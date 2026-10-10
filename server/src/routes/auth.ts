@@ -85,7 +85,7 @@ authRouter.post('/send-verify-link', sendLinkLimiter, async (req: Request, res: 
     }
 
     const token = issueEmailToken(email, purpose as VerifyPurpose);
-    const link = `${config.clientUrl}/email-verify?t=${encodeURIComponent(token)}`;
+    const link = `${config.publicUrl}/email-verify?t=${encodeURIComponent(token)}`;
     await sendVerificationLink(email, link, purpose);
 
     // 未配置真实 SMTP 时，把链接直接返回给前端，方便本地联调（链接同时也打印在控制台）

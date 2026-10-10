@@ -38,6 +38,14 @@ export const config = {
   // 前端地址（用于 CORS 与拼接邮箱验证链接），支持逗号分隔的多个来源
   clientUrl: process.env.CLIENT_URL || 'http://localhost:5173',
 
+  // 对外公开的站点地址：专门用于拼接邮箱验证链接等对外 URL。
+  // 优先取 PUBLIC_URL；未配置时取 CLIENT_URL 的第一个值。
+  // 注意：不能用整个 CLIENT_URL（逗号分隔列表），否则生成的链接是坏的。
+  publicUrl: (
+    process.env.PUBLIC_URL ||
+    (process.env.CLIENT_URL || 'http://localhost:3001').split(',')[0]
+  ).trim().replace(/\/+$/, ''),
+
   // 允许的跨域来源列表
   allowedOrigins: (process.env.CLIENT_URL || 'http://localhost:5173')
     .split(',')
