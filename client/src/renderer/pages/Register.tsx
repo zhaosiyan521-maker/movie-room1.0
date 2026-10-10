@@ -36,16 +36,18 @@ export default function Register() {
     e.preventDefault();
     setError('');
 
-    if (!emailVerified) {
-      setError('请先完成邮箱验证（点击邮件中的验证链接）后再注册');
-      return;
-    }
     if (form.password !== form.confirmPassword) {
       setError('两次输入的密码不一致');
       return;
     }
     if (form.password.length < 8) {
       setError('密码长度至少 8 位');
+      return;
+    }
+
+    // 按钮保持可交互：点击时先本地判断是否有验证令牌，再交给服务端最终求证。
+    if (!emailVerified) {
+      setError('请验证邮箱');
       return;
     }
 
@@ -61,7 +63,13 @@ export default function Register() {
       clear();
       navigate('/');
     } catch (err: any) {
-      setError(err.response?.data?.error || err || '注册失败');
+      const msg = err.response?.data?.error || err || '注册失败';
+      // 服务端求证未通过时，统一给用户「请验证邮箱」的明确提示
+      if (/验证|verify/i.test(String(msg))) {
+        setError('请验证邮箱');
+      } else {
+        setError(msg);
+      }
     }
   };
 
@@ -165,7 +173,7 @@ export default function Register() {
           <button
             type="submit"
             className="btn btn-primary btn-block"
-            disabled={isLoading || !emailVerified}
+            disabled={isLoading}
           >
             {isLoading ? '注册中...' : '注册'}
           </button>

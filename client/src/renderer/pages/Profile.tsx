@@ -120,7 +120,7 @@ export default function Profile() {
     } else if (pwEmailVerified) {
       payload.emailVerifyToken = pending!.token;
     } else {
-      setPwMsg('请先通过邮箱验证链接完成验证');
+      setPwMsg('请验证邮箱');
       return;
     }
 
@@ -133,7 +133,8 @@ export default function Profile() {
       setPwConfirm('');
       clear();
     } catch (e: any) {
-      setPwMsg(e.response?.data?.error || '修改失败');
+      const msg = e.response?.data?.error || '修改失败';
+      setPwMsg(/验证|verify/i.test(String(msg)) ? '请验证邮箱' : msg);
     } finally {
       setPwSaving(false);
     }
@@ -146,7 +147,7 @@ export default function Profile() {
       return;
     }
     if (!bindEmailVerified) {
-      setBindMsg('请先完成邮箱验证（点击邮件中的验证链接）');
+      setBindMsg('请验证邮箱');
       return;
     }
     setBindSaving(true);
@@ -157,7 +158,8 @@ export default function Profile() {
       clear();
       fetchUser();
     } catch (e: any) {
-      setBindMsg(e.response?.data?.error || '绑定失败');
+      const msg = e.response?.data?.error || '绑定失败';
+      setBindMsg(/验证|verify/i.test(String(msg)) ? '请验证邮箱' : msg);
     } finally {
       setBindSaving(false);
     }
@@ -299,7 +301,7 @@ export default function Profile() {
           <button
             onClick={handleChangePassword}
             className="btn btn-primary"
-            disabled={pwSaving || (!pwEmailVerified && !(user?.isAdmin && pwCurrent))}
+            disabled={pwSaving}
           >
             {pwSaving ? '修改中...' : '修改密码'}
           </button>
@@ -339,7 +341,7 @@ export default function Profile() {
           <button
             onClick={handleBindEmail}
             className="btn btn-primary"
-            disabled={bindSaving || !bindEmailVerified}
+            disabled={bindSaving}
           >
             {bindSaving ? '绑定中...' : '绑定邮箱'}
           </button>
