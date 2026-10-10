@@ -1,0 +1,1596 @@
+import { useState, useEffect, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { api, useAuthStore } from '../store/authStore';
+import { getAbsoluteApiBase, toProxiedUrl } from '../store/apiBase';
+import { io, Socket } from 'socket.io-client';
+import Hls from 'hls.js';
+import './RoomView.css';
+
+interface RoomMemberInfo {
+  userId: string;
+  nickname: string;
+  socketId?: string;
+}
+
+interface Room {
+  id: string;
+  name: string;
+  description?: string;
+  images?: string | null;
+  status: string;
+  /** 服务端只下发是否存在密码，不再下发明文密码 */
+  hasPassword?: boolean;
+  maxViewers: number;
+  currentMovie?: string;
+  hostId: string;
+  host: {
+    id: string;
+    username: string;
+    nickname: string;
+  };
+  members: Array<{
+    id: string;
+    role: string;
+    user: {
+      id: string;
+      username: string;
+      nickname: string;
+    };
+  }>;
+}
+
+interface ChatMessage {
+  from: string;
+  userId: string;
+  message: string;
+  timestamp: string;
+}
+
+interface KickVoteRequest {
+  targetUserId: string;
+  targetName: string;
+  needed: number;
+  total: number;
+}
+
+interface PlaybackVoteRequest {
+  action: 'pause' | 'stop';
+  initiator: string;
+  needed: number;
+  total: number;
+}
+
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
+
+const CHAT_COOLDOWN_SEC = 3;
+const CHAT_MAX_LENGTH = 50;
+
+function parseImages(images?: string | null): string[] {
+  if (!images) return [];
+  try {
+    const arr = JSON.parse(images);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+// 语音音量 → 颜色：低音量绿色，高音量红色（绿→黄→红）
+function speakingColor(level: number): string {
+  const hue = 120 - Math.max(0, Math.min(1, level)) * 120; // 120(绿) → 0(红)
+  return `hsl(${Math.round(hue)}, 75%, 50%)`;
+}
+
+/**
+ * 把远程视频直链改写为同源代理地址，以绕过跨域 / 防盗链（Referer/Origin）限制。
+ * 已抽取到 store/apiBase.ts 的 toProxiedUrl，返回「绝对」地址，
+ * 避免 Electron(file://) / 非 5173 端口下相对路径失效导致"视频加载失败"。
+ */
+
+export default function RoomView() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const { user, fetchUser } = useAuthStore();
+
+  const [room, setRoom] = useState<Room | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [joined, setJoined] = useState(false);
+  const [passwordInput, setPasswordInput] = useState('');
+  const [error, setError] = useState('');
+
+  // WebRTC 相关
+  const socketRef = useRef<Socket | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const makingOfferRef = useRef<Map<string, boolean>>(new Map());
+  const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isHost, setIsHost] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<any>(null);
+  const [needClickPlay, setNeedClickPlay] = useState(false);
+
+  // 成员 / 语音 / 聊天
+  const [members, setMembers] = useState<RoomMemberInfo[]>([]);
+  const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
+  const [inVoice, setInVoice] = useState(false);
+  const [showVoicePrompt, setShowVoicePrompt] = useState(false);
+  const [voiceUserIds, setVoiceUserIds] = useState<Set<string>>(new Set());
+  const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set());
+  const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set());
+  const [micOn, setMicOn] = useState(true);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatCooldown, setChatCooldown] = useState(0);
+  const [avatarBubbles, setAvatarBubbles] = useState<Record<string, string>>({});
+  const [menuUserId, setMenuUserId] = useState<string | null>(null);
+  const [menuRect, setMenuRect] = useState<{ x: number; y: number } | null>(null);
+
+  // 踢出投票（观众收到的确认弹窗）
+  const [kickVote, setKickVote] = useState<KickVoteRequest | null>(null);
+
+  // 放映投票（房主发起暂停/结束 → 观众收到确认弹窗）
+  const [playbackVote, setPlaybackVote] = useState<PlaybackVoteRequest | null>(null);
+  // 房主自己发起的放映投票（等待其他观众同意期间显示「投票中」）
+  const [pendingPlaybackAction, setPendingPlaybackAction] = useState<'pause' | 'stop' | null>(null);
+
+  // 语音音量等级（0~1），用于头像按音量着色
+  const [levelByUser, setLevelByUser] = useState<Record<string, number>>({});
+
+  // 分辨率同步（房主视频分辨率徽标）
+  const [resolution, setResolution] = useState<string | null>(null);
+
+  // 网络视频播放模式（房主粘贴直链，观众各自加载，不经过房主带宽）
+  const [usingRemoteUrl, setUsingRemoteUrl] = useState(false);
+  const [remotePlayUrl, setRemotePlayUrl] = useState('');
+  const [urlInput, setUrlInput] = useState('');
+  // 视频加载错误提示：网络直链可能因跨域/失效而失败，需要明确反馈而非"点了没反应"
+  const [videoError, setVideoError] = useState('');
+
+  const hlsRef = useRef<any>(null);
+  const setupDoneRef = useRef(false);
+  const recentMsgSigRef = useRef<Set<string>>(new Set());
+  // 本地视频的 ObjectURL，用于切换/离开房间时 revoke，避免 Blob 泄漏
+  const localObjectUrlRef = useRef<string | null>(null);
+  // 进度同步节流：记录上次广播时间戳
+  const lastSyncProgressRef = useRef(0);
+
+  const localMicRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const speakingRef = useRef(false);
+  const bubbleTimersRef = useRef<Record<string, any>>({});
+  const cooldownTimerRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (!user) {
+      fetchUser();
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchRoom();
+
+    return () => {
+      cleanupAll();
+    };
+  }, [id]);
+
+  const cleanupAll = () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+    }
+    // 关键修复：必须复位 setupDoneRef。
+    // 否则 React Router 在 /room/A → /room/B 时复用同一组件实例，
+    // setupWebSocket() 会命中 if (setupDoneRef.current) return 而直接早退，
+    // 导致切换房间后聊天/语音/视频/投票全部永久失效（直到刷新页面）。
+    setupDoneRef.current = false;
+
+    // 销毁 HLS 实例：否则旧实例会继续拉取分片，占用带宽与内存
+    destroyHls();
+
+    peersRef.current.forEach(pc => pc.close());
+    peersRef.current.clear();
+    audioElsRef.current.forEach(el => {
+      el.pause();
+      el.srcObject = null;
+    });
+    audioElsRef.current.clear();
+    remoteStreamsRef.current.clear();
+    if (localMicRef.current) {
+      localMicRef.current.getTracks().forEach(t => t.stop());
+      localMicRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    Object.values(bubbleTimersRef.current).forEach(t => clearTimeout(t));
+    bubbleTimersRef.current = {};
+    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+
+    // 释放 ObjectURL，避免 Blob 泄漏
+    if (localObjectUrlRef.current) {
+      URL.revokeObjectURL(localObjectUrlRef.current);
+      localObjectUrlRef.current = null;
+    }
+
+    // 重置房间相关状态，避免上一个房间的聊天与 UI 状态串到新房间
+    setMessages([]);
+    setLevelByUser({});
+    setMutedUserIds(new Set());
+    setSpeakingUserIds(new Set());
+    setVoiceUserIds(new Set());
+    setOnlineUserIds(new Set());
+    setResolution(null);
+    setUsingRemoteUrl(false);
+    setRemotePlayUrl('');
+    setVideoError('');
+    setIsPlaying(false);
+    recentMsgSigRef.current.clear();
+  };
+
+  const fetchRoom = async () => {
+    try {
+      const { data } = await api.get(`/rooms/${id}`);
+      const r: Room = data.room;
+      setRoom(r);
+      setMembers(r.members.map(m => ({
+        userId: m.user.id,
+        nickname: m.user.nickname || m.user.username
+      })));
+
+      const me = useAuthStore.getState().user;
+      if (me) {
+        setIsHost(r.hostId === me.id);
+        const alreadyMember = r.members.some(m => m.user.id === me.id);
+        if (alreadyMember) {
+          doJoin();
+        }
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.error || '获取房间信息失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user && room && !joined) {
+      setIsHost(room.hostId === user.id);
+      const alreadyMember = room.members.some(m => m.user.id === user.id);
+      if (alreadyMember) {
+        doJoin();
+      }
+    }
+  }, [user, room]);
+
+  const doJoin = async (password?: string) => {
+    try {
+      await api.post(`/rooms/${id}/join`, {
+        password: password || undefined
+      });
+
+      setJoined(true);
+      setError('');
+      setupWebSocket();
+      setShowVoicePrompt(true);
+    } catch (error: any) {
+      setError(error.response?.data?.error || '加入房间失败');
+    }
+  };
+
+  const handleJoin = () => doJoin(passwordInput);
+
+  // ===== WebSocket =====
+
+  const setupWebSocket = () => {
+    // 防止重复初始化导致监听器叠加（聊天消息重复的根因）
+    if (setupDoneRef.current) return;
+    setupDoneRef.current = true;
+
+    const token = localStorage.getItem('token');
+    const socket = io(`${getAbsoluteApiBase()}`, {
+      auth: { token },
+      transports: ['websocket']
+    });
+
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      socket.emit('join-room', id);
+      const me = useAuthStore.getState().user;
+      if (me) {
+        setOnlineUserIds(prev => new Set(prev).add(me.id));
+      }
+    });
+
+    socket.on('room-joined', async (data: any) => {
+      setOnlineUserIds(prev => {
+        const next = new Set(prev);
+        data.users.forEach((u: any) => u.userId && next.add(u.userId));
+        return next;
+      });
+      setVoiceUserIds(prev => {
+        const next = new Set(prev);
+        data.users.forEach((u: any) => {
+          if (u.inVoice && u.userId) next.add(u.userId);
+        });
+        return next;
+      });
+      setMembers(prev => {
+        const next = [...prev];
+        data.users.forEach((u: any) => {
+          if (u.userId && !next.some(m => m.userId === u.userId)) {
+            next.push({ userId: u.userId, nickname: u.nickname || u.username, socketId: u.socketId });
+          }
+        });
+        return next;
+      });
+
+      for (const u of data.users) {
+        if (u.socketId) {
+          await createPeerConnection(u.socketId);
+        }
+      }
+    });
+
+    socket.on('user-joined', (data: any) => {
+      if (data.userId) {
+        setOnlineUserIds(prev => new Set(prev).add(data.userId));
+        setMembers(prev => {
+          if (prev.some(m => m.userId === data.userId)) return prev;
+          return [...prev, { userId: data.userId, nickname: data.nickname || data.username, socketId: data.socketId }];
+        });
+      }
+    });
+
+    socket.on('user-left', (data: any) => {
+      if (data.userId) {
+        setOnlineUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(data.userId);
+          return next;
+        });
+        setVoiceUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(data.userId);
+          return next;
+        });
+        setSpeakingUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(data.userId);
+          return next;
+        });
+      }
+      if (data.socketId) {
+        removePeer(data.socketId);
+      }
+    });
+
+    socket.on('offer', async (data: any) => {
+      const pc = await createPeerConnection(data.from);
+      const polite = isPolite(data.from);
+      const makingOffer = makingOfferRef.current.get(data.from) || false;
+      const offerCollision = makingOffer || pc.signalingState !== 'stable';
+      const ignoreOffer = !polite && offerCollision;
+      if (ignoreOffer) return;
+
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+        await pc.setLocalDescription();
+        socket.emit('answer', { target: data.from, answer: pc.localDescription });
+      } catch (err) {
+        console.error('处理 offer 失败:', err);
+      }
+    });
+
+    socket.on('answer', async (data: any) => {
+      const pc = peersRef.current.get(data.from);
+      if (!pc) return;
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+      } catch (err) {
+        console.error('处理 answer 失败:', err);
+      }
+    });
+
+    socket.on('ice-candidate', async (data: any) => {
+      const pc = peersRef.current.get(data.from);
+      if (!pc) return;
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (err) {
+        console.error('添加 ICE 候选失败:', err);
+      }
+    });
+
+    socket.on('playback-start', (data: any) => {
+      setIsPlaying(true);
+      setPendingPlaybackAction(null);
+      setResolution(data?.resolution || null);
+      if (data?.videoUrl) {
+        // 网络视频模式：观众各自加载直链，不经过房主带宽
+        setRemotePlayUrl(data.videoUrl);
+        loadRemoteVideo(data.videoUrl, !!data.isHls);
+      } else {
+        setRemotePlayUrl('');
+        destroyHls();
+        remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+      }
+    });
+
+    socket.on('playback-pause', () => {
+      setIsPlaying(false);
+      remoteVideoRef.current?.pause();
+      localVideoRef.current?.pause();
+    });
+
+    socket.on('playback-resume', () => {
+      setIsPlaying(true);
+      remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+      localVideoRef.current?.play().catch(() => {});
+    });
+
+    socket.on('playback-stop', () => {
+      setIsPlaying(false);
+      setPendingPlaybackAction(null);
+      remoteVideoRef.current?.pause();
+      localVideoRef.current?.pause();
+    });
+
+    // 房主发起「暂停/结束放映」投票 → 观众收到确认弹窗
+    socket.on('playback-vote-request', (data: any) => {
+      setPlaybackVote({ action: data.action, initiator: data.initiator, needed: data.needed, total: data.total });
+    });
+
+    // 进度同步（本地 mesh 模式由 WebRTC 自带；网络视频模式按此对齐播放位置）
+    socket.on('progress-sync', (data: any) => {
+      const el = remoteVideoRef.current;
+      const t = typeof data?.currentTime === 'number' ? data.currentTime : 0;
+      if (el && Math.abs(el.currentTime - t) > 2) {
+        try { el.currentTime = t; } catch {}
+      }
+    });
+
+    socket.on('host-disconnected', (data: any) => {
+      setIsPlaying(false);
+      appendSystemMessage(`⚠️ ${data.message || '房主连接中断，放映已结束'}`);
+    });
+
+    socket.on('chat-message', (msg: ChatMessage) => {
+      appendMessage(msg);
+    });
+
+    socket.on('chat-limited', (data: any) => {
+      appendSystemMessage(`⏱️ ${data.message}`);
+    });
+
+    socket.on('voice-state', (data: any) => {
+      if (!data.userId) return;
+      setVoiceUserIds(prev => {
+        const next = new Set(prev);
+        if (data.inVoice) next.add(data.userId);
+        else next.delete(data.userId);
+        return next;
+      });
+    });
+
+    socket.on('user-speaking', (data: any) => {
+      if (!data.userId) return;
+      if (data.speaking) {
+        setSpeakingUserIds(prev => new Set(prev).add(data.userId));
+        const lvl = typeof data.level === 'number' ? Math.max(0, Math.min(1, data.level)) : 1;
+        setLevelByUser(prev => ({ ...prev, [data.userId]: lvl }));
+      } else {
+        setSpeakingUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(data.userId);
+          return next;
+        });
+        setLevelByUser(prev => {
+          const next = { ...prev };
+          delete next[data.userId];
+          return next;
+        });
+      }
+    });
+
+    // 房主发起踢出 → 观众收到确认弹窗
+    socket.on('kick-vote-request', (data: KickVoteRequest) => {
+      // 目标本人不弹窗
+      if (data.targetUserId === useAuthStore.getState().user?.id) return;
+      setKickVote(data);
+    });
+
+    // 踢出结果
+    socket.on('kick-vote-result', (data: any) => {
+      setKickVote(null);
+      if (data.kicked) {
+        setMembers(prev => prev.filter(m => m.userId !== data.targetUserId));
+        setOnlineUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(data.targetUserId);
+          return next;
+        });
+        appendSystemMessage(`🚨 「${data.targetName}」已被投票踢出房间（同意 ${data.agrees}/${data.total}），本场电影无法再次进入`);
+      }
+    });
+
+    socket.on('kicked', (data: any) => {
+      alert(data.reason || '你已被踢出该房间');
+      cleanupAll();
+      navigate('/');
+    });
+
+    // 房间被彻底解散并清除（房主退出后自动解散），所有人退出到首页
+    socket.on('room-dissolved', (data: any) => {
+      alert(data.reason || '房间已解散并清除');
+      cleanupAll();
+      navigate('/');
+    });
+
+    socket.on('error', (err: any) => {
+      setError(err.message);
+    });
+  };
+
+  // ===== WebRTC mesh =====
+
+  const isPolite = (peerSocketId: string) => {
+    const myId = socketRef.current?.id || '';
+    return myId < peerSocketId;
+  };
+
+  const createPeerConnection = async (targetSocketId: string): Promise<RTCPeerConnection> => {
+    const existing = peersRef.current.get(targetSocketId);
+    if (existing) return existing;
+
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    peersRef.current.set(targetSocketId, pc);
+    makingOfferRef.current.set(targetSocketId, false);
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && socketRef.current) {
+        socketRef.current.emit('ice-candidate', {
+          target: targetSocketId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    pc.onnegotiationneeded = async () => {
+      try {
+        makingOfferRef.current.set(targetSocketId, true);
+        await pc.setLocalDescription();
+        socketRef.current?.emit('offer', {
+          target: targetSocketId,
+          offer: pc.localDescription
+        });
+      } catch (err) {
+        console.error('协商失败:', err);
+      } finally {
+        makingOfferRef.current.set(targetSocketId, false);
+      }
+    };
+
+    pc.ontrack = (event) => {
+      handleRemoteTrack(targetSocketId, event.track);
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        removePeer(targetSocketId);
+      }
+    };
+
+    addLocalTracksTo(pc);
+
+    return pc;
+  };
+
+  const addLocalTracksTo = (pc: RTCPeerConnection) => {
+    if (localMicRef.current) {
+      localMicRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localMicRef.current!);
+      });
+    }
+    // 网络视频模式下，视频由每位观众各自加载直链，房主不通过 WebRTC 转发视频轨
+    if (isHost && !usingRemoteUrl && localVideoRef.current) {
+      const stream = getVideoCaptureStream();
+      if (stream) {
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      }
+    }
+  };
+
+  const getVideoCaptureStream = (): MediaStream | null => {
+    const video = localVideoRef.current as any;
+    if (!video) return null;
+    const capture = video.captureStream || video.mozCaptureStream;
+    if (!capture) return null;
+    const stream: MediaStream = capture.call(video);
+    return stream.getTracks().length > 0 ? stream : null;
+  };
+
+  const handleRemoteTrack = (socketId: string, track: MediaStreamTrack) => {
+    let stream = remoteStreamsRef.current.get(socketId);
+    if (!stream) {
+      stream = new MediaStream();
+      remoteStreamsRef.current.set(socketId, stream);
+    }
+    if (!stream.getTracks().includes(track)) {
+      stream.addTrack(track);
+    }
+
+    if (track.kind === 'video') {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+        remoteVideoRef.current.play().catch(() => setNeedClickPlay(true));
+      }
+    } else if (track.kind === 'audio') {
+      let audioEl = audioElsRef.current.get(socketId);
+      if (!audioEl) {
+        audioEl = new Audio();
+        audioEl.autoplay = true;
+        audioElsRef.current.set(socketId, audioEl);
+      }
+      audioEl.srcObject = stream;
+      audioEl.play().catch(() => {});
+    }
+  };
+
+  const removePeer = (socketId: string) => {
+    const pc = peersRef.current.get(socketId);
+    if (pc) {
+      pc.close();
+      peersRef.current.delete(socketId);
+    }
+    makingOfferRef.current.delete(socketId);
+    remoteStreamsRef.current.delete(socketId);
+    const audioEl = audioElsRef.current.get(socketId);
+    if (audioEl) {
+      audioEl.pause();
+      audioEl.srcObject = null;
+      audioElsRef.current.delete(socketId);
+    }
+  };
+
+  // ===== 语音聊天 =====
+
+  const joinVoice = async () => {
+    setShowVoicePrompt(false);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      localMicRef.current = stream;
+      setInVoice(true);
+      setMicOn(true);
+
+      peersRef.current.forEach(pc => {
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      });
+
+      socketRef.current?.emit('voice-join', id);
+      startSpeakingDetection(stream);
+    } catch (error) {
+      console.error('获取麦克风失败:', error);
+      alert('无法访问麦克风，请检查浏览器权限设置');
+    }
+  };
+
+  const leaveVoice = () => {
+    if (localMicRef.current) {
+      localMicRef.current.getTracks().forEach(t => t.stop());
+      localMicRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    speakingRef.current = false;
+    setInVoice(false);
+    setSpeakingUserIds(prev => {
+      const me = useAuthStore.getState().user;
+      const next = new Set(prev);
+      if (me) next.delete(me.id);
+      return next;
+    });
+    socketRef.current?.emit('voice-leave', id);
+    peersRef.current.forEach((pc) => {
+      pc.getSenders().forEach(sender => {
+        if (sender.track?.kind === 'audio') {
+          pc.removeTrack(sender);
+        }
+      });
+    });
+  };
+
+  const toggleMic = () => {
+    if (!localMicRef.current) return;
+    const next = !micOn;
+    localMicRef.current.getAudioTracks().forEach(t => { t.enabled = next; });
+    setMicOn(next);
+    if (!next) {
+      emitSpeaking(false);
+    }
+  };
+
+  const startSpeakingDetection = (stream: MediaStream) => {
+    try {
+      const ctx = new AudioContext();
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      const check = () => {
+        if (!audioCtxRef.current) return;
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((a, b) => a + b, 0) / data.length;
+        const speaking = micOn && avg > 12;
+        // 归一化音量到 0~1（用于头像按音量着色：绿→黄→红）
+        const level = Math.max(0, Math.min(1, avg / 80));
+        if (speaking !== speakingRef.current) {
+          speakingRef.current = speaking;
+          emitSpeaking(speaking, level);
+        } else if (speaking) {
+          // 说话中持续上报音量等级
+          emitSpeaking(true, level);
+        }
+        setTimeout(check, 200);
+      };
+      check();
+    } catch (error) {
+      console.error('说话检测初始化失败:', error);
+    }
+  };
+
+  const emitSpeaking = (speaking: boolean, level = 0) => {
+    socketRef.current?.emit('speaking', { roomId: id, speaking, level });
+    const me = useAuthStore.getState().user;
+    if (me) {
+      if (speaking) {
+        setSpeakingUserIds(prev => new Set(prev).add(me.id));
+        setLevelByUser(prev => ({ ...prev, [me.id]: Math.max(0, Math.min(1, level)) }));
+      } else {
+        setSpeakingUserIds(prev => {
+          const next = new Set(prev);
+          next.delete(me.id);
+          return next;
+        });
+        setLevelByUser(prev => {
+          const next = { ...prev };
+          delete next[me.id];
+          return next;
+        });
+      }
+    }
+  };
+
+  const toggleMuteUser = (userId: string) => {
+    setMutedUserIds(prev => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+
+      const member = members.find(m => m.userId === userId);
+      if (member?.socketId) {
+        const audioEl = audioElsRef.current.get(member.socketId);
+        if (audioEl) audioEl.muted = next.has(userId);
+      }
+      return next;
+    });
+  };
+
+  // ===== 踢出（房主发起，观众投票确认） =====
+
+  const requestKick = (targetUserId: string) => {
+    setMenuUserId(null);
+    if (!socketRef.current) return;
+    const target = members.find(m => m.userId === targetUserId);
+    if (!target) return;
+    if (!confirm(`确定要发起踢出「${target.nickname}」吗？\n房间内 1/3 的人同意后，TA 将被踢出且本场电影无法再次进入。`)) return;
+    socketRef.current.emit('kick-request', { roomId: id, targetUserId });
+    appendSystemMessage(`🗳️ 你已发起踢出「${target.nickname}」的投票，等待其他观众确认...`);
+  };
+
+  const answerKickVote = (agree: boolean) => {
+    if (!kickVote || !socketRef.current) return;
+    socketRef.current.emit('kick-vote', {
+      roomId: id,
+      targetUserId: kickVote.targetUserId,
+      agree
+    });
+    setKickVote(null);
+  };
+
+  // ===== 聊天 =====
+
+  const appendMessage = (msg: ChatMessage) => {
+    // 去重：同用户同内容同时间戳在短时间内视为重复（防止监听器叠加导致重复消息）
+    const sig = `${msg.userId}|${msg.message}|${msg.timestamp}`;
+    if (msg.userId && recentMsgSigRef.current.has(sig)) return;
+    if (msg.userId) {
+      recentMsgSigRef.current.add(sig);
+      setTimeout(() => recentMsgSigRef.current.delete(sig), 1500);
+    }
+    setMessages(prev => [...prev, msg]);
+    if (msg.userId) {
+      showAvatarBubble(msg.userId, msg.message);
+    }
+  };
+
+  const appendSystemMessage = (text: string) => {
+    setMessages(prev => [...prev, {
+      from: '系统',
+      userId: '',
+      message: text,
+      timestamp: new Date().toISOString()
+    }]);
+  };
+
+  const showAvatarBubble = (userId: string, text: string) => {
+    setAvatarBubbles(prev => ({ ...prev, [userId]: text }));
+    if (bubbleTimersRef.current[userId]) {
+      clearTimeout(bubbleTimersRef.current[userId]);
+    }
+    bubbleTimersRef.current[userId] = setTimeout(() => {
+      setAvatarBubbles(prev => {
+        const next = { ...prev };
+        delete next[userId];
+        return next;
+      });
+    }, 6000);
+  };
+
+  const startCooldown = () => {
+    setChatCooldown(CHAT_COOLDOWN_SEC);
+    if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
+    cooldownTimerRef.current = setInterval(() => {
+      setChatCooldown(prev => {
+        if (prev <= 1) {
+          clearInterval(cooldownTimerRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const sendMessage = () => {
+    const text = chatInput.trim();
+    if (!text || !socketRef.current || chatCooldown > 0) return;
+    if (text.length > CHAT_MAX_LENGTH) return;
+
+    socketRef.current.emit('chat-message', {
+      roomId: id,
+      message: text
+    });
+
+    const me = useAuthStore.getState().user;
+    appendMessage({
+      from: '我',
+      userId: me?.id || '',
+      message: text,
+      timestamp: new Date().toISOString()
+    });
+
+    setChatInput('');
+    startCooldown();
+  };
+
+  // ===== 房主：视频播放 =====
+
+  const selectVideoFile = async () => {
+    if ((window as any).electronAPI?.selectVideoFile) {
+      const file = await (window as any).electronAPI.selectVideoFile();
+      if (file) {
+        // 让主进程用 pathToFileURL 生成正确的 file:// URL：
+        // 直接拼接 `file://${path}` 在含空格/中文/特殊字符时会失效或被截断
+        let src = `file://${file.path}`;
+        try {
+          const converted = await (window as any).electronAPI.getVideoUrl?.(file.path);
+          if (converted) src = converted;
+        } catch {
+          /* 回退到拼接方式 */
+        }
+        loadVideoFile(src, file.name, false);
+      }
+    } else {
+      fileInputRef.current?.click();
+    }
+  };
+
+  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      // createObjectURL 必须配对 revokeObjectURL，否则 Blob 会一直驻留内存
+      const url = URL.createObjectURL(file);
+      loadVideoFile(url, file.name, true);
+    }
+    // 重置 value，保证连续选择同一文件也能触发 change 事件
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  /** ownObjectUrl=true 表示 src 是 createObjectURL 产生的，换片/清理时需要 revoke */
+  const loadVideoFile = (src: string, name: string, ownObjectUrl = false) => {
+    // 先释放上一个 ObjectURL
+    if (localObjectUrlRef.current) {
+      URL.revokeObjectURL(localObjectUrlRef.current);
+      localObjectUrlRef.current = null;
+    }
+    if (ownObjectUrl) {
+      localObjectUrlRef.current = src;
+    }
+    setSelectedFile({ name });
+    if (localVideoRef.current) {
+      localVideoRef.current.src = src;
+      localVideoRef.current.load();
+    }
+  };
+
+  // ===== 网络视频（HLS / 直链）加载 =====
+  const destroyHls = () => {
+    if (hlsRef.current) {
+      try { hlsRef.current.destroy(); } catch {}
+      hlsRef.current = null;
+    }
+  };
+
+  /**
+   * 判断一个直链是否为 HLS 流。
+   * 除了 .m3u8 扩展名，还覆盖常见的无扩展名 HLS 直链特征：
+   *   - 路径含 .m3u8
+   *   - query 含 m3u8 / hls / .ts 等关键字（很多 CDN 直链不带扩展名）
+   * 这样能避免把 HLS 播放列表误当普通 mp4 塞给 <video>（后者必然加载失败）。
+   */
+  function looksLikeHls(url: string): boolean {
+    if (/\.m3u8(\?|#|$)/i.test(url)) return true;
+    // 去参数、去 hash 后的路径
+    let pathPart = '';
+    try {
+      const u = new URL(url);
+      pathPart = `${u.pathname}${u.search}`;
+    } catch {
+      pathPart = url;
+    }
+    return /(\.m3u8|m3u8|hls|\.ts)(\?|&|#|$)/i.test(pathPart);
+  }
+
+  /**
+   * 用 hls.js 加载 HLS 流。
+   * 关键点：必须在 manifest 解析完成（MANIFEST_PARSED）之后才调用 play()，
+   * 否则在 attachMedia 之后立即 play() 会因媒体尚未就绪而静默失败。
+   */
+  const attachHls = (el: HTMLVideoElement, url: string) => {
+    const hls = new Hls();
+    hlsRef.current = hls;
+    hls.loadSource(url);
+    hls.attachMedia(el);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      setVideoError('');
+      el.play().catch(() => setNeedClickPlay(true));
+    });
+    hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
+      if (!data?.fatal) return;
+      console.error('HLS 播放错误：', data);
+      // 网络错误时可尝试一次自动恢复，避免临时抖动直接判死
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        hls.startLoad();
+        return;
+      }
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+        return;
+      }
+      setVideoError('视频加载失败：HLS 流解析出错。请确认直链有效且未过期（多数站点直链有时效），重试或更换链接。');
+      setNeedClickPlay(true);
+    });
+  };
+
+  const loadRemoteVideo = (url: string, isHls: boolean) => {
+    const el = remoteVideoRef.current;
+    if (!el) return;
+    setVideoError('');
+    destroyHls();
+    const target = toProxiedUrl(url);
+    // 增强 HLS 识别：显式标记 或 启发式判断
+    const useHls = isHls || looksLikeHls(url);
+    if (useHls && Hls.isSupported()) {
+      attachHls(el, target);
+    } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
+      // 原生 HLS 支持（Safari）：直接交给 <video>
+      el.src = target;
+      el.play().catch(() => setNeedClickPlay(true));
+    } else {
+      el.src = target;
+      el.play().catch(() => setNeedClickPlay(true));
+    }
+  };
+
+  // 房主本地也直接加载网络视频观看（不通过 WebRTC 转发）
+  const loadLocalUrl = (url: string, isHls: boolean) => {
+    const el = localVideoRef.current;
+    if (!el) return;
+    setVideoError('');
+    destroyHls();
+    const target = toProxiedUrl(url);
+    const useHls = isHls || looksLikeHls(url);
+    if (useHls && Hls.isSupported()) {
+      attachHls(el, target);
+    } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
+      el.src = target;
+      el.play().catch(() => setNeedClickPlay(true));
+    } else {
+      el.src = target;
+      el.play().catch(() => setNeedClickPlay(true));
+    }
+  };
+
+  /** 手动点击「开始播放」：同时覆盖房主(localVideoRef)与观众(remoteVideoRef)两种情况 */
+  const playCurrentVideo = () => {
+    const el = isHost ? localVideoRef.current : remoteVideoRef.current;
+    el?.play().catch(() => setNeedClickPlay(true));
+    setNeedClickPlay(false);
+    setVideoError('');
+  };
+
+  const getResolution = () => {
+    const el = localVideoRef.current;
+    if (el && el.videoWidth && el.videoHeight) return `${el.videoWidth}×${el.videoHeight}`;
+    return null;
+  };
+
+  const startPlayback = async () => {
+    if (usingRemoteUrl) {
+      const url = remotePlayUrl.trim();
+      if (!url) { alert('请先粘贴要播放的网络视频地址'); return; }
+      // 增强 HLS 识别：不再只认 .m3u8，覆盖无扩展名的 HLS 直链
+      const isHls = looksLikeHls(url);
+      setIsPlaying(true);
+      loadLocalUrl(url, isHls);
+      socketRef.current?.emit('host-start-play', {
+        roomId: id,
+        movieName: url,
+        videoUrl: url,
+        isHls,
+        resolution: getResolution()
+      });
+      return;
+    }
+
+    if (!selectedFile) {
+      alert('请先选择视频文件');
+      return;
+    }
+
+    setIsPlaying(true);
+
+    if (localVideoRef.current) {
+      try {
+        await localVideoRef.current.play();
+      } catch (err) {
+        console.error('播放失败:', err);
+        alert('视频播放失败，请检查文件格式');
+        setIsPlaying(false);
+        return;
+      }
+    }
+
+    const stream = getVideoCaptureStream();
+    if (stream) {
+      peersRef.current.forEach(pc => {
+        const existingKinds = pc.getSenders().map(s => s.track?.kind);
+        stream.getTracks().forEach(track => {
+          if (!existingKinds.includes(track.kind) || track.kind === 'video') {
+            try { pc.addTrack(track, stream); } catch {}
+          }
+        });
+      });
+    }
+
+    socketRef.current?.emit('host-start-play', {
+      roomId: id,
+      movieName: selectedFile.name,
+      resolution: getResolution()
+    });
+  };
+
+  // 暂停改为房主直接操作，无需投票；结束放映仍走观众投票
+  const pausePlayback = () => {
+    if (!socketRef.current) return;
+    if (usingRemoteUrl) remoteVideoRef.current?.pause(); else localVideoRef.current?.pause();
+    socketRef.current.emit('host-pause', { roomId: id });
+  };
+
+  const resumePlayback = () => {
+    setIsPlaying(true);
+    if (usingRemoteUrl) remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+    else localVideoRef.current?.play();
+    socketRef.current?.emit('host-resume', { roomId: id });
+  };
+
+  // 结束放映（之后才能解散房间）
+  const stopPlayback = () => {
+    if (!socketRef.current) return;
+    setPendingPlaybackAction('stop');
+    socketRef.current.emit('playback-vote-request', { roomId: id, action: 'stop' });
+    appendSystemMessage('🗳️ 已发起「结束放映」投票，需房间内观众同意后生效...');
+  };
+
+  const answerPlaybackVote = (agree: boolean) => {
+    if (!playbackVote || !socketRef.current) return;
+    socketRef.current.emit('playback-vote', { roomId: id, action: playbackVote.action, agree });
+    setPlaybackVote(null);
+  };
+
+  const leaveRoom = async () => {
+    // 放映途中房主不允许解散房间
+    if (isHost && isPlaying) {
+      alert('放映途中不能解散房间，请先点击「⏹️ 结束放映」');
+      return;
+    }
+
+    if (socketRef.current) {
+      socketRef.current.emit('leave-room', id);
+    }
+    cleanupAll();
+
+    try {
+      await api.post(`/rooms/${id}/leave`);
+    } catch (error: any) {
+      console.error('离开房间失败:', error);
+      if (isHost) {
+        alert(error.response?.data?.error || '解散房间失败');
+        return;
+      }
+    }
+
+    navigate('/');
+  };
+
+  // ===== 渲染 =====
+
+  if (loading) {
+    return <div className="loading-page">加载中...</div>;
+  }
+
+  if (error && !room) {
+    return <div className="error-page">{error}</div>;
+  }
+
+  const myUserId = user?.id;
+  const roomImages = parseImages(room?.images);
+
+  return (
+    <div className="room-view-page fade-in">
+      {/* 未加入状态 */}
+      {!joined ? (
+        <div className="join-room-card card">
+          <h2>🎬 {room?.name}</h2>
+          {room?.description && <p className="room-description">{room.description}</p>}
+
+          {/* 房间图片展示 */}
+          {roomImages.length > 0 && (
+            <div className="join-room-gallery">
+              {roomImages.map((img, idx) => (
+                <img key={idx} src={img} alt={`房间图片 ${idx + 1}`} />
+              ))}
+            </div>
+          )}
+
+          <div className="room-info">
+            <p>👤 房主：{room?.host.nickname || room?.host.username}</p>
+            <p>👥 观众：{room?.members.length}/{room?.maxViewers}</p>
+            {room?.hasPassword && !isHost && <p>🔒 需要密码</p>}
+          </div>
+
+          {room?.hasPassword && !isHost && (
+            <div className="form-group">
+              <label className="label">输入房间密码</label>
+              <input
+                type="password"
+                className="input"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="请输入密码"
+              />
+            </div>
+          )}
+
+          {error && <div className="error-message">{error}</div>}
+
+          <button
+            onClick={handleJoin}
+            className="btn btn-primary btn-block"
+          >
+            加入房间
+          </button>
+
+          <button onClick={() => navigate('/')} className="btn btn-secondary btn-block" style={{ marginTop: '12px' }}>
+            返回列表
+          </button>
+        </div>
+      ) : (
+        /* 已加入 - 观影界面 */
+        <div className="viewing-room">
+          {/* 左侧：观众头像栏 */}
+          <div className="avatar-rail">
+            {members.map(member => {
+              const isMe = member.userId === myUserId;
+              const isMemberHost = member.userId === room?.hostId;
+              const speaking = speakingUserIds.has(member.userId);
+              const muted = mutedUserIds.has(member.userId);
+              const inVoiceNow = voiceUserIds.has(member.userId) || (isMe && inVoice);
+              const bubble = avatarBubbles[member.userId];
+
+              return (
+                <div key={member.userId} className="avatar-rail-item">
+                  {(() => {
+                    const lvl = speaking ? levelByUser[member.userId] : undefined;
+                    const speakColor = lvl != null ? speakingColor(lvl) : undefined;
+                    return (
+                      <div
+                        className={`avatar-circle ${speaking ? 'speaking' : ''} ${isMemberHost ? 'host' : ''} ${!onlineUserIds.has(member.userId) && !isMe ? 'offline' : ''}`}
+                        style={speakColor ? { borderColor: speakColor, boxShadow: `0 0 12px ${speakColor}` } : undefined}
+                        title={member.nickname}
+                        onClick={(e) => {
+                          if (isMe) return;
+                          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                          setMenuRect({ x: r.right + 6, y: r.top });
+                          setMenuUserId(menuUserId === member.userId ? null : member.userId);
+                        }}
+                      >
+                        {member.nickname.charAt(0).toUpperCase()}
+                        {isMemberHost && <span className="host-crown">👑</span>}
+                        {muted && <span className="mute-badge">🔇</span>}
+                        {inVoiceNow && !muted && <span className="voice-badge">🎤</span>}
+                      </div>
+                    );
+                  })()}
+                  <span className="avatar-name">{isMe ? '我' : member.nickname}</span>
+
+                  {bubble && (
+                    <div className="avatar-bubble">
+                      {bubble.length > 40 ? bubble.slice(0, 40) + '…' : bubble}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* 中间：视频区域 */}
+          <div className="video-area">
+            {/* 房主发起放映投票时显示的提示条 */}
+            {isHost && pendingPlaybackAction && (
+              <div className="vote-banner">
+                <span>
+                  🗳️ 正在发起「{pendingPlaybackAction === 'pause' ? '暂停放映' : '结束放映'}」投票，等待房间内观众同意...
+                </span>
+              </div>
+            )}
+
+            <div className="video-container">
+              {isHost ? (
+                <video
+                  ref={localVideoRef}
+                  className="video-player"
+                  controls
+                  playsInline
+                  onLoadedMetadata={() => setResolution(getResolution())}
+                  onError={() => {
+                    const code = localVideoRef.current?.error?.code;
+                    let msg = '视频加载失败，请检查文件格式或网络链接是否有效';
+                    if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
+                    else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) msg = '格式不支持：该直链无法播放，或 HLS 流未被正确识别';
+                    setVideoError(`${msg}。多数站点直链有时效，请重试或更换链接。`);
+                    setNeedClickPlay(true);
+                  }}
+                  onTimeUpdate={() => {
+                    // 节流：onTimeUpdate 每秒触发约 4 次，30 人房间中相当于
+                    // 每秒 120 次服务端转发，会挤占 WebRTC 信令通道。
+                    // 进度同步 2 秒一次已足够流畅。
+                    const el = localVideoRef.current;
+                    if (!el || !socketRef.current) return;
+                    const now = Date.now();
+                    if (now - lastSyncProgressRef.current < 2000) return;
+                    lastSyncProgressRef.current = now;
+                    socketRef.current.emit('sync-progress', {
+                      roomId: id,
+                      currentTime: el.currentTime,
+                      duration: el.duration || 0
+                    });
+                  }}
+                />
+              ) : (
+                <video
+                  ref={remoteVideoRef}
+                  className="video-player"
+                  autoPlay
+                  playsInline
+                  onError={() => {
+                    const code = remoteVideoRef.current?.error?.code;
+                    let msg = '视频加载失败，请检查网络链接是否有效、是否支持跨域播放';
+                    if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
+                    else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) msg = '格式不支持：该直链无法播放，或 HLS 流未被正确识别';
+                    setVideoError(`${msg}。多数站点直链有时效，请重试或更换链接。`);
+                    setNeedClickPlay(true);
+                  }}
+                  /* 观众只读：不提供播放控制条，放映由房主统一控制 */
+                />
+              )}
+
+              {resolution && (
+                <div className="res-badge">{resolution}</div>
+              )}
+
+              {!isPlaying && (
+                <div className="video-overlay">
+                  <p>{isHost ? '请选择视频文件并开始放映' : '等待房主开始播放'}</p>
+                </div>
+              )}
+
+              {(needClickPlay || videoError) && (
+                <div className="video-overlay">
+                  {videoError && (
+                    <p style={{ color: '#ff6b6b', marginBottom: 12, maxWidth: 320 }}>{videoError}</p>
+                  )}
+                  <button
+                    className="btn btn-primary"
+                    onClick={playCurrentVideo}
+                  >
+                    ▶️ 点击开始播放（含声音）
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* 语音控制条 */}
+            <div className="voice-controls">
+              {inVoice ? (
+                <>
+                  <span className="voice-status on">🎤 语音聊天中</span>
+                  <button onClick={toggleMic} className="btn btn-secondary btn-sm">
+                    {micOn ? '🔇 关闭麦克风' : '🎤 打开麦克风'}
+                  </button>
+                  <button onClick={leaveVoice} className="btn btn-secondary btn-sm">
+                    📞 退出语音
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="voice-status">未加入语音</span>
+                  <button onClick={joinVoice} className="btn btn-primary btn-sm">
+                    🎤 加入语音聊天
+                  </button>
+                </>
+              )}
+              <span className="voice-hint">点击左侧头像可静音某人{isHost ? '或踢出房间' : ''}</span>
+            </div>
+
+            {/* 房主控制面板 */}
+            {isHost && (
+              <div className="host-controls">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="video/*,.mkv,.flv,.wmv"
+                  style={{ display: 'none' }}
+                  onChange={handleFileInput}
+                />
+
+                {/* 片源模式：本地文件 / 网络视频直链 */}
+                <div className="source-tabs">
+                  <button
+                    className={`tab ${!usingRemoteUrl ? 'active' : ''}`}
+                    onClick={() => setUsingRemoteUrl(false)}
+                  >📁 本地文件</button>
+                  <button
+                    className={`tab ${usingRemoteUrl ? 'active' : ''}`}
+                    onClick={() => setUsingRemoteUrl(true)}
+                  >🌐 网络视频直链</button>
+                </div>
+
+                {usingRemoteUrl ? (
+                  <div className="url-play-row">
+                    <span className="selected-file">📽️ {remotePlayUrl ? remotePlayUrl : '尚未设置播放源'}</span>
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="粘贴视频直链（支持 .m3u8 HLS 或 mp4/webm 等）"
+                      value={urlInput}
+                      onChange={(e) => setUrlInput(e.target.value)}
+                    />
+                    <button className="btn btn-secondary btn-sm" onClick={() => setRemotePlayUrl(urlInput.trim())}>
+                      设为播放源
+                    </button>
+                  </div>
+                ) : (
+                  !selectedFile && (
+                    <button onClick={selectVideoFile} className="btn btn-primary">
+                      📁 选择视频文件
+                    </button>
+                  )
+                )}
+
+                {!isPlaying ? (
+                  <button
+                    onClick={startPlayback}
+                    className="btn btn-success"
+                    disabled={usingRemoteUrl ? !remotePlayUrl.trim() : !selectedFile}
+                  >
+                    ▶️ {usingRemoteUrl ? '播放网络视频' : '开始放映'}
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={pausePlayback}
+                      className="btn btn-warning"
+                    >
+                      ⏸️ 暂停放映
+                    </button>
+                    <button onClick={resumePlayback} className="btn btn-success" disabled={pendingPlaybackAction !== null}>
+                      ▶️ 继续
+                    </button>
+                    <button
+                      onClick={stopPlayback}
+                      className="btn btn-secondary"
+                      disabled={pendingPlaybackAction !== null}
+                    >
+                      {pendingPlaybackAction === 'stop' ? '🗳️ 投票中...' : '⏹️ 结束放映'}
+                    </button>
+                    <span className="host-hint">放映途中无法解散房间</span>
+                  </>
+                )}
+
+                {/* 未播放时允许解散房间 */}
+                {!isPlaying && (
+                  <button
+                    onClick={() => { if (confirm('确定要解散房间吗？')) leaveRoom(); }}
+                    className="btn btn-danger"
+                  >
+                    ❌ 解散房间
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 右侧：聊天 */}
+          <div className="sidebar">
+            <div className="chat-panel card">
+              <h3>💬 聊天 ({members.length} 人在房间)</h3>
+              <div className="chat-messages">
+                {messages.map((msg, idx) => (
+                  <div key={idx} className={`chat-msg ${msg.userId === myUserId && msg.from === '我' ? 'self' : ''} ${msg.from === '系统' ? 'system' : ''}`}>
+                    <span className="msg-from">{msg.from}:</span>
+                    <span className="msg-text">{msg.message}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="chat-input-area">
+                <input
+                  type="text"
+                  className="input chat-input"
+                  value={chatInput}
+                  maxLength={CHAT_MAX_LENGTH}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                  placeholder={`发送消息（最多 ${CHAT_MAX_LENGTH} 字）...`}
+                />
+                <button
+                  onClick={sendMessage}
+                  className="btn btn-primary btn-sm"
+                  disabled={chatCooldown > 0 || !chatInput.trim()}
+                >
+                  {chatCooldown > 0 ? `${chatCooldown}s` : '发送'}
+                </button>
+              </div>
+              <div className="chat-rules">每 {CHAT_COOLDOWN_SEC} 秒可发送一条，每条最多 {CHAT_MAX_LENGTH} 字</div>
+            </div>
+
+            {!isHost && (
+              <button onClick={leaveRoom} className="btn btn-secondary btn-block">
+                离开房间
+              </button>
+            )}
+          </div>
+
+          {/* 加入语音询问弹窗 */}
+          {showVoicePrompt && (
+            <div className="modal-mask">
+              <div className="modal-card card">
+                <h3>🎤 是否加入语音聊天？</h3>
+                <p>加入后可以与房间内所有人语音交流，也可以随时退出。</p>
+                <div className="modal-actions">
+                  <button className="btn btn-secondary" onClick={() => setShowVoicePrompt(false)}>
+                    暂不加入
+                  </button>
+                  <button className="btn btn-primary" onClick={joinVoice}>
+                    加入语音
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 踢出确认弹窗（房主发起后观众收到） */}
+          {kickVote && (
+            <div className="modal-mask">
+              <div className="modal-card card">
+                <h3>🗳️ 踢出投票</h3>
+                <p>
+                  房主发起投票：是否同意踢出「<strong>{kickVote.targetName}</strong>」？<br />
+                  房间内 1/3 的人同意（{kickVote.needed}/{kickVote.total} 人）即踢出，且本场电影无法再次进入。
+                </p>
+                <div className="modal-actions">
+                  <button className="btn btn-secondary" onClick={() => answerKickVote(false)}>
+                    否（不同意）
+                  </button>
+                  <button className="btn btn-danger" onClick={() => answerKickVote(true)}>
+                    是（同意踢出）
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 放映控制投票（房主发起暂停/结束放映后观众收到） */}
+          {playbackVote && (
+            <div className="modal-mask">
+              <div className="modal-card card">
+                <h3>🗳️ 放映控制投票</h3>
+                <p>
+                  「{playbackVote.initiator}」发起投票：是否同意
+                  <strong>{playbackVote.action === 'pause' ? '暂停放映' : '结束本场放映'}</strong>？<br />
+                  需房间内 1/3 的人同意（{playbackVote.needed}/{playbackVote.total} 人）后生效。
+                </p>
+                <div className="modal-actions">
+                  <button className="btn btn-secondary" onClick={() => answerPlaybackVote(false)}>
+                    不同意
+                  </button>
+                  <button className="btn btn-primary" onClick={() => answerPlaybackVote(true)}>
+                    同意
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 静音 / 踢出 操作菜单：固定定位在顶层，避免被头像栏裁剪 */}
+          {menuUserId && menuRect && (
+            <div className="menu-backdrop" onClick={() => { setMenuUserId(null); setMenuRect(null); }} />
+          )}
+          {menuUserId && menuRect && (() => {
+            const m = members.find(mm => mm.userId === menuUserId);
+            if (!m) return null;
+            const isMemberHost = m.userId === room?.hostId;
+            const mutedNow = mutedUserIds.has(m.userId);
+            return (
+              <div className="avatar-menu-fixed" style={{ left: menuRect.x, top: menuRect.y }}>
+                <button onClick={() => { toggleMuteUser(m.userId); setMenuUserId(null); setMenuRect(null); }}>
+                  {mutedNow ? '🔊 取消静音' : '🔇 静音此人'}
+                </button>
+                {isHost && !isMemberHost && (
+                  <button className="danger" onClick={() => requestKick(m.userId)}>
+                    🗳️ 踢出房间
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      )}
+    </div>
+  );
+}

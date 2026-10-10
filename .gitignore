@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+release/
+out/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.db-journal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Certificates (微信支付证书)
+certs/
+*.pem
+
+# 运行时上传的房间图片（用户数据，不入库）
+uploads/
+
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+
+# WorkBuddy 工作区记忆（本机笔记，不入库）
+.workbuddy/
+
+# 代码审计报告（含漏洞细节，暂不入库）
+代码审计报告.md

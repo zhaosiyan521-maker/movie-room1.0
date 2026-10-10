@@ -1,0 +1,115 @@
+// Prisma Schema for Movie Room App
+// 注意：SQLite 不支持 enum，使用 String 代替
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(uuid())
+  username      String    @unique
+  email         String    @unique
+  passwordHash  String
+  nickname      String
+  avatar        String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // 用户名修改冷却（30 天）
+  usernameChangedAt DateTime?
+
+  // 封禁相关
+  banned        Boolean   @default(false)
+  banReason     String?
+  bannedAt      DateTime?
+  lastIp        String?
+  abruptLeaves  Int       @default(0) // 放映中强行中断次数（≥3 永久封禁）
+
+  // 管理员
+  isAdmin       Boolean   @default(false)
+
+  // JWT 令牌版本：改密/封禁时自增，使此前签发的 JWT 立即失效
+  tokenVersion  Int       @default(0)
+
+  rooms         Room[]   @relation("HostedRooms")
+  memberships   RoomMember[]
+  bans          RoomBan[]
+  @@map("users")
+}
+
+model Room {
+  id              String    @id @default(uuid())
+  name            String
+  description     String?
+  images          String?         // 房间图片（JSON 数组，最多 5 张）
+  hostId          String
+  host            User      @relation("HostedRooms", fields: [hostId], references: [id])
+
+  // 房间设置
+  password        String?         // 密码保护（可选）
+  maxViewers      Int             @default(30) // 最大观众数
+
+  // 房间状态：WAITING, PLAYING, ENDED
+  status          String          @default("WAITING")
+  currentMovie    String?         // 当前播放的电影名（仅作显示）
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  members         RoomMember[]
+  bans            RoomBan[]
+  @@map("rooms")
+}
+
+model RoomMember {
+  id          String    @id @default(uuid())
+  roomId      String
+  room        Room      @relation(fields: [roomId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  // 角色：HOST, VIEWER
+  role        String    @default("VIEWER")
+  joinedAt    DateTime  @default(now())
+  leftAt      DateTime?
+
+  @@unique([roomId, userId])
+  @@map("room_members")
+}
+
+// 房间黑名单（被投票踢出的用户，本场电影禁止再次进入；房间解散时清除）
+model RoomBan {
+  id          String    @id @default(uuid())
+  roomId      String
+  room        Room      @relation(fields: [roomId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  reason      String?
+  createdAt   DateTime  @default(now())
+
+  @@unique([roomId, userId])
+  @@map("room_bans")
+}
+
+// 全局 IP 封禁列表（永久封禁的用户 IP，管理员可解除）
+model BannedIp {
+  id          String    @id @default(uuid())
+  ip          String    @unique
+  reason      String?
+  userId      String?   // 关联被封禁的用户
+  createdAt   DateTime  @default(now())
+
+  @@map("banned_ips")
+}
+
+// 已消费的邮箱验证令牌 jti（一次性令牌落库，防重放）
+// 注意：仅存内存会在服务重启后使全部已消费令牌复活，故必须持久化。
+model UsedToken {
+  jti       String   @id
+  usedAt    DateTime @default(now())
+
+  @@map("used_tokens")
+}
