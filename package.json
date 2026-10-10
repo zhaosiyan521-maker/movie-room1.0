@@ -23,8 +23,5 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
-  },
-  "dependencies": {
-    "@rollup/rollup-win32-x64-msvc": "^4.64.3"
   }
 }
