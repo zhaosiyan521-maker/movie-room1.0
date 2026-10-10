@@ -349,6 +349,38 @@ export default function RoomView() {
           await createPeerConnection(u.socketId);
         }
       }
+
+      // 新观众加入：若房间正在放映，立即续播并追到房主当前进度
+      if (data.playbackState?.playing) {
+        const ps = data.playbackState;
+        setIsPlaying(true);
+        setResolution(ps.resolution || null);
+        if (ps.videoUrl) {
+          // 网络视频模式：加载直链，并在媒体可播放后追进度
+          setRemotePlayUrl(ps.videoUrl);
+          loadRemoteVideo(ps.videoUrl, !!ps.isHls);
+          // 等待媒体就绪后跳转到房主当前进度
+          const seekToProgress = () => {
+            const el = remoteVideoRef.current;
+            if (!el) return;
+            const target = typeof ps.currentTime === 'number' ? ps.currentTime : 0;
+            const applySeek = () => {
+              if (el.readyState >= 1 && target > 0) {
+                try { el.currentTime = target; } catch {}
+              }
+              el.play().catch(() => setNeedClickPlay(true));
+            };
+            if (el.readyState >= 1) applySeek();
+            else el.addEventListener('loadedmetadata', applySeek, { once: true });
+          };
+          setTimeout(seekToProgress, 300);
+        } else {
+          // 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
+          setRemotePlayUrl('');
+          destroyHls();
+          remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+        }
+      }
     });
 
     socket.on('user-joined', (data: any) => {
@@ -677,6 +709,13 @@ export default function RoomView() {
   const joinVoice = async () => {
     setShowVoicePrompt(false);
     try {
+      // 安全上下文检查：getUserMedia 在公网 HTTP（非 localhost / 非 HTTPS）下会被浏览器拒绝。
+      // 提前给出明确提示，避免「点击无反应」。
+      if (!navigator.mediaDevices?.getUserMedia) {
+        alert('当前页面无法访问麦克风：浏览器仅在 HTTPS 或 localhost 安全环境下允许语音。\n请通过 HTTPS（如 https://你的域名）访问本网站后再加入语音。');
+        return;
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       localMicRef.current = stream;
       setInVoice(true);
@@ -688,9 +727,20 @@ export default function RoomView() {
 
       socketRef.current?.emit('voice-join', id);
       startSpeakingDetection(stream);
-    } catch (error) {
+    } catch (error: any) {
       console.error('获取麦克风失败:', error);
-      alert('无法访问麦克风，请检查浏览器权限设置');
+      const name = error?.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        alert('麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问后重试。');
+      } else if (name === 'NotFoundError') {
+        alert('未检测到麦克风设备，请检查设备连接。');
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        alert('麦克风被其他应用占用，请关闭占用麦克风的程序后重试。');
+      } else if (name === 'SecurityError') {
+        alert('当前页面不是安全上下文（HTTP），浏览器禁止访问麦克风。\n请通过 HTTPS 访问本网站后再加入语音。');
+      } else {
+        alert('无法访问麦克风，请检查浏览器权限设置。');
+      }
     }
   };
 

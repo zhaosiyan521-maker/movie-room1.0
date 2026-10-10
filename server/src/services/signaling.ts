@@ -18,6 +18,18 @@ const kickVotes = new Map<string, Map<string, { agrees: Set<string>; declines: S
 // 放映投票（暂停/结束）：roomId -> { action, agrees, declines }
 const playbackVotes = new Map<string, { action: 'pause' | 'stop'; agrees: Set<string>; declines: Set<string> }>();
 
+// 房间当前播放状态缓存：新观众加入时据此立即续播，避免「等待房主开始播放」。
+// roomId -> { playing, videoUrl?, isHls?, resolution?, currentTime, duration, updatedAt }
+interface RoomPlaybackState {
+  playing: boolean;
+  videoUrl?: string | null;
+  isHls?: boolean;
+  resolution?: string | null;
+  currentTime: number;
+  duration: number;
+}
+const roomPlaybackStates = new Map<string, RoomPlaybackState>();
+
 // io 实例引用：供 admin 路由主动断开被封禁用户的连接（避免与 index.ts 形成循环依赖）
 let ioRef: Server | null = null;
 
@@ -230,11 +242,15 @@ export function setupSocketHandlers(io: Server) {
             };
           });
 
+        // 若房间正在放映，把当前播放状态一并下发，让新观众立即续播而非「等待房主开始播放」
+        const playbackState = roomPlaybackStates.get(roomIdStr) || null;
+
         socket.emit('room-joined', {
           roomId: roomIdStr,
           users: usersInRoom,
           userCount: roomUsers.get(roomIdStr)?.size || 0,
-          selfSocketId: socket.id
+          selfSocketId: socket.id,
+          playbackState
         });
 
         dbg(`${socket.username} 加入了房间 ${roomIdStr}`);
@@ -291,6 +307,16 @@ export function setupSocketHandlers(io: Server) {
         }
       }
 
+      // 更新房间播放状态缓存，供新观众加入时续播
+      roomPlaybackStates.set(room.id, {
+        playing: true,
+        videoUrl: typeof data.videoUrl === 'string' ? data.videoUrl : null,
+        isHls: !!data.isHls,
+        resolution: typeof data.resolution === 'string' ? data.resolution.slice(0, 20) : null,
+        currentTime: 0,
+        duration: 0
+      });
+
       socket.to(room.id).emit('playback-start', {
         hostId: socket.userId,
         movieName: data.movieName.slice(0, 200),
@@ -314,6 +340,9 @@ export function setupSocketHandlers(io: Server) {
       const room = await requireHost(socket, data?.roomId);
       if (!room) return;
 
+      const st = roomPlaybackStates.get(room.id);
+      if (st) st.playing = true;
+
       socket.to(room.id).emit('playback-resume', {
         hostId: socket.userId
       });
@@ -323,6 +352,9 @@ export function setupSocketHandlers(io: Server) {
     socket.on('host-pause', async (data: { roomId: string }) => {
       const room = await requireHost(socket, data?.roomId);
       if (!room) return;
+
+      const st = roomPlaybackStates.get(room.id);
+      if (st) st.playing = false;
 
       io.to(room.id).emit('playback-pause', { byHost: true });
     });
@@ -399,6 +431,13 @@ export function setupSocketHandlers(io: Server) {
       const currentTime = Number(data.currentTime);
       const duration = Number(data.duration);
       if (!Number.isFinite(currentTime) || !Number.isFinite(duration)) return;
+
+      // 更新房间播放状态缓存的进度，供新观众加入时续播
+      const st = roomPlaybackStates.get(room.id);
+      if (st) {
+        st.currentTime = Math.max(0, currentTime);
+        st.duration = Math.max(0, duration);
+      }
 
       socket.to(room.id).emit('progress-sync', {
         currentTime: Math.max(0, currentTime),
@@ -655,6 +694,7 @@ async function checkPlaybackVotes(io: Server, roomId: string) {
       io.to(roomId).emit('playback-pause', { byVote: true });
     } else {
       io.to(roomId).emit('playback-stop', { byVote: true });
+      roomPlaybackStates.delete(roomId); // 结束放映，清空播放状态
       await prisma.room.update({
         where: { id: roomId },
         data: { status: 'WAITING' }
@@ -702,6 +742,7 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
       roomUsers.delete(roomId);
       kickVotes.delete(roomId);
       playbackVotes.delete(roomId);  // 房间清空时一并清理，避免内存泄漏
+      roomPlaybackStates.delete(roomId);
     }
   }
 
@@ -755,6 +796,8 @@ async function handleHostAbruptLeave(io: Server, roomId: string, hostUserId: str
       where: { id: roomId },
       data: { status: 'WAITING' }
     }).catch(() => {});
+
+    roomPlaybackStates.delete(roomId); // 放映中断，清空播放状态
 
     io.to(roomId).emit('host-disconnected', {
       message: '房主连接中断，放映已结束'
