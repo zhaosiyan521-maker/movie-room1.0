@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 import { useVerifyStore } from '../store/verifyStore';
@@ -24,6 +24,14 @@ export default function Register() {
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setForm({ ...form, [e.target.name]: e.target.value });
   };
+
+  // 当验证令牌更新（如其他标签页完成验证）时，自动回填邮箱，
+  // 确保 form.email 与 pending.email 一致，验证状态能正确点亮/通过。
+  useEffect(() => {
+    if (pending?.purpose === 'register' && pending.email) {
+      setForm(prev => (prev.email === pending.email ? prev : { ...prev, email: pending.email }));
+    }
+  }, [pending]);
 
   // 邮箱是否已完成「点击邮件验证链接」这一步
   const emailVerified =
