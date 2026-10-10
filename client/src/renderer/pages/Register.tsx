@@ -1,14 +1,17 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 import { useVerifyStore } from '../store/verifyStore';
 import SendVerifyLink from '../components/SendVerifyLink';
 import './Login.css';
 
 export default function Register() {
+  const [searchParams] = useSearchParams();
+  // 从验证成功跳转过来的 URL 里读取邮箱，自动回填，避免用户手动重填导致验证状态对不上
+  const emailFromUrl = searchParams.get('email') || '';
   const [form, setForm] = useState({
     username: '',
-    email: '',
+    email: emailFromUrl,
     password: '',
     confirmPassword: '',
     nickname: ''

@@ -75,7 +75,14 @@ export default function EmailVerify() {
               已确认邮箱 <strong>{info.email}</strong>，本次操作为「{PURPOSE_TEXT[info.purpose] || info.purpose}」。
             </p>
             <p className="ev-tip">请返回对应页面继续操作。点击下方按钮即可前往。</p>
-            <button className="btn btn-primary btn-block" onClick={() => navigate(PURPOSE_TARGET[info.purpose] || '/')}>
+            <button
+              className="btn btn-primary btn-block"
+              onClick={() => {
+                // 跳转时把邮箱带过去，让目标页面（如注册页）自动回填，避免用户手动重填导致状态对不上
+                const target = PURPOSE_TARGET[info.purpose] || '/';
+                navigate(`${target}?email=${encodeURIComponent(info.email)}`);
+              }}
+            >
               前往{PURPOSE_TEXT[info.purpose] || '操作'}
             </button>
             <div className="email-verify-footer">
