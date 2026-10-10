@@ -112,10 +112,19 @@ export default function RoomView() {
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 全屏容器引用：全屏时气泡/聊天公屏需要渲染在该元素内部，否则不会显示
+  const videoContainerRef = useRef<HTMLDivElement>(null);
   const [isHost, setIsHost] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
+
+  // ===== 全屏观看 + 聊天公屏 =====
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  // 全屏时是否打开聊天公屏
+  const [showOverlayChat, setShowOverlayChat] = useState(false);
+  // 聊天公屏不透明度（0.3 ~ 0.95）
+  const [chatOpacity, setChatOpacity] = useState(0.72);
 
   // 成员 / 语音 / 聊天
   const [members, setMembers] = useState<RoomMemberInfo[]>([]);
@@ -1133,6 +1142,54 @@ export default function RoomView() {
     setPlaybackVote(null);
   };
 
+  // ===== 全屏观看 =====
+
+  const enterFullscreen = async () => {
+    const el = videoContainerRef.current;
+    if (!el) return;
+    try {
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
+      } else if ((el as any).webkitRequestFullscreen) {
+        (el as any).webkitRequestFullscreen(); // iOS Safari
+      }
+    } catch (err) {
+      console.error('进入全屏失败:', err);
+    }
+  };
+
+  const exitFullscreen = async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else if ((document as any).webkitFullscreenElement) {
+        (document as any).webkitExitFullscreen();
+      }
+    } catch (err) {
+      console.error('退出全屏失败:', err);
+    }
+  };
+
+  const toggleFullscreen = () => {
+    if (isFullscreen) exitFullscreen();
+    else enterFullscreen();
+  };
+
+  // 监听全屏状态变化（含用户按 Esc 退出全屏），同步 UI 状态
+  useEffect(() => {
+    const onFsChange = () => {
+      const fsEl = document.fullscreenElement || (document as any).webkitFullscreenElement;
+      setIsFullscreen(!!fsEl);
+      if (!fsEl) setShowOverlayChat(false);
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+    };
+  }, []);
+
   const leaveRoom = async () => {
     // 放映途中房主不允许解散房间
     if (isHost && isPlaying) {
@@ -1280,7 +1337,7 @@ export default function RoomView() {
               </div>
             )}
 
-            <div className="video-container">
+            <div className="video-container" ref={videoContainerRef}>
               {isHost ? (
                 <video
                   ref={localVideoRef}
@@ -1332,6 +1389,84 @@ export default function RoomView() {
 
               {resolution && (
                 <div className="res-badge">{resolution}</div>
+              )}
+
+              {/* 全屏切换按钮（观众 + 房主均可用） */}
+              <button
+                className="fullscreen-btn"
+                onClick={toggleFullscreen}
+                title={isFullscreen ? '退出全屏' : '全屏观看'}
+              >
+                {isFullscreen ? '⛶ 退出全屏' : '⛶ 全屏'}
+              </button>
+
+              {/* 全屏时：左下角圆形半透明气泡，点击打开聊天公屏 */}
+              {isFullscreen && (
+                <button
+                  className={`fullscreen-bubble ${showOverlayChat ? 'active' : ''}`}
+                  onClick={() => setShowOverlayChat(v => !v)}
+                  title={showOverlayChat ? '收起聊天公屏' : '打开聊天公屏'}
+                >
+                  💬
+                </button>
+              )}
+
+              {/* 全屏聊天公屏：占屏幕 1/4，半透明，可调不透明度 */}
+              {isFullscreen && showOverlayChat && (
+                <div className="overlay-chat" style={{ opacity: chatOpacity }}>
+                  <div className="overlay-chat-header">
+                    <span className="overlay-chat-title">💬 聊天公屏 ({members.length} 人)</span>
+                    <div className="overlay-chat-actions">
+                      <label className="opacity-control" title="调整不透明度">
+                        <span className="opacity-label">不透明度</span>
+                        <input
+                          type="range"
+                          min="0.3"
+                          max="0.95"
+                          step="0.01"
+                          value={chatOpacity}
+                          onChange={(e) => setChatOpacity(Number(e.target.value))}
+                        />
+                      </label>
+                      <button
+                        className="overlay-chat-close"
+                        onClick={() => setShowOverlayChat(false)}
+                        title="收起"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                  <div className="overlay-chat-messages">
+                    {messages.map((msg, idx) => (
+                      <div
+                        key={idx}
+                        className={`overlay-chat-msg ${msg.userId === myUserId && msg.from === '我' ? 'self' : ''} ${msg.from === '系统' ? 'system' : ''}`}
+                      >
+                        <span className="msg-from">{msg.from}:</span>
+                        <span className="msg-text">{msg.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="overlay-chat-input">
+                    <input
+                      type="text"
+                      className="input chat-input"
+                      value={chatInput}
+                      maxLength={CHAT_MAX_LENGTH}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                      placeholder={`发送消息（最多 ${CHAT_MAX_LENGTH} 字）...`}
+                    />
+                    <button
+                      onClick={sendMessage}
+                      className="btn btn-primary btn-sm"
+                      disabled={chatCooldown > 0 || !chatInput.trim()}
+                    >
+                      {chatCooldown > 0 ? `${chatCooldown}s` : '发送'}
+                    </button>
+                  </div>
+                </div>
               )}
 
               {!isPlaying && (
