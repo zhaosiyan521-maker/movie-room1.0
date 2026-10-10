@@ -3,8 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  // 相对路径，适配 Electron 打包后的 file:// 协议加载
-  base: './',
+  // 绝对路径：网页端由后端在域名根路径托管，深层路由（如 /room/xxx）下
+  // 相对路径 './assets/...' 会被解析成 /room/assets/... 导致白屏
+  base: '/',
   server: {
     port: 5173,
     // 端口被占用时直接报错，而不是静默递增到 5174
