@@ -106,3 +106,54 @@ export async function inspectEmailToken(token: string): Promise<{ email: string;
     return null;
   }
 }
+
+/**
+ * 标记某邮箱某用途「已完成验证」。
+ * 在 /verify-email 确认 token 有效后调用，落库一份记录，
+ * 供后续 register / change-password / bind-email 在本地 token 丢失时按邮箱兜底求证。
+ */
+export async function markEmailVerified(email: string, purpose: VerifyPurpose): Promise<void> {
+  try {
+    await prisma.emailVerify.upsert({
+      where: { email_purpose: { email, purpose } },
+      create: { email, purpose },
+      update: { verifiedAt: new Date() }
+    });
+  } catch (error) {
+    console.error('标记邮箱验证失败:', error);
+  }
+}
+
+/**
+ * 查询某邮箱某用途是否已完成验证（且仍在有效期内）。
+ * 超过 emailVerifyTtlSec 的旧记录视为失效，避免过期验证被永久复用。
+ */
+export async function isEmailVerified(email: string, purpose: VerifyPurpose): Promise<boolean> {
+  try {
+    const rec = await prisma.emailVerify.findUnique({
+      where: { email_purpose: { email, purpose } }
+    });
+    if (!rec) return false;
+    const age = Date.now() - rec.verifiedAt.getTime();
+    return age <= config.emailVerifyTtlSec * 1000;
+  } catch (error) {
+    console.error('查询邮箱验证状态失败:', error);
+    return false;
+  }
+}
+
+/**
+ * 按邮箱消费一条已验证记录（注册成功后调用，避免同一份验证被重复用于多次注册）。
+ * 返回是否成功消费（存在该记录）。
+ */
+export async function consumeEmailVerified(email: string, purpose: VerifyPurpose): Promise<boolean> {
+  try {
+    const res = await prisma.emailVerify.deleteMany({
+      where: { email, purpose }
+    });
+    return res.count > 0;
+  } catch (error) {
+    console.error('消费邮箱验证记录失败:', error);
+    return false;
+  }
+}

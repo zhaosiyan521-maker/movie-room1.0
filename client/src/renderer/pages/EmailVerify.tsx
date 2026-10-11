@@ -26,7 +26,10 @@ export default function EmailVerify() {
   const [info, setInfo] = useState<{ email: string; purpose: string } | null>(null);
   const [error, setError] = useState('');
 
-  const t = params.get('t') || '';
+  const rawT = params.get('t') || '';
+  // 清洗 token：邮件客户端会把长链接折行，用户复制时可能带入换行/空格/尖括号等
+  // 附加字符，导致 jwt.verify 失败而误报「无效或已过期」。这里做保守清洗。
+  const t = rawT.trim().replace(/[\r\n\s]+/g, '').replace(/[<>]/g, '');
 
   useEffect(() => {
     let cancelled = false;

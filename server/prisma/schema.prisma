@@ -113,3 +113,16 @@ model UsedToken {
 
   @@map("used_tokens")
 }
+
+// 邮箱验证完成记录：用户点击邮件验证链接、服务端确认 token 有效的那一刻写入。
+// 用途：注册/改密/绑邮箱时，即使前端本地暂存的 token 丢失（换标签页/换设备/刷新），
+// 服务端也能按「邮箱 + 用途」独立判断该邮箱是否已完成验证，从而实现兜底求证。
+model EmailVerify {
+  id        String   @id @default(uuid())
+  email     String
+  purpose   String   // register | change-password | bind-email
+  verifiedAt DateTime @default(now())
+
+  @@unique([email, purpose])
+  @@map("email_verifies")
+}

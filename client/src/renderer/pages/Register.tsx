@@ -53,19 +53,16 @@ export default function Register() {
       return;
     }
 
-    // 按钮保持可交互：点击时先本地判断是否有验证令牌，再交给服务端最终求证。
-    if (!emailVerified) {
-      setError('请验证邮箱');
-      return;
-    }
-
+    // 按钮保持可交互：点击时不再因本地无验证令牌就阻断，
+    // 而是直接提交给服务端；服务端会按邮箱向数据库求证是否已验证（兜底）。
     try {
       await register({
         username: form.username,
         email: form.email,
         password: form.password,
         nickname: form.nickname || undefined,
-        emailVerifyToken: pending!.token
+        // 本地有令牌则带上（快速路径）；无令牌传空串，由服务端按邮箱兜底求证
+        emailVerifyToken: emailVerified ? pending!.token : ''
       });
       // 一次性令牌用完即清，避免重复使用
       clear();
@@ -74,7 +71,7 @@ export default function Register() {
       const msg = err.response?.data?.error || err || '注册失败';
       // 服务端求证未通过时，统一给用户「请验证邮箱」的明确提示
       if (/验证|verify/i.test(String(msg))) {
-        setError('请验证邮箱');
+        setError('请先完成邮箱验证');
       } else {
         setError(msg);
       }

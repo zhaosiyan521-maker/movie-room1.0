@@ -11,6 +11,9 @@ import {
   verifyEmailToken,
   inspectEmailToken,
   consumeEmailToken,
+  markEmailVerified,
+  isEmailVerified,
+  consumeEmailVerified,
   VerifyPurpose
 } from '../services/verifyLink';
 import { sendVerificationLink, emailConfigured } from '../services/email';
@@ -105,9 +108,23 @@ authRouter.post('/send-verify-link', sendLinkLimiter, async (req: Request, res: 
 // ===== 校验邮箱验证链接（前端点击链接后调用） =====
 // 仅做预览，不消耗令牌（真正消耗在 register / bind-email / change-password）
 authRouter.get('/verify-email', async (req: Request, res: Response) => {
-  const t = req.query.t as string;
+  const t = (req.query.t as string || '').trim();
+  if (!t) return res.status(400).json({ error: '验证链接缺少参数，请重新获取验证链接' });
+
   const info = await inspectEmailToken(t);
-  if (!info) return res.status(400).json({ error: '验证链接无效或已过期，请重新获取' });
+  if (!info) {
+    // 区分「已被使用」与「无效/过期」，给出更准确提示，避免用户盲目重复获取
+    try {
+      const payload = jwt.verify(t, config.jwtSecret, { algorithms: ['HS256'] }) as any;
+      if (payload?.jti) {
+        const used = await prisma.usedToken.findUnique({ where: { jti: payload.jti } });
+        if (used) return res.status(400).json({ error: '该验证链接已被使用，请重新获取验证链接' });
+      }
+    } catch { /* 非 JWT，走下方通用提示 */ }
+    return res.status(400).json({ error: '验证链接无效或已过期，请重新获取' });
+  }
+  // 链接校验通过即「已验证」：落库一份记录，供后续操作在本地 token 丢失时按邮箱兜底
+  await markEmailVerified(info.email, info.purpose);
   res.json({ ok: true, email: info.email, purpose: info.purpose });
 });
 
@@ -138,13 +155,22 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
       }
     }
     if (!emailVerifyToken) {
-      return res.status(400).json({ error: '请先完成邮箱验证再注册' });
-    }
-
-    // 校验邮箱验证令牌（用途必须为 register 且邮箱一致）
-    const verified = await verifyEmailToken(emailVerifyToken, 'register', email);
-    if (!verified) {
-      return res.status(400).json({ error: '邮箱验证无效或已过期，请重新获取验证链接' });
+      // 前端本地令牌丢失（换标签页/换设备/刷新）：按邮箱向服务端求证是否已验证
+      const emailVerified = await isEmailVerified(email, 'register');
+      if (!emailVerified) {
+        return res.status(400).json({ error: '请先完成邮箱验证再注册' });
+      }
+      // 兜底通过：无需 token，继续走后续注册流程（下方不再消费 token）
+    } else {
+      // 校验邮箱验证令牌（用途必须为 register 且邮箱一致）
+      const verified = await verifyEmailToken(emailVerifyToken, 'register', email);
+      if (!verified) {
+        // 令牌无效/过期/已被使用：仍按邮箱兜底求证一次，避免因令牌边界问题误伤
+        const emailVerified = await isEmailVerified(email, 'register');
+        if (!emailVerified) {
+          return res.status(400).json({ error: '邮箱验证无效或已过期，请重新获取验证链接' });
+        }
+      }
     }
 
     // 检查 IP 是否被永久封禁
@@ -166,12 +192,22 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
       return res.status(409).json({ error: '该用户名或邮箱已被注册' });
     }
 
-    // 原子消费令牌：必须在创建用户「之前」消费。
-    // 若放在之后，两个并发请求会同时通过 verifyEmailToken 检查（TOCTOU），
-    // 导致同一个验证链接被使用两次。
-    const consumed = await consumeEmailToken(emailVerifyToken);
-    if (!consumed) {
-      return res.status(400).json({ error: '邮箱验证链接已被使用，请重新获取' });
+    // 原子消费验证凭据：必须在创建用户「之前」消费。
+    // 若放在之后，两个并发请求会同时通过校验（TOCTOU），导致同一份验证被使用两次。
+    // 优先消费前端传来的 token（若有）；同时清理邮箱验证记录，防止重复注册。
+    if (emailVerifyToken) {
+      const consumed = await consumeEmailToken(emailVerifyToken);
+      if (!consumed) {
+        // token 消费失败（已被使用），但邮箱仍可能处于已验证状态（本次走的是兜底分支）
+        // 此时按邮箱消费记录即可，不必拒绝
+        await consumeEmailVerified(email, 'register');
+      } else {
+        // token 消费成功，一并清理邮箱验证记录
+        await consumeEmailVerified(email, 'register');
+      }
+    } else {
+      // 无 token，纯兜底：消费邮箱验证记录，防止同一邮箱重复注册
+      await consumeEmailVerified(email, 'register');
     }
 
     const passwordHash = await bcrypt.hash(password, 10);

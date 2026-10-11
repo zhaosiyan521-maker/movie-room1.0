@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, useAuthStore } from '../store/authStore';
 import { getAbsoluteApiBase, toProxiedUrl } from '../store/apiBase';
+import { getOrCreateHostSession, getHostSession, destroyHostSession, HostSession } from '../store/hostStreaming';
 import { io, Socket } from 'socket.io-client';
 import Hls from 'hls.js';
 import './RoomView.css';
@@ -105,8 +106,8 @@ export default function RoomView() {
 
   // WebRTC 相关
   const socketRef = useRef<Socket | null>(null);
-  const localVideoRef = useRef<HTMLVideoElement>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
@@ -114,6 +115,9 @@ export default function RoomView() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   // 全屏容器引用：全屏时气泡/聊天公屏需要渲染在该元素内部，否则不会显示
   const videoContainerRef = useRef<HTMLDivElement>(null);
+  // 房主本地视频的挂载容器：session.video 是模块级单例元素（跨页面存活），
+  // 这里用一个回调 ref 把它挂载进组件展示区，切页时再移回 document.body 隐藏。
+  const hostVideoMountRef = useRef<HTMLDivElement | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
@@ -183,6 +187,8 @@ export default function RoomView() {
   const localObjectUrlRef = useRef<string | null>(null);
   // 进度同步节流：记录上次广播时间戳
   const lastSyncProgressRef = useRef(0);
+  // 房主推流会话（模块级单例）：房主切页时推流资源跨页面存活
+  const hostSessionRef = useRef<HostSession | null>(null);
 
   const localMicRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -204,9 +210,16 @@ export default function RoomView() {
     };
   }, [id]);
 
-  const cleanupAll = () => {
+  const cleanupAll = (disposeHostSession = false) => {
+    // 房主：切换页面（disposeHostSession=false）时保留推流会话（socket + 本地视频 + WebRTC peers 继续存活），
+    // 只有观众或房主主动「解散/退出」（disposeHostSession=true）才彻底断开。
+    const isHostNow = isHost;
+    const shouldDisposeHost = isHostNow && disposeHostSession;
+
     if (socketRef.current) {
-      socketRef.current.disconnect();
+      if (!isHostNow || shouldDisposeHost) {
+        socketRef.current.disconnect();
+      }
       socketRef.current = null;
     }
     // 关键修复：必须复位 setupDoneRef。
@@ -218,8 +231,33 @@ export default function RoomView() {
     // 销毁 HLS 实例：否则旧实例会继续拉取分片，占用带宽与内存
     destroyHls();
 
-    peersRef.current.forEach(pc => pc.close());
-    peersRef.current.clear();
+    // 房主：切页时保留 peers（推流通道）与本地视频；观众或房主主动离开：关闭所有 peers
+    if (!isHostNow || shouldDisposeHost) {
+      peersRef.current.forEach(pc => pc.close());
+      peersRef.current.clear();
+    } else {
+      // 房主切页：把本地视频元素移出 React 组件（append 到 body 隐藏），
+      // 使 captureStream 的推流轨道不因 React 卸载 <video> 而停止，观众画面不断。
+      const localEl = localVideoRef.current;
+      if (localEl && hostSessionRef.current) {
+        hostSessionRef.current.video = localEl;
+        // 注意：绝不能 pause()！房主切页后视频仍需继续播放，captureStream 的
+        // 推流轨道才会持续产出帧，观众画面才不会冻结。只做隐藏，不暂停。
+        localEl.style.position = 'fixed';
+        localEl.style.left = '-9999px';
+        localEl.style.opacity = '0';
+        localEl.style.pointerEvents = 'none';
+        // 若尚未在 body 上，则挂载；React 卸载时因节点已移走而不会真正销毁它
+        if (localEl.parentNode !== document.body) {
+          document.body.appendChild(localEl);
+        }
+        // 解绑组件级事件：房主切页后这些 UI 事件不再需要，回到房间时重新绑定
+        localEl.onloadedmetadata = null;
+        localEl.onended = null;
+        localEl.onerror = null;
+        localEl.ontimeupdate = null;
+      }
+    }
     audioElsRef.current.forEach(el => {
       el.pause();
       el.srcObject = null;
@@ -238,10 +276,12 @@ export default function RoomView() {
     bubbleTimersRef.current = {};
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
 
-    // 释放 ObjectURL，避免 Blob 泄漏
+    // 释放 ObjectURL，避免 Blob 泄漏（房主切页时不释放，视频仍要用）
     if (localObjectUrlRef.current) {
-      URL.revokeObjectURL(localObjectUrlRef.current);
-      localObjectUrlRef.current = null;
+      if (!isHostNow) {
+        URL.revokeObjectURL(localObjectUrlRef.current);
+        localObjectUrlRef.current = null;
+      }
     }
 
     // 重置房间相关状态，避免上一个房间的聊天与 UI 状态串到新房间
@@ -328,15 +368,58 @@ export default function RoomView() {
     setupDoneRef.current = true;
 
     const token = localStorage.getItem('token');
-    const socket = io(`${getAbsoluteApiBase()}`, {
-      auth: { token },
-      transports: ['websocket']
-    });
+
+    // 房主：复用模块级持久 socket（跨页面切换存活），切换页面不断推流、服务端不判离开。
+    // 观众：每次进入房间新建 socket（组件卸载即断开）。
+    let socket: Socket;
+    if (isHost) {
+      const session = getOrCreateHostSession(id!);
+      hostSessionRef.current = session;
+      socket = session.socket;
+      // 房主回到房间（或首次进入）时，清掉旧组件残留的监听器，避免叠加
+      socket.removeAllListeners();
+    } else {
+      socket = io(`${getAbsoluteApiBase()}`, {
+        auth: { token },
+        transports: ['websocket']
+      });
+    }
 
     socketRef.current = socket;
 
+    // 房主：为持久 video 元素绑定组件级事件（进度同步 / 播完 / 错误 / 分辨率）。
+    // 组件卸载（切页）时由 cleanupAll 解绑，回到房间时重新绑定，避免监听器叠加。
+    if (isHost && hostSessionRef.current) {
+      const v = hostSessionRef.current.video as HTMLVideoElement;
+      v.onloadedmetadata = () => setResolution(getResolution());
+      v.onended = handleHostMovieEnded;
+      v.onerror = () => {
+        const code = (v.error && v.error.code) || 0;
+        let msg = '视频加载失败，请检查文件格式或网络链接是否有效';
+        if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
+        else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) msg = '格式不支持：该直链无法播放，或 HLS 流未被正确识别';
+        setVideoError(`${msg}。多数站点直链有时效，请重试或更换链接。`);
+        setNeedClickPlay(true);
+      };
+      v.ontimeupdate = () => {
+        const el = v;
+        if (!el || !socketRef.current) return;
+        const now = Date.now();
+        if (now - lastSyncProgressRef.current < 2000) return;
+        lastSyncProgressRef.current = now;
+        socketRef.current.emit('sync-progress', {
+          roomId: id,
+          currentTime: el.currentTime,
+          duration: el.duration || 0
+        });
+      };
+    }
+
     socket.on('connect', () => {
       socket.emit('join-room', id);
+      if (isHost && hostSessionRef.current) {
+        hostSessionRef.current.joinedRoom = true;
+      }
       const me = useAuthStore.getState().user;
       if (me) {
         setOnlineUserIds(prev => new Set(prev).add(me.id));
@@ -589,14 +672,16 @@ export default function RoomView() {
 
     socket.on('kicked', (data: any) => {
       alert(data.reason || '你已被踢出该房间');
-      cleanupAll();
+      if (isHost) { destroyHostSession(id!); hostSessionRef.current = null; }
+      cleanupAll(true);
       navigate('/');
     });
 
     // 房间被彻底解散并清除（房主退出后自动解散），所有人退出到首页
     socket.on('room-dissolved', (data: any) => {
       alert(data.reason || '房间已解散并清除');
-      cleanupAll();
+      if (isHost) { destroyHostSession(id!); hostSessionRef.current = null; }
+      cleanupAll(true);
       navigate('/');
     });
 
@@ -1342,7 +1427,13 @@ export default function RoomView() {
     if (socketRef.current) {
       socketRef.current.emit('leave-room', id);
     }
-    cleanupAll();
+    // 房主主动离开：彻底销毁推流会话（socket + 本地视频 + WebRTC peers + captureStream）。
+    // 注意顺序：先 emit leave-room 再销毁，确保服务端收到离开信号。
+    if (isHost) {
+      destroyHostSession(id!);
+      hostSessionRef.current = null;
+    }
+    cleanupAll(true);
 
     try {
       await api.post(`/rooms/${id}/leave`);
@@ -1490,36 +1581,31 @@ export default function RoomView() {
 
             <div className="video-container" ref={videoContainerRef}>
               {isHost ? (
-                <video
-                  ref={localVideoRef}
+                // 房主本地视频：使用模块级单例元素（session.video），跨页面切换存活。
+                // 通过回调 ref 把单例元素挂载进组件展示区；切页时由 cleanupAll 移回 body 隐藏。
+                <div
+                  ref={(el) => {
+                    hostVideoMountRef.current = el;
+                    if (!el) return;
+                    const session = hostSessionRef.current;
+                    const v = session?.video;
+                    if (v && v.parentNode !== el) {
+                      // 恢复可见并挂载进组件
+                      v.style.position = '';
+                      v.style.left = '';
+                      v.style.top = '';
+                      v.style.width = '100%';
+                      v.style.height = '100%';
+                      v.style.opacity = '';
+                      v.style.pointerEvents = '';
+                      el.appendChild(v);
+                      localVideoRef.current = v;
+                    } else if (v) {
+                      localVideoRef.current = v;
+                    }
+                  }}
                   className="video-player"
-                  controls
-                  playsInline
-                  onLoadedMetadata={() => setResolution(getResolution())}
-                  onEnded={handleHostMovieEnded}
-                  onError={() => {
-                    const code = localVideoRef.current?.error?.code;
-                    let msg = '视频加载失败，请检查文件格式或网络链接是否有效';
-                    if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
-                    else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) msg = '格式不支持：该直链无法播放，或 HLS 流未被正确识别';
-                    setVideoError(`${msg}。多数站点直链有时效，请重试或更换链接。`);
-                    setNeedClickPlay(true);
-                  }}
-                  onTimeUpdate={() => {
-                    // 节流：onTimeUpdate 每秒触发约 4 次，30 人房间中相当于
-                    // 每秒 120 次服务端转发，会挤占 WebRTC 信令通道。
-                    // 进度同步 2 秒一次已足够流畅。
-                    const el = localVideoRef.current;
-                    if (!el || !socketRef.current) return;
-                    const now = Date.now();
-                    if (now - lastSyncProgressRef.current < 2000) return;
-                    lastSyncProgressRef.current = now;
-                    socketRef.current.emit('sync-progress', {
-                      roomId: id,
-                      currentTime: el.currentTime,
-                      duration: el.duration || 0
-                    });
-                  }}
+                  style={{ width: '100%', height: '100%' }}
                 />
               ) : (
                 <video
