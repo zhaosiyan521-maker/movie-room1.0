@@ -74,6 +74,18 @@ function parseImages(images?: string | null): string[] {
   }
 }
 
+// 秒 → 时间文本（HH:MM:SS 或 MM:SS），用于观众端只读进度显示
+function formatTime(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return '00:00';
+  const s = Math.floor(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const mm = String(m).padStart(2, '0');
+  const sss = String(ss).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${sss}` : `${mm}:${sss}`;
+}
+
 // 语音音量 → 颜色：低音量绿色，高音量红色（绿→黄→红）
 function speakingColor(level: number): string {
   const hue = 120 - Math.max(0, Math.min(1, level)) * 120; // 120(绿) → 0(红)
@@ -160,6 +172,9 @@ export default function RoomView() {
   // 分辨率同步（房主视频分辨率徽标）
   const [resolution, setResolution] = useState<string | null>(null);
 
+  // 观众端只读进度显示（当前播放时间 / 总时长）
+  const [progress, setProgress] = useState<{ current: number; duration: number }>({ current: 0, duration: 0 });
+
   // 网络视频播放模式（房主粘贴直链，观众各自加载，不经过房主带宽）
   const [usingRemoteUrl, setUsingRemoteUrl] = useState(false);
   // usingRemoteUrl 的同步镜像：addLocalTracksTo 在 room-joined 异步回调里被调用，
@@ -190,6 +205,8 @@ export default function RoomView() {
   const localObjectUrlRef = useRef<string | null>(null);
   // 进度同步节流：记录上次广播时间戳
   const lastSyncProgressRef = useRef(0);
+  // 观众端 seek 冷却：记录上次强制 seek 时间戳，避免 HLS 缓冲期间被反复 seek 打断
+  const lastViewerSeekRef = useRef(0);
   // 房主推流会话（模块级单例）：房主切页时推流资源跨页面存活
   const hostSessionRef = useRef<HostSession | null>(null);
 
@@ -274,6 +291,7 @@ export default function RoomView() {
         // （或新观众加入）才能追到切页后的真实进度，而不是停在切页时刻。
         localEl.onpause = null;
         localEl.onplay = null;
+        localEl.onseeked = null;
         // 设置抑制窗口兜底（双保险），即使有其他路径触发 pause 也不会误广播
         suppressPauseRef.current = Date.now();
         // 注意：绝不能 pause()！房主切页后视频仍需继续播放，captureStream 的
@@ -513,6 +531,15 @@ export default function RoomView() {
           socketRef.current.emit('host-resume', { roomId: id });
         }
       };
+      // 房主拖动进度条（原生控制条）seek 后，广播给观众跟随 seek。
+      // 用持久 socket（session.socket）上报，保证房主切页场景下（若有）也安全。
+      v.onseeked = () => {
+        if (Date.now() - suppressPauseRef.current < 800) return;
+        const sock = hostSessionRef.current?.socket ?? socketRef.current;
+        if (sock && Number.isFinite(v.currentTime)) {
+          sock.emit('host-seek', { roomId: id, currentTime: v.currentTime });
+        }
+      };
     }
 
     socket.on('connect', () => {
@@ -721,11 +748,33 @@ export default function RoomView() {
       localVideoRef.current?.pause();
     });
 
-    // 注意：已删除 progress-sync 监听。原逻辑是「房主每 2 秒广播进度、观众端
-    // Math.abs(currentTime - t) > 2 就强制 seek」，网络直链模式下观众独立拉流、
-    // 进度天然有数秒偏差，导致观众每 2 秒被强制 seek 一次、反复打断 HLS 缓冲而严重卡顿。
-    // 服务端 sync-progress 现只更新缓存（供新观众续播/房主回来追进度），不再广播。
-    // 观众进度跟随改为事件驱动（host-pause / host-resume），不再被动轮询对齐。
+    // 房主拖动进度条 seek 后，观众跟随 seek（进度差拉大的主因修复）。
+    socket.on('playback-seek', (data: any) => {
+      const el = remoteVideoRef.current;
+      const t = typeof data?.currentTime === 'number' ? data.currentTime : 0;
+      if (el && Number.isFinite(t)) {
+        lastViewerSeekRef.current = Date.now();
+        try { el.currentTime = t; } catch {}
+      }
+    });
+
+    // 周期温和纠偏：房主每 2 秒广播进度，观众只在进度差 > 2 秒时才 seek，
+    // 且带 3 秒冷却 + 跳过缓冲中，避免旧版「每 2 秒无差别 seek」反复打断 HLS 缓冲导致卡顿。
+    // 正常播放时房主观众播放同一 HLS、进度差 < 1 秒，几乎不触发 seek，保持流畅。
+    socket.on('progress-sync', (data: any) => {
+      const el = remoteVideoRef.current;
+      const t = typeof data?.currentTime === 'number' ? data.currentTime : 0;
+      if (!el || !Number.isFinite(t)) return;
+      // 冷却期内不重复 seek
+      if (Date.now() - lastViewerSeekRef.current < 3000) return;
+      // 正在缓冲 / seek 中，跳过本轮
+      if (el.seeking || el.readyState < 2) return;
+      // 进度差超过 2 秒才纠正
+      if (Math.abs(el.currentTime - t) > 2) {
+        lastViewerSeekRef.current = Date.now();
+        try { el.currentTime = t; } catch {}
+      }
+    });
 
     socket.on('host-disconnected', (data: any) => {
       setIsPlaying(false);
@@ -1813,6 +1862,18 @@ export default function RoomView() {
                   className="video-player"
                   autoPlay
                   playsInline
+                  onTimeUpdate={(e) => {
+                    const el = e.currentTarget;
+                    setProgress({ current: el.currentTime, duration: el.duration || 0 });
+                  }}
+                  onLoadedMetadata={(e) => {
+                    const el = e.currentTarget;
+                    setProgress({ current: el.currentTime, duration: el.duration || 0 });
+                  }}
+                  onDurationChange={(e) => {
+                    const el = e.currentTarget;
+                    setProgress({ current: el.currentTime, duration: el.duration || 0 });
+                  }}
                   onError={() => {
                     const code = remoteVideoRef.current?.error?.code;
                     let msg = '视频加载失败，请检查网络链接是否有效、是否支持跨域播放';
@@ -1826,6 +1887,20 @@ export default function RoomView() {
 
               {resolution && (
                 <div className="res-badge">{resolution}</div>
+              )}
+
+              {/* 观众端只读进度条：原生 <progress> + 时间文本，不可拖动 */}
+              {!isHost && isPlaying && (
+                <div className="viewer-progress">
+                  <progress
+                    className="viewer-progress-bar"
+                    max={progress.duration > 0 ? progress.duration : 1}
+                    value={progress.current}
+                  />
+                  <span className="viewer-progress-time">
+                    {formatTime(progress.current)} / {formatTime(progress.duration)}
+                  </span>
+                </div>
               )}
 
               {/* 全屏切换按钮（观众 + 房主均可用） */}

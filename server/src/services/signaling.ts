@@ -429,16 +429,40 @@ export function setupSocketHandlers(io: Server) {
       const duration = Number(data.duration);
       if (!Number.isFinite(currentTime) || !Number.isFinite(duration)) return;
 
-      // 更新房间播放状态缓存的进度，供新观众加入时续播、房主切页回来时追进度。
-      // 注意：不再向在线观众广播 progress-sync 强制对齐进度。
-      // 网络直链模式下观众各自独立拉流，进度天然有数秒偏差，若每 2 秒强制 seek
-      // 会反复打断 HLS 缓冲、造成严重卡顿。观众进度跟随只靠房主主动的
-      // host-pause / host-resume 事件驱动，这里仅刷新服务端缓存。
+      // 更新房间播放状态缓存，供新观众加入时续播、房主切页回来时追进度。
       const st = roomPlaybackStates.get(room.id);
       if (st) {
         st.currentTime = Math.max(0, currentTime);
         st.duration = Math.max(0, duration);
       }
+
+      // 温和的周期纠偏：广播给在线观众，但客户端只在进度差 > 2 秒时才 seek，
+      // 且带 3 秒冷却，避免像旧版那样每 2 秒无差别 seek 反复打断 HLS 缓冲导致卡顿。
+      // 正常播放时房主观众播放同一 HLS、进度差 < 1 秒，几乎不触发 seek，保持流畅。
+      socket.to(room.id).emit('progress-sync', {
+        currentTime: Math.max(0, currentTime),
+        duration: Math.max(0, duration)
+      });
+    });
+
+    // 房主拖动进度条 seek 后广播，观众跟随 seek（进度差拉大的主因修复）
+    socket.on('host-seek', async (data: { roomId: string; currentTime: number }) => {
+      const room = await requireHost(socket, data?.roomId);
+      if (!room) return;
+
+      const currentTime = Number(data.currentTime);
+      if (!Number.isFinite(currentTime)) return;
+
+      // 更新缓存进度，供后续新观众续播 / 房主切页回来追进度
+      const st = roomPlaybackStates.get(room.id);
+      if (st) {
+        st.currentTime = Math.max(0, currentTime);
+      }
+
+      // 广播给观众（不含房主本人，房主本地已经 seek 到位）
+      socket.to(room.id).emit('playback-seek', {
+        currentTime: Math.max(0, currentTime)
+      });
     });
 
     // 聊天消息（限流：每 3 秒一条，每条最多 50 字）
