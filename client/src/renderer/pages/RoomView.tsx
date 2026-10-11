@@ -268,7 +268,10 @@ export default function RoomView() {
         localEl.onloadedmetadata = null;
         localEl.onended = null;
         localEl.onerror = null;
-        localEl.ontimeupdate = null;
+        // 注意：不解绑 ontimeupdate！房主切页后 session.video 仍在 body 上继续播放
+        // （网络直链 HLS 孤儿 / 本地文件都继续），进度仍在真实推进。保留 ontimeupdate
+        // 让进度持续上报（handler 内部已改用持久 session.socket），这样房主回来
+        // （或新观众加入）才能追到切页后的真实进度，而不是停在切页时刻。
         localEl.onpause = null;
         localEl.onplay = null;
         // 设置抑制窗口兜底（双保险），即使有其他路径触发 pause 也不会误广播
@@ -479,11 +482,16 @@ export default function RoomView() {
       };
       v.ontimeupdate = () => {
         const el = v;
-        if (!el || !socketRef.current) return;
+        // 关键：用持久 socket（session.socket）上报，而不是 socketRef.current。
+        // 房主切页后 socketRef.current 会被置 null，但 session.socket 仍存活且已连接，
+        // 这样房主切页期间 session.video 继续播放时，进度仍能持续上报给服务端，
+        // 房主回来（或新观众加入）才能追到切页后的真实进度，而不是停在切页时刻。
+        const sock = hostSessionRef.current?.socket ?? socketRef.current;
+        if (!el || !sock) return;
         const now = Date.now();
         if (now - lastSyncProgressRef.current < 2000) return;
         lastSyncProgressRef.current = now;
-        socketRef.current.emit('sync-progress', {
+        sock.emit('sync-progress', {
           roomId: id,
           currentTime: el.currentTime,
           duration: el.duration || 0
