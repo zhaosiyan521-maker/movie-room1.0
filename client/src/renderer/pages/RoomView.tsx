@@ -47,6 +47,13 @@ interface ChatMessage {
   timestamp: string;
 }
 
+interface DanmakuItem {
+  id: number;
+  text: string;
+  top: number;      // 垂直轨道位置（百分比 0~85）
+  duration: number; // 滚动动画时长（秒）
+}
+
 interface KickVoteRequest {
   targetUserId: string;
   targetName: string;
@@ -90,6 +97,21 @@ function formatTime(sec: number): string {
 function speakingColor(level: number): string {
   const hue = 120 - Math.max(0, Math.min(1, level)) * 120; // 120(绿) → 0(红)
   return `hsl(${Math.round(hue)}, 75%, 50%)`;
+}
+
+// 用户头像纯色：按 userId 哈希到固定色板，同一用户恒定同色、不带文字。
+const AVATAR_COLORS = [
+  '#F858AF', '#5B8DEF', '#F5A623', '#46C48A', '#9B6BF3',
+  '#EF5350', '#26C6DA', '#FF7043', '#66BB6A', '#AB47BC',
+  '#EC407A', '#42A5F5', '#FFCA28', '#8D6E63', '#7E57C2'
+];
+function avatarColor(userId: string): string {
+  if (!userId) return AVATAR_COLORS[0];
+  let hash = 0;
+  for (let i = 0; i < userId.length; i++) {
+    hash = (hash * 31 + userId.charCodeAt(i)) >>> 0;
+  }
+  return AVATAR_COLORS[hash % AVATAR_COLORS.length];
 }
 
 /**
@@ -141,12 +163,10 @@ export default function RoomView() {
   // 避免误判为「房主主动暂停」而向观众广播 host-pause。
   const suppressPauseRef = useRef(0);
 
-  // ===== 全屏观看 + 聊天公屏 =====
+  // ===== 全屏观看 + 弹幕设置 =====
   const [isFullscreen, setIsFullscreen] = useState(false);
-  // 全屏时是否打开聊天公屏
+  // 全屏时是否打开弹幕设置 + 发送面板
   const [showOverlayChat, setShowOverlayChat] = useState(false);
-  // 聊天公屏不透明度（0.3 ~ 0.95）
-  const [chatOpacity, setChatOpacity] = useState(0.72);
 
   // 成员 / 语音 / 聊天
   const [members, setMembers] = useState<RoomMemberInfo[]>([]);
@@ -156,12 +176,20 @@ export default function RoomView() {
   const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set());
   const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set());
   const [micOn, setMicOn] = useState(true);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatCooldown, setChatCooldown] = useState(0);
-  const [avatarBubbles, setAvatarBubbles] = useState<Record<string, string>>({});
   const [menuUserId, setMenuUserId] = useState<string | null>(null);
   const [menuRect, setMenuRect] = useState<{ x: number; y: number } | null>(null);
+
+  // ===== 弹幕 =====
+  // 所有聊天内容以弹幕形式在视频区域滚动显示（不再用消息列表）。
+  // 弹幕为「本地视角」呈现：不透明度 / 滚动速度 / 颜色均为用户个人偏好，不同步给他人。
+  const [danmaku, setDanmaku] = useState<DanmakuItem[]>([]);
+  const [danmakuOpacity, setDanmakuOpacity] = useState(1);
+  const [danmakuSpeed, setDanmakuSpeed] = useState(3); // 1~5 档，越大越快
+  const [danmakuColor, setDanmakuColor] = useState('#ff4d4f'); // 红/黄/蓝/绿（默认红）
+  const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
+  const danmakuSeqRef = useRef(0);
 
   // 踢出投票（观众收到的确认弹窗）
   const [kickVote, setKickVote] = useState<KickVoteRequest | null>(null);
@@ -218,7 +246,6 @@ export default function RoomView() {
   const localMicRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const speakingRef = useRef(false);
-  const bubbleTimersRef = useRef<Record<string, any>>({});
   const cooldownTimerRef = useRef<any>(null);
 
   useEffect(() => {
@@ -327,8 +354,6 @@ export default function RoomView() {
       audioCtxRef.current.close().catch(() => {});
       audioCtxRef.current = null;
     }
-    Object.values(bubbleTimersRef.current).forEach(t => clearTimeout(t));
-    bubbleTimersRef.current = {};
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
 
     // 释放 ObjectURL，避免 Blob 泄漏（房主切页时不释放，视频仍要用）
@@ -340,7 +365,7 @@ export default function RoomView() {
     }
 
     // 重置房间相关状态，避免上一个房间的聊天与 UI 状态串到新房间
-    setMessages([]);
+    setDanmaku([]);
     setLevelByUser({});
     setMutedUserIds(new Set());
     setSpeakingUserIds(new Set());
@@ -1260,41 +1285,32 @@ export default function RoomView() {
 
   // ===== 聊天 =====
 
+  // 弹幕轨道：随机垂直位置（避免全部重叠在同一高度）
+  const pushDanmaku = (text: string) => {
+    if (!text) return;
+    const id = ++danmakuSeqRef.current;
+    const top = Math.round((Math.random() * 82 + 6) * 10) / 10; // 6% ~ 88%
+    const duration = Math.max(1.5, 8 / Math.max(1, Math.min(5, danmakuSpeed)));
+    setDanmaku(prev => [...prev, { id, text, top, duration }]);
+    window.setTimeout(() => {
+      setDanmaku(prev => prev.filter(d => d.id !== id));
+    }, duration * 1000 + 200);
+  };
+
   const appendMessage = (msg: ChatMessage) => {
-    // 去重：同用户同内容同时间戳在短时间内视为重复（防止监听器叠加导致重复消息）
+    // 去重：同用户同内容同时间戳在短时间内视为重复（防止监听器叠加导致重复弹幕）
     const sig = `${msg.userId}|${msg.message}|${msg.timestamp}`;
     if (msg.userId && recentMsgSigRef.current.has(sig)) return;
     if (msg.userId) {
       recentMsgSigRef.current.add(sig);
       setTimeout(() => recentMsgSigRef.current.delete(sig), 1500);
     }
-    setMessages(prev => [...prev, msg]);
-    if (msg.userId) {
-      showAvatarBubble(msg.userId, msg.message);
-    }
+    // 所有聊天内容以弹幕形式展示：非系统消息显示「昵称: 内容」
+    pushDanmaku(`${msg.from}: ${msg.message}`);
   };
 
   const appendSystemMessage = (text: string) => {
-    setMessages(prev => [...prev, {
-      from: '系统',
-      userId: '',
-      message: text,
-      timestamp: new Date().toISOString()
-    }]);
-  };
-
-  const showAvatarBubble = (userId: string, text: string) => {
-    setAvatarBubbles(prev => ({ ...prev, [userId]: text }));
-    if (bubbleTimersRef.current[userId]) {
-      clearTimeout(bubbleTimersRef.current[userId]);
-    }
-    bubbleTimersRef.current[userId] = setTimeout(() => {
-      setAvatarBubbles(prev => {
-        const next = { ...prev };
-        delete next[userId];
-        return next;
-      });
-    }, 6000);
+    pushDanmaku(text);
   };
 
   const startCooldown = () => {
@@ -1810,10 +1826,10 @@ export default function RoomView() {
           <div className="room-info">
             <p>👤 房主：{room?.host.nickname || room?.host.username}</p>
             <p>👥 观众：{room?.members.length}/{room?.maxViewers}</p>
-            {room?.hasPassword && !isHost && <p>🔒 需要密码</p>}
+            {room?.hasPassword && !isHost && !user?.isAdmin && <p>🔒 需要密码</p>}
           </div>
 
-          {room?.hasPassword && !isHost && (
+          {room?.hasPassword && !isHost && !user?.isAdmin && (
             <div className="form-group">
               <label className="label">输入房间密码</label>
               <input
@@ -1850,7 +1866,6 @@ export default function RoomView() {
               const speaking = speakingUserIds.has(member.userId);
               const muted = mutedUserIds.has(member.userId);
               const inVoiceNow = voiceUserIds.has(member.userId) || (isMe && inVoice);
-              const bubble = avatarBubbles[member.userId];
 
               return (
                 <div key={member.userId} className="avatar-rail-item">
@@ -1860,7 +1875,10 @@ export default function RoomView() {
                     return (
                       <div
                         className={`avatar-circle ${speaking ? 'speaking' : ''} ${isMemberHost ? 'host' : ''} ${!onlineUserIds.has(member.userId) && !isMe ? 'offline' : ''}`}
-                        style={speakColor ? { borderColor: speakColor, boxShadow: `0 0 12px ${speakColor}` } : undefined}
+                        style={{
+                          backgroundColor: avatarColor(member.userId),
+                          ...(speakColor ? { borderColor: speakColor, boxShadow: `0 0 12px ${speakColor}` } : undefined)
+                        }}
                         title={member.nickname}
                         onClick={(e) => {
                           if (isMe) return;
@@ -1869,7 +1887,6 @@ export default function RoomView() {
                           setMenuUserId(menuUserId === member.userId ? null : member.userId);
                         }}
                       >
-                        {member.nickname.charAt(0).toUpperCase()}
                         {isMemberHost && <span className="host-crown">👑</span>}
                         {muted && <span className="mute-badge">🔇</span>}
                         {inVoiceNow && !muted && <span className="voice-badge">🎤</span>}
@@ -1877,12 +1894,6 @@ export default function RoomView() {
                     );
                   })()}
                   <span className="avatar-name">{isMe ? '我' : member.nickname}</span>
-
-                  {bubble && (
-                    <div className="avatar-bubble">
-                      {bubble.length > 40 ? bubble.slice(0, 40) + '…' : bubble}
-                    </div>
-                  )}
                 </div>
               );
             })}
@@ -1938,6 +1949,23 @@ export default function RoomView() {
                 <div className="res-badge">{resolution}</div>
               )}
 
+              {/* 弹幕层：所有聊天内容以弹幕形式从右向左滚动，覆盖在视频上方 */}
+              <div className="danmaku-layer" style={{ opacity: danmakuOpacity }}>
+                {danmaku.map(d => (
+                  <div
+                    key={d.id}
+                    className="danmaku-item"
+                    style={{
+                      top: `${d.top}%`,
+                      color: danmakuColor,
+                      animationDuration: `${d.duration}s`
+                    }}
+                  >
+                    {d.text}
+                  </div>
+                ))}
+              </div>
+
               {/* 观众端只读进度条：原生 <progress> + 时间文本，不可拖动。
                   鼠标移动/点击时显示，3 秒无操作自动淡出，避免常驻影响观感。 */}
               {!isHost && isPlaying && (
@@ -1962,53 +1990,72 @@ export default function RoomView() {
                 {isFullscreen ? '⛶ 退出全屏' : '⛶ 全屏'}
               </button>
 
-              {/* 全屏时：左下角圆形半透明气泡，点击打开聊天公屏 */}
+              {/* 全屏时：左下角圆形半透明气泡，点击打开弹幕设置 + 发送输入框 */}
               {isFullscreen && (
                 <button
                   className={`fullscreen-bubble ${showOverlayChat ? 'active' : ''}`}
                   onClick={() => setShowOverlayChat(v => !v)}
-                  title={showOverlayChat ? '收起聊天公屏' : '打开聊天公屏'}
+                  title={showOverlayChat ? '收起弹幕设置' : '打开弹幕设置'}
                 >
                   💬
                 </button>
               )}
 
-              {/* 全屏聊天公屏：占屏幕 1/4，半透明，可调不透明度 */}
+              {/* 全屏弹幕设置 + 发送：不再显示消息列表，聊天内容以弹幕呈现 */}
               {isFullscreen && showOverlayChat && (
-                <div className="overlay-chat" style={{ opacity: chatOpacity }}>
+                <div className="overlay-chat">
                   <div className="overlay-chat-header">
-                    <span className="overlay-chat-title">💬 聊天公屏 ({members.length} 人)</span>
-                    <div className="overlay-chat-actions">
-                      <label className="opacity-control" title="调整不透明度">
-                        <span className="opacity-label">不透明度</span>
-                        <input
-                          type="range"
-                          min="0.3"
-                          max="0.95"
-                          step="0.01"
-                          value={chatOpacity}
-                          onChange={(e) => setChatOpacity(Number(e.target.value))}
-                        />
-                      </label>
-                      <button
-                        className="overlay-chat-close"
-                        onClick={() => setShowOverlayChat(false)}
-                        title="收起"
-                      >
-                        ✕
-                      </button>
-                    </div>
+                    <span className="overlay-chat-title">💬 弹幕设置</span>
+                    <button
+                      className="overlay-chat-close"
+                      onClick={() => setShowOverlayChat(false)}
+                      title="收起"
+                    >
+                      ✕
+                    </button>
                   </div>
-                  <div className="overlay-chat-messages">
-                    {messages.map((msg, idx) => (
-                      <div
-                        key={idx}
-                        className={`overlay-chat-msg ${msg.userId === myUserId && msg.from === '我' ? 'self' : ''} ${msg.from === '系统' ? 'system' : ''}`}
-                      >
-                        <span className="msg-from">{msg.from}:</span>
-                        <span className="msg-text">{msg.message}</span>
+                  <div className="danmaku-settings">
+                    <label className="danmaku-setting-row">
+                      <span>不透明度</span>
+                      <input
+                        type="range"
+                        min="0.2"
+                        max="1"
+                        step="0.05"
+                        value={danmakuOpacity}
+                        onChange={(e) => setDanmakuOpacity(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="danmaku-setting-row">
+                      <span>滚动速度</span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="5"
+                        step="1"
+                        value={danmakuSpeed}
+                        onChange={(e) => setDanmakuSpeed(Number(e.target.value))}
+                      />
+                    </label>
+                    <div className="danmaku-setting-row">
+                      <span>颜色</span>
+                      <div className="danmaku-colors">
+                        {[
+                          { c: '#ff4d4f', n: '红' },
+                          { c: '#fadb14', n: '黄' },
+                          { c: '#1677ff', n: '蓝' },
+                          { c: '#52c41a', n: '绿' }
+                        ].map(o => (
+                          <button
+                            key={o.c}
+                            className={`danmaku-color ${danmakuColor === o.c ? 'active' : ''}`}
+                            style={{ backgroundColor: o.c }}
+                            title={o.n}
+                            onClick={() => setDanmakuColor(o.c)}
+                          />
+                        ))}
                       </div>
-                    ))}
+                    </div>
                   </div>
                   <div className="overlay-chat-input">
                     <input
@@ -2018,7 +2065,7 @@ export default function RoomView() {
                       maxLength={CHAT_MAX_LENGTH}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-                      placeholder={`发送消息（最多 ${CHAT_MAX_LENGTH} 字）...`}
+                      placeholder={`发送弹幕（最多 ${CHAT_MAX_LENGTH} 字）...`}
                     />
                     <button
                       onClick={sendMessage}
@@ -2160,18 +2207,10 @@ export default function RoomView() {
             )}
           </div>
 
-          {/* 右侧：聊天 */}
+          {/* 右侧：聊天（弹幕） */}
           <div className="sidebar">
             <div className="chat-panel card">
-              <h3>💬 聊天 ({members.length} 人在房间)</h3>
-              <div className="chat-messages">
-                {messages.map((msg, idx) => (
-                  <div key={idx} className={`chat-msg ${msg.userId === myUserId && msg.from === '我' ? 'self' : ''} ${msg.from === '系统' ? 'system' : ''}`}>
-                    <span className="msg-from">{msg.from}:</span>
-                    <span className="msg-text">{msg.message}</span>
-                  </div>
-                ))}
-              </div>
+              <h3>💬 发送弹幕 ({members.length} 人在房间)</h3>
               <div className="chat-input-area">
                 <input
                   type="text"
@@ -2180,7 +2219,7 @@ export default function RoomView() {
                   maxLength={CHAT_MAX_LENGTH}
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-                  placeholder={`发送消息（最多 ${CHAT_MAX_LENGTH} 字）...`}
+                  placeholder={`发送弹幕（最多 ${CHAT_MAX_LENGTH} 字）...`}
                 />
                 <button
                   onClick={sendMessage}
@@ -2189,8 +2228,62 @@ export default function RoomView() {
                 >
                   {chatCooldown > 0 ? `${chatCooldown}s` : '发送'}
                 </button>
+                <button
+                  onClick={() => setShowDanmakuSettings(v => !v)}
+                  className="btn btn-secondary btn-sm danmaku-settings-toggle"
+                  title="弹幕设置"
+                >
+                  ⚙️
+                </button>
               </div>
               <div className="chat-rules">每 {CHAT_COOLDOWN_SEC} 秒可发送一条，每条最多 {CHAT_MAX_LENGTH} 字</div>
+
+              {/* 弹幕设置面板（房间内，点击 ⚙️ 展开） */}
+              {showDanmakuSettings && (
+                <div className="danmaku-settings">
+                  <label className="danmaku-setting-row">
+                    <span>不透明度</span>
+                    <input
+                      type="range"
+                      min="0.2"
+                      max="1"
+                      step="0.05"
+                      value={danmakuOpacity}
+                      onChange={(e) => setDanmakuOpacity(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="danmaku-setting-row">
+                    <span>滚动速度</span>
+                    <input
+                      type="range"
+                      min="1"
+                      max="5"
+                      step="1"
+                      value={danmakuSpeed}
+                      onChange={(e) => setDanmakuSpeed(Number(e.target.value))}
+                    />
+                  </label>
+                  <div className="danmaku-setting-row">
+                    <span>颜色</span>
+                    <div className="danmaku-colors">
+                      {[
+                        { c: '#ff4d4f', n: '红' },
+                        { c: '#fadb14', n: '黄' },
+                        { c: '#1677ff', n: '蓝' },
+                        { c: '#52c41a', n: '绿' }
+                      ].map(o => (
+                        <button
+                          key={o.c}
+                          className={`danmaku-color ${danmakuColor === o.c ? 'active' : ''}`}
+                          style={{ backgroundColor: o.c }}
+                          title={o.n}
+                          onClick={() => setDanmakuColor(o.c)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {!isHost && (

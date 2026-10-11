@@ -131,6 +131,7 @@ interface AuthenticatedSocket extends Socket {
   userId?: string;
   username?: string;
   nickname?: string;
+  isAdmin?: boolean;
 }
 
 export function setupSocketHandlers(io: Server) {
@@ -169,6 +170,7 @@ export function setupSocketHandlers(io: Server) {
       (socket as AuthenticatedSocket).userId = user.id;
       (socket as AuthenticatedSocket).username = user.username;
       (socket as AuthenticatedSocket).nickname = user.nickname || user.username;
+      (socket as AuthenticatedSocket).isAdmin = user.isAdmin;
       next();
     } catch (error) {
       next(new Error('认证失败'));
@@ -255,19 +257,30 @@ export function setupSocketHandlers(io: Server) {
         // 加入新房间
         socket.join(roomIdStr);
 
-        if (!roomUsers.has(roomIdStr)) {
-          roomUsers.set(roomIdStr, new Set());
-        }
-        roomUsers.get(roomIdStr)!.add(socket.id);
+        // 管理员隐身：管理员进入房间时不广播 user-joined、不加入在线用户名单，
+        // 房间内其他用户完全看不到管理员（成员栏、在线列表、人数均不含管理员）。
+        // 但管理员本人仍 socket.join 房间，能接收房间广播、能看到房间内所有用户。
+        // 注意：userRooms（socket→room 映射，供 requireInRoom 权限校验）对管理员仍要设置，
+        // 否则管理员无法通过聊天/语音等「须在房间内」的校验；隐身只体现在 roomUsers（成员名单）
+        // 与 user-joined 广播上。
+        const isAdmin = socket.isAdmin === true;
+
         userRooms.set(socket.id, roomIdStr);
 
-        // 通知房间内其他用户
-        socket.to(roomIdStr).emit('user-joined', {
-          userId: socket.userId,
-          username: socket.username,
-          nickname: socket.nickname,
-          socketId: socket.id
-        });
+        if (!isAdmin) {
+          if (!roomUsers.has(roomIdStr)) {
+            roomUsers.set(roomIdStr, new Set());
+          }
+          roomUsers.get(roomIdStr)!.add(socket.id);
+
+          // 通知房间内其他用户
+          socket.to(roomIdStr).emit('user-joined', {
+            userId: socket.userId,
+            username: socket.username,
+            nickname: socket.nickname,
+            socketId: socket.id
+          });
+        }
 
         // 发送当前房间内的用户列表给新加入的用户
         const usersInRoom = Array.from(roomUsers.get(roomIdStr) || [])
@@ -745,46 +758,24 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   lastChatTime.delete(socket.id);
   lastSpeakingAt.delete(socket.id);
 
-  // 通知房间内其他用户
-  socket.to(roomId).emit('user-left', {
-    userId: socket.userId,
-    username: socket.username,
-    nickname: socket.nickname,
-    socketId: socket.id,
-    hostAbrupt
-  });
+  // 通知房间内其他用户（管理员隐身，不广播 user-left，与其从未广播 user-joined 对称）
+  if (!socket.isAdmin) {
+    socket.to(roomId).emit('user-left', {
+      userId: socket.userId,
+      username: socket.username,
+      nickname: socket.nickname,
+      socketId: socket.id,
+      hostAbrupt
+    });
+  }
 
   dbg(`${socket.username} 离开了房间 ${roomId}`);
 }
 
-// 房主放映中断线去重：同一用户同一房间 10 秒内的重复断线只计一次。
-// 房主若开了多个标签页，一次断网会在同一瞬间触发多个 socket 的 disconnect，
-// 原实现会各自 +1，导致 abruptLeaves 瞬间达到阈值而误封号。
-const ABRUPT_DEDUPE_MS = 10_000;
-const recentAbrupt = new Map<string, number>();
-
-// 定期清理去重记录
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, ts] of recentAbrupt) {
-    if (now - ts > ABRUPT_DEDUPE_MS) recentAbrupt.delete(key);
-  }
-}, 60 * 1000).unref();
-
-// 房主放映中断线：累计次数，达到上限永久封禁
+// 房主放映中断线：结束本场放映、房间回到等待状态，并通知房间内观众。
+// 需求变更：允许房主随意中断放映，不再累计中断次数、不再封禁账号或 IP。
 async function handleHostAbruptLeave(io: Server, roomId: string, hostUserId: string) {
   try {
-    const dedupeKey = `${roomId}:${hostUserId}`;
-    const now = Date.now();
-    const lastAt = recentAbrupt.get(dedupeKey) || 0;
-    if (now - lastAt < ABRUPT_DEDUPE_MS) return;   // 重复断线，忽略
-    recentAbrupt.set(dedupeKey, now);
-
-    const user = await prisma.user.update({
-      where: { id: hostUserId },
-      data: { abruptLeaves: { increment: 1 } }
-    });
-
     // 结束本场放映，房间回到等待状态
     await prisma.room.update({
       where: { id: roomId },
@@ -797,40 +788,7 @@ async function handleHostAbruptLeave(io: Server, roomId: string, hostUserId: str
       message: '房主连接中断，放映已结束'
     });
 
-    dbg(`房主 ${user.username} 放映中断线（第 ${user.abruptLeaves} 次）`);
-
-    // 自动封禁：管理员（白名单）不受封禁制约，即使断线次数超限也不封禁。
-    if (user.abruptLeaves >= config.maxAbruptLeaves && !user.banned && !user.isAdmin) {
-      const reason = `放映途中强行中断 ${user.abruptLeaves} 次，被系统永久封禁`;
-      await prisma.user.update({
-        where: { id: hostUserId },
-        // tokenVersion 自增：封禁同时使该用户所有 JWT 失效
-        data: { banned: true, banReason: reason, bannedAt: new Date(), tokenVersion: { increment: 1 } }
-      });
-
-      // 封禁其 IP
-      if (user.lastIp) {
-        await prisma.bannedIp.upsert({
-          where: { ip: user.lastIp },
-          create: { ip: user.lastIp, reason, userId: hostUserId },
-          update: { reason, userId: hostUserId }
-        });
-      }
-
-      // 解散其所有活跃房间
-      await prisma.room.updateMany({
-        where: { hostId: hostUserId, status: { in: ['WAITING', 'PLAYING'] } },
-        data: { status: 'ENDED' }
-      });
-      await prisma.roomMember.deleteMany({
-        where: { room: { hostId: hostUserId } }
-      });
-
-      // 断开其在线连接，避免封禁后仍能收发房间广播
-      disconnectUser(io, hostUserId, '你的账号已被永久封禁');
-
-      dbg(`用户 ${user.username} 已被永久封禁（IP: ${user.lastIp}）`);
-    }
+    dbg(`房主 ${hostUserId} 放映中断线，放映已结束`);
   } catch (error) {
     console.error('Handle host abrupt leave error:', error);
   }

@@ -403,7 +403,7 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
         return res.status(400).json({ error: '房间密码格式无效' });
       }
     }
-    if (!isHost && room.password && room.password !== password) {
+    if (!isHost && !req.user!.isAdmin && room.password && room.password !== password) {
       return res.status(403).json({ error: '房间密码错误' });
     }
 
