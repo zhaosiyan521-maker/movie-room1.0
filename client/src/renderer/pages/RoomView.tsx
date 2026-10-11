@@ -721,14 +721,11 @@ export default function RoomView() {
       localVideoRef.current?.pause();
     });
 
-    // 进度同步（本地 mesh 模式由 WebRTC 自带；网络视频模式按此对齐播放位置）
-    socket.on('progress-sync', (data: any) => {
-      const el = remoteVideoRef.current;
-      const t = typeof data?.currentTime === 'number' ? data.currentTime : 0;
-      if (el && Math.abs(el.currentTime - t) > 2) {
-        try { el.currentTime = t; } catch {}
-      }
-    });
+    // 注意：已删除 progress-sync 监听。原逻辑是「房主每 2 秒广播进度、观众端
+    // Math.abs(currentTime - t) > 2 就强制 seek」，网络直链模式下观众独立拉流、
+    // 进度天然有数秒偏差，导致观众每 2 秒被强制 seek 一次、反复打断 HLS 缓冲而严重卡顿。
+    // 服务端 sync-progress 现只更新缓存（供新观众续播/房主回来追进度），不再广播。
+    // 观众进度跟随改为事件驱动（host-pause / host-resume），不再被动轮询对齐。
 
     socket.on('host-disconnected', (data: any) => {
       setIsPlaying(false);
@@ -1341,6 +1338,11 @@ export default function RoomView() {
       try { hlsRef.current.destroy(); } catch {}
       hlsRef.current = null;
     }
+    // 同步清理持久化的 session.hls，避免它指向已销毁的实例（否则房主回来时
+    // loadLocalUrl 的复用分支会误判为「仍在播放」而复用僵尸实例 → 黑屏）。
+    if (hostSessionRef.current) {
+      hostSessionRef.current.hls = null;
+    }
   };
 
   /**
@@ -1371,6 +1373,12 @@ export default function RoomView() {
   const attachHls = (el: HTMLVideoElement, url: string, seekTo?: number) => {
     const hls = new Hls();
     hlsRef.current = hls;
+    // 房主：HLS 实例持久化到 session.hls，房主切页后 hlsRef（组件级）随组件卸载丢失，
+    // 但 session.hls 仍持有实例继续拉流播放；房主回来时 loadLocalUrl 会复用同一实例，
+    // 避免在同一个 session.video 上叠加新旧两个 HLS 实例导致冲突（黑屏）。
+    if (isHostRef.current && hostSessionRef.current) {
+      hostSessionRef.current.hls = hls;
+    }
     hls.loadSource(url);
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -1437,8 +1445,22 @@ export default function RoomView() {
     const el = hostSessionRef.current?.video || localVideoRef.current;
     if (!el) return;
     setVideoError('');
-    destroyHls();
     const target = toProxiedUrl(url);
+
+    // 房主切页回来：若 session.hls 仍存活、attach 在同一个 video 上、且加载的还是同一
+    // 条直链（url 一致），说明切页期间 HLS 一直在后台播放、进度持续推进。此时直接复用，
+    // 不 destroy、不重新 loadSource、不重新 attachMedia，避免在同一个 video 上叠加新旧
+    // 两个 HLS 实例导致冲突（黑屏）。
+    // 注意必须校验 url：若房主主动切换了新的直链，existingHls.url 与 target 不同，不能复用
+    // 旧 HLS（否则会继续放旧片源），应走下方 destroyHls + 重新加载新直链的正常流程。
+    const existingHls = hostSessionRef.current?.hls;
+    if (existingHls && existingHls.media === el && existingHls.url === target) {
+      hlsRef.current = existingHls;
+      el.play().catch(() => setNeedClickPlay(true));
+      return;
+    }
+
+    destroyHls();
     const useHls = isHls || looksLikeHls(url);
     // 房主切页回来重载直链时，加载完成后追回原进度（否则会从 0 重新播放，进度与观众脱节）
     const resumeAt = (e: HTMLVideoElement) => {

@@ -429,17 +429,16 @@ export function setupSocketHandlers(io: Server) {
       const duration = Number(data.duration);
       if (!Number.isFinite(currentTime) || !Number.isFinite(duration)) return;
 
-      // 更新房间播放状态缓存的进度，供新观众加入时续播
+      // 更新房间播放状态缓存的进度，供新观众加入时续播、房主切页回来时追进度。
+      // 注意：不再向在线观众广播 progress-sync 强制对齐进度。
+      // 网络直链模式下观众各自独立拉流，进度天然有数秒偏差，若每 2 秒强制 seek
+      // 会反复打断 HLS 缓冲、造成严重卡顿。观众进度跟随只靠房主主动的
+      // host-pause / host-resume 事件驱动，这里仅刷新服务端缓存。
       const st = roomPlaybackStates.get(room.id);
       if (st) {
         st.currentTime = Math.max(0, currentTime);
         st.duration = Math.max(0, duration);
       }
-
-      socket.to(room.id).emit('progress-sync', {
-        currentTime: Math.max(0, currentTime),
-        duration: Math.max(0, duration)
-      });
     });
 
     // 聊天消息（限流：每 3 秒一条，每条最多 50 字）

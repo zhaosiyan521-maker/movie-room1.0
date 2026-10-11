@@ -32,6 +32,8 @@ export interface HostSession {
   isHls: boolean;
   /** 本地文件模式下，captureStream 产生的推流 */
   captureStream: MediaStream | null;
+  /** 网络直链模式下的 HLS 实例（持久化，房主切页后继续拉流播放，回来复用避免孤儿冲突） */
+  hls: any | null;
   /** 是否正在放映 */
   playing: boolean;
   /** socket 事件监听器是否已绑定（跨组件复用，避免重复绑定导致消息叠加） */
@@ -74,6 +76,7 @@ export function getOrCreateHostSession(roomId: string): HostSession {
       remoteUrl: '',
       isHls: false,
       captureStream: null,
+      hls: null,
       playing: false,
       listenersBound: false,
       joinedRoom: false
@@ -100,6 +103,12 @@ export function destroyHostSession(roomId: string): void {
     if (s.captureStream) {
       s.captureStream.getTracks().forEach(t => t.stop());
       s.captureStream = null;
+    }
+  } catch { /* ignore */ }
+  try {
+    if (s.hls) {
+      s.hls.destroy();
+      s.hls = null;
     }
   } catch { /* ignore */ }
   try {
