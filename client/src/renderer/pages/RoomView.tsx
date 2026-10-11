@@ -131,6 +131,10 @@ export default function RoomView() {
   const isPlayingRef = useRef(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
+  // 假暂停抑制窗口：房主切页回来时，挂载 effect 把 session.video 从 body 移回容器，
+  // HTML 规范下媒体元素在 DOM 中移动会触发一次 pause 事件。这个窗口用于忽略该「假暂停」，
+  // 避免误判为「房主主动暂停」而向观众广播 host-pause。
+  const suppressPauseRef = useRef(0);
 
   // ===== 全屏观看 + 聊天公屏 =====
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -408,6 +412,12 @@ export default function RoomView() {
       v.style.opacity = '';
       v.style.pointerEvents = '';
       container.appendChild(v);
+      // DOM 移动会触发一次「假 pause」，设置抑制窗口避免向观众误广播 host-pause
+      suppressPauseRef.current = Date.now();
+      // 若视频本应处于播放态（房主切页回来），立即恢复播放，抵消移动导致的暂停
+      if (isPlayingRef.current) {
+        v.play().catch(() => {});
+      }
     }
     localVideoRef.current = v;
   }, [isHost, hostSessionReady]);
@@ -481,6 +491,8 @@ export default function RoomView() {
       };
       // 房主用原生控制条暂停/继续时，广播给观众同步（移除自定义按钮后由这里兜底）
       v.onpause = () => {
+        // 忽略「假暂停」：切页回来时 DOM 移动触发的 pause（抑制窗口内），不应广播。
+        if (Date.now() - suppressPauseRef.current < 800) return;
         // 仅当正在放映中才广播，避免切页隐藏/加载时误触发。
         // 用 isPlayingRef（同步镜像）而非闭包捕获的 isPlaying state（会是旧值 false，导致广播发不出）。
         if (isPlayingRef.current && socketRef.current) {
@@ -488,6 +500,7 @@ export default function RoomView() {
         }
       };
       v.onplay = () => {
+        if (Date.now() - suppressPauseRef.current < 800) return;
         if (isPlayingRef.current && socketRef.current) {
           socketRef.current.emit('host-resume', { roomId: id });
         }
@@ -578,7 +591,7 @@ export default function RoomView() {
               if (el.readyState >= 1 && target > 0) {
                 try { el.currentTime = target; } catch {}
               }
-              el.play().catch(() => setNeedClickPlay(true));
+              el.play().catch(() => {});
             };
             if (el.readyState >= 1) applySeek();
             else el.addEventListener('loadedmetadata', applySeek, { once: true });
@@ -588,7 +601,7 @@ export default function RoomView() {
           // 观众 + 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
           setRemotePlayUrl('');
           destroyHls();
-          remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+          remoteVideoRef.current?.play().catch(() => {});
         }
       }
     });
@@ -675,7 +688,7 @@ export default function RoomView() {
       } else {
         setRemotePlayUrl('');
         destroyHls();
-        remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+        remoteVideoRef.current?.play().catch(() => {});
       }
     });
 
@@ -689,7 +702,7 @@ export default function RoomView() {
     socket.on('playback-resume', () => {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
+      remoteVideoRef.current?.play().catch(() => {});
       localVideoRef.current?.play().catch(() => {});
     });
 
@@ -959,7 +972,8 @@ export default function RoomView() {
     if (track.kind === 'video') {
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = stream;
-        remoteVideoRef.current.play().catch(() => setNeedClickPlay(true));
+        // 观众完全被动：播放失败不做任何兜底（不弹窗/不静音/不加按钮），浏览器自动播放策略由观众本地决定。
+        remoteVideoRef.current.play().catch(() => {});
       }
     } else if (track.kind === 'audio') {
       let audioEl = audioElsRef.current.get(socketId);
@@ -1322,7 +1336,12 @@ export default function RoomView() {
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setVideoError('');
-      el.play().catch(() => setNeedClickPlay(true));
+      // 观众端播放失败静默忽略（不弹窗/不静音）；房主端保留点击播放兜底。
+      if (el === remoteVideoRef.current) {
+        el.play().catch(() => {});
+      } else {
+        el.play().catch(() => setNeedClickPlay(true));
+      }
     });
     hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
       if (!data?.fatal) return;
@@ -1337,7 +1356,10 @@ export default function RoomView() {
         return;
       }
       setVideoError('视频加载失败：HLS 流解析出错。请确认直链有效且未过期（多数站点直链有时效），重试或更换链接。');
-      setNeedClickPlay(true);
+      // 观众端不显示点击播放按钮
+      if (el !== remoteVideoRef.current) {
+        setNeedClickPlay(true);
+      }
     });
   };
 
@@ -1354,10 +1376,10 @@ export default function RoomView() {
     } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
       // 原生 HLS 支持（Safari）：直接交给 <video>
       el.src = target;
-      el.play().catch(() => setNeedClickPlay(true));
+      el.play().catch(() => {});
     } else {
       el.src = target;
-      el.play().catch(() => setNeedClickPlay(true));
+      el.play().catch(() => {});
     }
   };
 
@@ -1715,7 +1737,6 @@ export default function RoomView() {
                     if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
                     else if (code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) msg = '格式不支持：该直链无法播放，或 HLS 流未被正确识别';
                     setVideoError(`${msg}。多数站点直链有时效，请重试或更换链接。`);
-                    setNeedClickPlay(true);
                   }}
                   /* 观众只读：不提供播放控制条，放映由房主统一控制 */
                 />
@@ -1804,12 +1825,16 @@ export default function RoomView() {
               )}
 
               {!isPlaying && (
-                <div className="video-overlay">
-                  <p>{isHost ? '请选择视频文件并开始放映' : '等待房主开始播放'}</p>
+                <div className="video-overlay" style={{ pointerEvents: 'none' }}>
+                  <p>
+                    {isHost
+                      ? (selectedFile || remotePlayUrl ? '⏸ 已暂停' : '请选择视频文件并开始放映')
+                      : '等待房主开始播放'}
+                  </p>
                 </div>
               )}
 
-              {(needClickPlay || videoError) && (
+              {(isHost && needClickPlay) && (
                 <div className="video-overlay">
                   {videoError && (
                     <p style={{ color: '#ff6b6b', marginBottom: 12, maxWidth: 320 }}>{videoError}</p>

@@ -400,7 +400,9 @@ export function setupSocketHandlers(io: Server) {
       const st = roomPlaybackStates.get(room.id);
       if (st) st.playing = false;
 
-      io.to(room.id).emit('playback-pause', { byHost: true });
+      // 只广播给观众，不回声给房主本人。否则房主自己收到 playback-pause 会把
+      // 本地 isPlaying 置 false，触发全屏覆盖层挡住原生控制条，导致无法点继续播放。
+      socket.to(room.id).emit('playback-pause', { byHost: true });
     });
 
     // 放映投票：结束放映必须由房间内观众投票决定（逻辑同踢人投票）。
