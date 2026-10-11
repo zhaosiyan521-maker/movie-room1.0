@@ -934,12 +934,9 @@ export default function RoomView() {
     return pc;
   };
 
-  const addLocalTracksTo = (pc: RTCPeerConnection) => {
-    if (localMicRef.current) {
-      localMicRef.current.getTracks().forEach(track => {
-        pc.addTrack(track, localMicRef.current!);
-      });
-    }
+  // ===== 本地文件推流（房主端）：把 captureStream 的视频/音频轨加入指定 PC =====
+  // 仅房主本地文件模式下调用；网络直链模式不走这里（观众各自加载直链，不经 WebRTC 转发）。
+  const pushLocalFileTracks = (pc: RTCPeerConnection) => {
     // 网络视频模式下，视频由每位观众各自加载直链，房主不通过 WebRTC 转发视频轨。
     // 关键修复：
     //   1) isHost / usingRemoteUrl 均为 state，此处经 room-joined 异步回调调用会捕获旧值，
@@ -964,6 +961,16 @@ export default function RoomView() {
         }
       }
     }
+  };
+
+  const addLocalTracksTo = (pc: RTCPeerConnection) => {
+    if (localMicRef.current) {
+      localMicRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localMicRef.current!);
+      });
+    }
+    // 本地文件模式：房主推视频/音频轨；网络直链模式：此函数内部无操作（观众各自加载直链）
+    pushLocalFileTracks(pc);
   };
 
   const getVideoCaptureStream = (): MediaStream | null => {
@@ -1569,25 +1576,27 @@ export default function RoomView() {
     return null;
   };
 
-  const startPlayback = async () => {
-    if (usingRemoteUrlRef.current) {
-      const url = remotePlayUrl.trim();
-      if (!url) { alert('请先粘贴要播放的网络视频地址'); return; }
-      // 增强 HLS 识别：不再只认 .m3u8，覆盖无扩展名的 HLS 直链
-      const isHls = looksLikeHls(url);
-      setIsPlaying(true);
-      isPlayingRef.current = true;
-      loadLocalUrl(url, isHls);
-      socketRef.current?.emit('host-start-play', {
-        roomId: id,
-        movieName: url,
-        videoUrl: url,
-        isHls,
-        resolution: getResolution()
-      });
-      return;
-    }
+  // ===== 网络直链播放（房主端）：加载直链并广播给观众各自加载 =====
+  // 注意：此分支与本地文件播放（startLocalFilePlayback）完全独立，互不影响。
+  const startRemotePlayback = () => {
+    const url = remotePlayUrl.trim();
+    if (!url) { alert('请先粘贴要播放的网络视频地址'); return; }
+    // 增强 HLS 识别：不再只认 .m3u8，覆盖无扩展名的 HLS 直链
+    const isHls = looksLikeHls(url);
+    setIsPlaying(true);
+    isPlayingRef.current = true;
+    loadLocalUrl(url, isHls);
+    socketRef.current?.emit('host-start-play', {
+      roomId: id,
+      movieName: url,
+      videoUrl: url,
+      isHls,
+      resolution: getResolution()
+    });
+  };
 
+  // ===== 本地文件播放（房主端）：captureStream 推流给观众（WebRTC） =====
+  const startLocalFilePlayback = async () => {
     if (!selectedFile) {
       alert('请先选择视频文件');
       return;
@@ -1651,6 +1660,15 @@ export default function RoomView() {
       movieName: selectedFile.name,
       resolution: getResolution()
     });
+  };
+
+  // 播放入口：按片源模式路由到「网络直链」或「本地文件」两条独立链路
+  const startPlayback = () => {
+    if (usingRemoteUrlRef.current) {
+      startRemotePlayback();
+    } else {
+      startLocalFilePlayback();
+    }
   };
 
   // 暂停/继续由房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
