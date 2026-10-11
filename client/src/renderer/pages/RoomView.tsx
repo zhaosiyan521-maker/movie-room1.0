@@ -126,6 +126,9 @@ export default function RoomView() {
   // 用它触发一次重渲染，让挂载 effect 把 session.video 挂进展示容器）
   const [hostSessionReady, setHostSessionReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  // isPlaying 的同步镜像：setupWebSocket 里的 onpause/onplay 闭包会捕获旧 state，
+  // 导致「房主暂停/继续」广播发不出去（同 isHostRef 一类的闭包时序 bug）。
+  const isPlayingRef = useRef(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
 
@@ -140,7 +143,6 @@ export default function RoomView() {
   const [members, setMembers] = useState<RoomMemberInfo[]>([]);
   const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
   const [inVoice, setInVoice] = useState(false);
-  const [showVoicePrompt, setShowVoicePrompt] = useState(false);
   const [voiceUserIds, setVoiceUserIds] = useState<Set<string>>(new Set());
   const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set());
   const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set());
@@ -168,6 +170,9 @@ export default function RoomView() {
 
   // 网络视频播放模式（房主粘贴直链，观众各自加载，不经过房主带宽）
   const [usingRemoteUrl, setUsingRemoteUrl] = useState(false);
+  // usingRemoteUrl 的同步镜像：addLocalTracksTo 在 room-joined 异步回调里被调用，
+  // 闭包捕获的 state 可能滞后，需用 ref 保证判断准确。
+  const usingRemoteUrlRef = useRef(false);
   const [remotePlayUrl, setRemotePlayUrl] = useState('');
   const [urlInput, setUrlInput] = useState('');
   // 视频加载错误提示：网络直链可能因跨域/失效而失败，需要明确反馈而非"点了没反应"
@@ -313,9 +318,11 @@ export default function RoomView() {
     setOnlineUserIds(new Set());
     setResolution(null);
     setUsingRemoteUrl(false);
+    usingRemoteUrlRef.current = false;
     setRemotePlayUrl('');
     setVideoError('');
     setIsPlaying(false);
+    isPlayingRef.current = false;
     setEndedPrompt(false);
     // 重置本地静音状态（音频图与元素复用，仅复位增益与状态）
     setHostMuted(false);
@@ -376,7 +383,6 @@ export default function RoomView() {
       setJoined(true);
       setError('');
       setupWebSocket();
-      setShowVoicePrompt(true);
     } catch (error: any) {
       setError(error.response?.data?.error || '加入房间失败');
     }
@@ -475,13 +481,14 @@ export default function RoomView() {
       };
       // 房主用原生控制条暂停/继续时，广播给观众同步（移除自定义按钮后由这里兜底）
       v.onpause = () => {
-        // 仅当正在放映中才广播，避免切页隐藏/加载时误触发
-        if (isPlaying && socketRef.current) {
+        // 仅当正在放映中才广播，避免切页隐藏/加载时误触发。
+        // 用 isPlayingRef（同步镜像）而非闭包捕获的 isPlaying state（会是旧值 false，导致广播发不出）。
+        if (isPlayingRef.current && socketRef.current) {
           socketRef.current.emit('host-pause', { roomId: id });
         }
       };
       v.onplay = () => {
-        if (isPlaying && socketRef.current) {
+        if (isPlayingRef.current && socketRef.current) {
           socketRef.current.emit('host-resume', { roomId: id });
         }
       };
@@ -534,21 +541,29 @@ export default function RoomView() {
       if (data.playbackState?.playing) {
         const ps = data.playbackState;
         setIsPlaying(true);
+        isPlayingRef.current = true;
         setResolution(ps.resolution || null);
 
         if (isHostRef.current) {
-          // 房主切页回来：session.video 一直存活（挂在 body 隐藏），只需恢复播放态；
-          // 若视频因切页时被 React 移除 DOM 而暂停，这里主动续播。
+          // 房主切页回来：session.video 一直存活（挂在 body 隐藏），只需恢复播放态。
+          // 注意：若视频尚无片源（刚进房未选文件），play() 会失败/转圈，这里仅在有片源时才续播。
           const lv = hostSessionRef.current?.video;
           if (lv) {
             if (ps.videoUrl) {
-              // 网络直链模式：确保片源仍在（切页未清 HLS/片源，理论上无需重载）
+              // 网络直链模式：房主本地需要重新加载直链（切页后 hlsRef/组件级资源已释放）
+              usingRemoteUrlRef.current = true;
+              setUsingRemoteUrl(true);
               setRemotePlayUrl(ps.videoUrl);
+              loadLocalUrl(ps.videoUrl, !!ps.isHls);
             } else {
+              // 本地文件模式：session.video 的 src 仍在（切页未 revoke），只需恢复播放
+              usingRemoteUrlRef.current = false;
+              setUsingRemoteUrl(false);
               setRemotePlayUrl('');
+              if (lv.src || lv.currentSrc) {
+                lv.play().catch(() => setNeedClickPlay(true));
+              }
             }
-            // 恢复播放：视频元素可能已因 detached 被浏览器暂停，重新 play
-            lv.play().catch(() => setNeedClickPlay(true));
           }
         } else if (ps.videoUrl) {
           // 观众 + 网络视频模式：加载直链，并在媒体可播放后追进度
@@ -650,6 +665,7 @@ export default function RoomView() {
 
     socket.on('playback-start', (data: any) => {
       setIsPlaying(true);
+      isPlayingRef.current = true;
       setPendingPlaybackAction(null);
       setResolution(data?.resolution || null);
       if (data?.videoUrl) {
@@ -665,18 +681,21 @@ export default function RoomView() {
 
     socket.on('playback-pause', () => {
       setIsPlaying(false);
+      isPlayingRef.current = false;
       remoteVideoRef.current?.pause();
       localVideoRef.current?.pause();
     });
 
     socket.on('playback-resume', () => {
       setIsPlaying(true);
+      isPlayingRef.current = true;
       remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
       localVideoRef.current?.play().catch(() => {});
     });
 
     socket.on('playback-stop', () => {
       setIsPlaying(false);
+      isPlayingRef.current = false;
       setPendingPlaybackAction(null);
       remoteVideoRef.current?.pause();
       localVideoRef.current?.pause();
@@ -698,6 +717,7 @@ export default function RoomView() {
 
     socket.on('host-disconnected', (data: any) => {
       setIsPlaying(false);
+      isPlayingRef.current = false;
       appendSystemMessage(`⚠️ ${data.message || '房主连接中断，放映已结束'}`);
     });
 
@@ -840,8 +860,15 @@ export default function RoomView() {
         pc.addTrack(track, localMicRef.current!);
       });
     }
-    // 网络视频模式下，视频由每位观众各自加载直链，房主不通过 WebRTC 转发视频轨
-    if (isHost && !usingRemoteUrl && localVideoRef.current) {
+    // 网络视频模式下，视频由每位观众各自加载直链，房主不通过 WebRTC 转发视频轨。
+    // 关键修复：
+    //   1) isHost / usingRemoteUrl 均为 state，此处经 room-joined 异步回调调用会捕获旧值，
+    //      改用 isHostRef / usingRemoteUrlRef（同步镜像）。
+    //   2) localVideoRef 依赖挂载 effect 赋值，房主刚进房时可能还是 null，
+    //      改用 hostSessionRef.current?.video（模块级单例，创建即可用），
+    //      否则房主的视频轨道从未加到 PC，导致「本地文件观众无法观看」。
+    const hostVideo = hostSessionRef.current?.video;
+    if (isHostRef.current && !usingRemoteUrlRef.current && hostVideo) {
       const stream = getVideoCaptureStream();
       if (stream) {
         // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
@@ -857,7 +884,8 @@ export default function RoomView() {
   };
 
   const getVideoCaptureStream = (): MediaStream | null => {
-    const video = localVideoRef.current as any;
+    // 优先用模块级单例 session.video（房主刚进房/切页回来时 localVideoRef 可能尚未赋值）
+    const video = (hostSessionRef.current?.video || localVideoRef.current) as any;
     if (!video) return null;
     const capture = video.captureStream || video.mozCaptureStream;
     if (!capture) return null;
@@ -871,7 +899,7 @@ export default function RoomView() {
    * 注意：同一个媒体元素只能 createMediaElementSource 一次，源节点挂在元素属性上复用。
    */
   const setupHostAudioGraph = () => {
-    const el = localVideoRef.current as any;
+    const el = (hostSessionRef.current?.video || localVideoRef.current) as any;
     if (!el) return;
     try {
       if (!hostAudioCtxRef.current) {
@@ -964,7 +992,6 @@ export default function RoomView() {
   // ===== 语音聊天 =====
 
   const joinVoice = async () => {
-    setShowVoicePrompt(false);
     try {
       // 安全上下文检查：getUserMedia 在公网 HTTP（非 localhost / 非 HTTPS）下会被浏览器拒绝。
       // 提前给出明确提示，避免「点击无反应」。
@@ -1248,9 +1275,10 @@ export default function RoomView() {
       localObjectUrlRef.current = src;
     }
     setSelectedFile({ name });
-    if (localVideoRef.current) {
-      localVideoRef.current.src = src;
-      localVideoRef.current.load();
+    const el = hostSessionRef.current?.video || localVideoRef.current;
+    if (el) {
+      el.src = src;
+      el.load();
     }
   };
 
@@ -1335,7 +1363,7 @@ export default function RoomView() {
 
   // 房主本地也直接加载网络视频观看（不通过 WebRTC 转发）
   const loadLocalUrl = (url: string, isHls: boolean) => {
-    const el = localVideoRef.current;
+    const el = hostSessionRef.current?.video || localVideoRef.current;
     if (!el) return;
     setVideoError('');
     destroyHls();
@@ -1354,25 +1382,28 @@ export default function RoomView() {
 
   /** 手动点击「开始播放」：同时覆盖房主(localVideoRef)与观众(remoteVideoRef)两种情况 */
   const playCurrentVideo = () => {
-    const el = isHost ? localVideoRef.current : remoteVideoRef.current;
+    const el = isHostRef.current
+      ? (hostSessionRef.current?.video || localVideoRef.current)
+      : remoteVideoRef.current;
     el?.play().catch(() => setNeedClickPlay(true));
     setNeedClickPlay(false);
     setVideoError('');
   };
 
   const getResolution = () => {
-    const el = localVideoRef.current;
+    const el = hostSessionRef.current?.video || localVideoRef.current;
     if (el && el.videoWidth && el.videoHeight) return `${el.videoWidth}×${el.videoHeight}`;
     return null;
   };
 
   const startPlayback = async () => {
-    if (usingRemoteUrl) {
+    if (usingRemoteUrlRef.current) {
       const url = remotePlayUrl.trim();
       if (!url) { alert('请先粘贴要播放的网络视频地址'); return; }
       // 增强 HLS 识别：不再只认 .m3u8，覆盖无扩展名的 HLS 直链
       const isHls = looksLikeHls(url);
       setIsPlaying(true);
+      isPlayingRef.current = true;
       loadLocalUrl(url, isHls);
       socketRef.current?.emit('host-start-play', {
         roomId: id,
@@ -1390,16 +1421,19 @@ export default function RoomView() {
     }
 
     setIsPlaying(true);
+    isPlayingRef.current = true;
 
-    if (localVideoRef.current) {
+    const hostVideo = hostSessionRef.current?.video || localVideoRef.current;
+    if (hostVideo) {
       try {
         // 先建立音频分流（需要用户手势才能启动 AudioContext，此刻正好是点击事件内）
         setupHostAudioGraph();
-        await localVideoRef.current.play();
+        await hostVideo.play();
       } catch (err) {
         console.error('播放失败:', err);
         alert('视频播放失败，请检查文件格式');
         setIsPlaying(false);
+        isPlayingRef.current = false;
         return;
       }
     }
@@ -1530,6 +1564,7 @@ export default function RoomView() {
   // 电影播放完毕（仅房主触发）：暂停同步 + 房间回到等待状态 + 弹窗询问是否解散
   const handleHostMovieEnded = () => {
     setIsPlaying(false);
+    isPlayingRef.current = false;
     socketRef.current?.emit('host-pause', { roomId: id });
     // 房间状态回到等待，房主可开始新电影或解散房间
     api.patch(`/rooms/${id}/status`, { status: 'WAITING' }).catch(() => {});
@@ -1826,11 +1861,11 @@ export default function RoomView() {
                 <div className="source-tabs">
                   <button
                     className={`tab ${!usingRemoteUrl ? 'active' : ''}`}
-                    onClick={() => setUsingRemoteUrl(false)}
+                    onClick={() => { setUsingRemoteUrl(false); usingRemoteUrlRef.current = false; }}
                   >📁 本地文件</button>
                   <button
                     className={`tab ${usingRemoteUrl ? 'active' : ''}`}
-                    onClick={() => setUsingRemoteUrl(true)}
+                    onClick={() => { setUsingRemoteUrl(true); usingRemoteUrlRef.current = true; }}
                   >🌐 网络视频直链</button>
                 </div>
 
@@ -1951,24 +1986,6 @@ export default function RoomView() {
                 <p className="chat-rules" style={{ marginTop: 10 }}>
                   保留的房间可随时进入开始新电影，或使用「❌ 解散房间」按钮解散。
                 </p>
-              </div>
-            </div>
-          )}
-
-          {/* 加入语音询问弹窗 */}
-          {showVoicePrompt && (
-            <div className="modal-mask">
-              <div className="modal-card card">
-                <h3>🎤 是否加入语音聊天？</h3>
-                <p>加入后可以与房间内所有人语音交流，也可以随时退出。</p>
-                <div className="modal-actions">
-                  <button className="btn btn-secondary" onClick={() => setShowVoicePrompt(false)}>
-                    暂不加入
-                  </button>
-                  <button className="btn btn-primary" onClick={joinVoice}>
-                    加入语音
-                  </button>
-                </div>
               </div>
             </div>
           )}
