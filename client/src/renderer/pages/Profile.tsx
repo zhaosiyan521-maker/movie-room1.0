@@ -225,6 +225,7 @@ export default function Profile() {
               onChange={(e) => setNickname(e.target.value)}
               placeholder="请输入昵称"
             />
+            <span className="hint">昵称不能与其他用户重复，且不超过 10 个字</span>
           </div>
 
           {message && (

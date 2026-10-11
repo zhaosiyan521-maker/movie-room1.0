@@ -45,14 +45,19 @@ userRouter.patch('/profile', async (req: AuthRequest, res: Response) => {
 
     const updateData: any = {};
 
-    // 昵称：trim 后非空 + 长度上限，避免全空格昵称与超长昵称入库
+    // 昵称：trim 后非空 + 长度上限（按字计，单个字母也算一个字）+ 全局唯一
     if (nickname !== undefined) {
       if (typeof nickname !== 'string') {
         return res.status(400).json({ error: '昵称格式无效' });
       }
       const trimmed = nickname.trim();
-      if (!trimmed || trimmed.length > 30) {
-        return res.status(400).json({ error: '昵称不能为空且不能超过 30 个字符' });
+      if (!trimmed || Array.from(trimmed).length > 10) {
+        return res.status(400).json({ error: '昵称不能为空且不能超过 10 个字' });
+      }
+      // 唯一性：排除自己
+      const existing = await prisma.user.findUnique({ where: { nickname: trimmed } });
+      if (existing && existing.id !== req.user!.id) {
+        return res.status(409).json({ error: '该昵称已被使用，请换一个' });
       }
       updateData.nickname = trimmed;
     }

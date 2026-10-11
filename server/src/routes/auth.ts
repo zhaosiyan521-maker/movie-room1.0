@@ -40,7 +40,7 @@ const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 // 用户名规则：与修改用户名（user.ts）保持同一份，避免两处规则漂移
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const MAX_PASSWORD_LEN = 128;
-const MAX_NICKNAME_LEN = 30;
+const MAX_NICKNAME_LEN = 10;
 const PURPOSES: VerifyPurpose[] = ['register', 'change-password', 'bind-email'];
 
 function normalizeEmail(email: string): string {
@@ -150,8 +150,8 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
       return res.status(400).json({ error: `密码长度需为 8-${MAX_PASSWORD_LEN} 位` });
     }
     if (nickname !== undefined) {
-      if (typeof nickname !== 'string' || !nickname.trim() || nickname.length > MAX_NICKNAME_LEN) {
-        return res.status(400).json({ error: `昵称不能为空且不能超过 ${MAX_NICKNAME_LEN} 个字符` });
+      if (typeof nickname !== 'string' || !nickname.trim() || Array.from(nickname).length > MAX_NICKNAME_LEN) {
+        return res.status(400).json({ error: `昵称不能为空且不能超过 ${MAX_NICKNAME_LEN} 个字` });
       }
     }
     if (!emailVerifyToken) {
@@ -192,6 +192,13 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
       return res.status(409).json({ error: '该用户名或邮箱已被注册' });
     }
 
+    // 昵称全局唯一：提前检查（并捕获唯一约束冲突），避免重名
+    const trimmedNickname = nickname ? nickname.trim() : username;
+    const existingNickname = await prisma.user.findUnique({ where: { nickname: trimmedNickname } });
+    if (existingNickname) {
+      return res.status(409).json({ error: '该昵称已被使用，请换一个' });
+    }
+
     // 原子消费验证凭据：必须在创建用户「之前」消费。
     // 若放在之后，两个并发请求会同时通过校验（TOCTOU），导致同一份验证被使用两次。
     // 优先消费前端传来的 token（若有）；同时清理邮箱验证记录，防止重复注册。
@@ -219,7 +226,7 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
           username,
           email,
           passwordHash,
-          nickname: nickname ? nickname.trim() : username,
+          nickname: trimmedNickname,
           lastIp: ip,
           // 管理员不再依据用户名自动授予（否则任何人都可抢注 admin 成为管理员）。
           // 管理员只能通过 server/scripts/reset-admin.ts 或人工改库创建。

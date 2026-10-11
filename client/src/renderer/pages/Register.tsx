@@ -145,7 +145,7 @@ export default function Register() {
               className="input"
               value={form.nickname}
               onChange={handleChange}
-              placeholder="请输入昵称"
+              placeholder="请输入昵称（不超过 10 个字，不能重复）"
             />
           </div>
 
