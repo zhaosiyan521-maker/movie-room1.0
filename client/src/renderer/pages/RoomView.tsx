@@ -567,7 +567,8 @@ export default function RoomView() {
               usingRemoteUrlRef.current = true;
               setUsingRemoteUrl(true);
               setRemotePlayUrl(ps.videoUrl);
-              loadLocalUrl(ps.videoUrl, !!ps.isHls);
+              // 传入当前进度，重载后追回，避免从 0 重新播放导致与观众进度脱节
+              loadLocalUrl(ps.videoUrl, !!ps.isHls, typeof ps.currentTime === 'number' ? ps.currentTime : 0);
             } else {
               // 本地文件模式：session.video 的 src 仍在（切页未 revoke），只需恢复播放
               usingRemoteUrlRef.current = false;
@@ -1329,13 +1330,17 @@ export default function RoomView() {
    * 关键点：必须在 manifest 解析完成（MANIFEST_PARSED）之后才调用 play()，
    * 否则在 attachMedia 之后立即 play() 会因媒体尚未就绪而静默失败。
    */
-  const attachHls = (el: HTMLVideoElement, url: string) => {
+  const attachHls = (el: HTMLVideoElement, url: string, seekTo?: number) => {
     const hls = new Hls();
     hlsRef.current = hls;
     hls.loadSource(url);
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setVideoError('');
+      // 房主切页回来重载直链时，追回原进度后再播放，避免从 0 重新播
+      if (typeof seekTo === 'number' && seekTo > 0) {
+        try { el.currentTime = seekTo; } catch {}
+      }
       // 观众端播放失败静默忽略（不弹窗/不静音）；房主端保留点击播放兜底。
       if (el === remoteVideoRef.current) {
         el.play().catch(() => {});
@@ -1384,21 +1389,34 @@ export default function RoomView() {
   };
 
   // 房主本地也直接加载网络视频观看（不通过 WebRTC 转发）
-  const loadLocalUrl = (url: string, isHls: boolean) => {
+  const loadLocalUrl = (url: string, isHls: boolean, seekTo?: number) => {
     const el = hostSessionRef.current?.video || localVideoRef.current;
     if (!el) return;
     setVideoError('');
     destroyHls();
     const target = toProxiedUrl(url);
     const useHls = isHls || looksLikeHls(url);
+    // 房主切页回来重载直链时，加载完成后追回原进度（否则会从 0 重新播放，进度与观众脱节）
+    const resumeAt = (e: HTMLVideoElement) => {
+      if (typeof seekTo === 'number' && seekTo > 0) {
+        const apply = () => {
+          try { e.currentTime = seekTo; } catch {}
+          e.play().catch(() => setNeedClickPlay(true));
+        };
+        if (e.readyState >= 1) apply();
+        else e.addEventListener('loadedmetadata', apply, { once: true });
+      } else {
+        e.play().catch(() => setNeedClickPlay(true));
+      }
+    };
     if (useHls && Hls.isSupported()) {
-      attachHls(el, target);
+      attachHls(el, target, seekTo);
     } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
       el.src = target;
-      el.play().catch(() => setNeedClickPlay(true));
+      resumeAt(el);
     } else {
       el.src = target;
-      el.play().catch(() => setNeedClickPlay(true));
+      resumeAt(el);
     }
   };
 
