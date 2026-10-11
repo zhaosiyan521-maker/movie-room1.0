@@ -15,8 +15,6 @@ const lastChatTime = new Map<string, number>();
 const lastSpeakingAt = new Map<string, number>();
 // 踢出投票：roomId -> targetUserId -> { agrees, declines, targetName }
 const kickVotes = new Map<string, Map<string, { agrees: Set<string>; declines: Set<string>; targetName: string }>>();
-// 放映投票（暂停/结束）：roomId -> { action, agrees, declines }
-const playbackVotes = new Map<string, { action: 'pause' | 'stop'; agrees: Set<string>; declines: Set<string> }>();
 
 // 房间当前播放状态缓存：新观众加入时据此立即续播，避免「等待房主开始播放」。
 // roomId -> { playing, videoUrl?, isHls?, resolution?, currentTime, duration, updatedAt }
@@ -122,7 +120,6 @@ function voteThreshold(total: number): number {
 const CHAT_COOLDOWN_MS = 3000; // 每 3 秒一条
 const CHAT_MAX_LENGTH = 50;    // 每条最多 50 字
 const SPEAKING_MIN_INTERVAL_MS = 300; // speaking 上报最小间隔
-const VOTE_TTL_MS = 60 * 1000; // 投票无响应自动失效
 
 // 生产环境关闭含用户名的调试日志（避免 PII 落盘）
 const isProd = process.env.NODE_ENV === 'production';
@@ -405,67 +402,21 @@ export function setupSocketHandlers(io: Server) {
       socket.to(room.id).emit('playback-pause', { byHost: true });
     });
 
-    // 放映投票：结束放映必须由房间内观众投票决定（逻辑同踢人投票）。
-    // 暂停已改为房主直接操作（host-pause），不再需要投票。
-    socket.on('playback-vote-request', async (data: { roomId: string; action: 'stop' }) => {
-      try {
-        if (!requireInRoom(socket, data?.roomId)) return;
-        const { roomId, action } = data;
-        if (action !== 'stop') return;
+    // 房主一键结束放映（已删除观众投票机制，结束放映由房主直接操作）
+    socket.on('host-stop-play', async (data: { roomId: string }) => {
+      const room = await requireHost(socket, data?.roomId);
+      if (!room) return;
 
-        const room = await prisma.room.findUnique({
-          where: { id: roomId },
-          select: { id: true, status: true }
-        });
-        if (!room || room.status !== 'PLAYING') {
-          socket.emit('error', { message: '当前没有正在放映的内容' });
-          return;
-        }
+      // 清空播放状态缓存，房间回到等待状态
+      roomPlaybackStates.delete(room.id);
 
-        playbackVotes.set(roomId, { action, agrees: new Set([socket.userId!]), declines: new Set() });
+      await prisma.room.update({
+        where: { id: room.id },
+        data: { status: 'WAITING' }
+      }).catch(() => {});
 
-        const total = distinctUserCount(io, roomId);
-        const needed = voteThreshold(total);
-        if (needed === Number.MAX_SAFE_INTEGER) return;
-
-        socket.to(roomId).emit('playback-vote-request', {
-          action,
-          initiator: socket.nickname || socket.username,
-          needed,
-          total
-        });
-
-        // 无人响应的投票自动撤销，避免 playbackVotes 无限堆积（内存泄漏）
-        setTimeout(() => {
-          const v = playbackVotes.get(roomId);
-          if (v && v.agrees.size === 1) playbackVotes.delete(roomId);
-        }, VOTE_TTL_MS).unref();
-
-        await checkPlaybackVotes(io, roomId);
-      } catch (error) {
-        console.error('Playback vote request error:', error);
-      }
-    });
-
-    socket.on('playback-vote', async (data: { roomId: string; action: 'pause' | 'stop'; agree: boolean }) => {
-      try {
-        // 成员校验：防止场外用户操纵任意房间的放映投票
-        if (!requireInRoom(socket, data?.roomId)) return;
-        const { roomId, action, agree } = data;
-        const vote = playbackVotes.get(roomId);
-        if (!vote || vote.action !== action) return;
-
-        // 同一用户改票时从另一侧移除，避免同时计入 agrees 与 declines
-        const userId = socket.userId!;
-        vote.agrees.delete(userId);
-        vote.declines.delete(userId);
-        if (agree) vote.agrees.add(userId);
-        else vote.declines.add(userId);
-
-        await checkPlaybackVotes(io, roomId);
-      } catch (error) {
-        console.error('Playback vote error:', error);
-      }
+      // 广播给观众（含房主自己，房主端也会收到 playback-stop 同步 isPlaying）
+      io.to(room.id).emit('playback-stop', { byHost: true });
     });
 
     // 同步播放进度（仅房主可发起，避免观众恶意扰乱进度）
@@ -725,32 +676,6 @@ async function checkKickVotes(io: Server, roomId: string, targetUserId: string) 
   }
 }
 
-// 检查放映投票是否达到阈值，达则下发暂停/结束指令
-async function checkPlaybackVotes(io: Server, roomId: string) {
-  const vote = playbackVotes.get(roomId);
-  if (!vote) return;
-
-  const total = distinctUserCount(io, roomId);
-  const needed = voteThreshold(total);
-
-  if (needed !== Number.MAX_SAFE_INTEGER && vote.agrees.size >= needed) {
-    playbackVotes.delete(roomId);
-
-    if (vote.action === 'pause') {
-      io.to(roomId).emit('playback-pause', { byVote: true });
-    } else {
-      io.to(roomId).emit('playback-stop', { byVote: true });
-      roomPlaybackStates.delete(roomId); // 结束放映，清空播放状态
-      await prisma.room.update({
-        where: { id: roomId },
-        data: { status: 'WAITING' }
-      }).catch(() => {});
-    }
-
-    dbg(`房间 ${roomId} 放映「${vote.action === 'pause' ? '暂停' : '结束'}」投票通过（同意 ${vote.agrees.size}/${total}）`);
-  }
-}
-
 async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server, voluntary = false) {
   socket.leave(roomId);
 
@@ -788,7 +713,6 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
     if (roomUsers.get(roomId)!.size === 0) {
       roomUsers.delete(roomId);
       kickVotes.delete(roomId);
-      playbackVotes.delete(roomId);  // 房间清空时一并清理，避免内存泄漏
       roomPlaybackStates.delete(roomId);
     }
   }

@@ -54,13 +54,6 @@ interface KickVoteRequest {
   total: number;
 }
 
-interface PlaybackVoteRequest {
-  action: 'pause' | 'stop';
-  initiator: string;
-  needed: number;
-  total: number;
-}
-
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -160,11 +153,6 @@ export default function RoomView() {
 
   // 踢出投票（观众收到的确认弹窗）
   const [kickVote, setKickVote] = useState<KickVoteRequest | null>(null);
-
-  // 放映投票（房主发起暂停/结束 → 观众收到确认弹窗）
-  const [playbackVote, setPlaybackVote] = useState<PlaybackVoteRequest | null>(null);
-  // 房主自己发起的放映投票（等待其他观众同意期间显示「投票中」）
-  const [pendingPlaybackAction, setPendingPlaybackAction] = useState<'pause' | 'stop' | null>(null);
 
   // 语音音量等级（0~1），用于头像按音量着色
   const [levelByUser, setLevelByUser] = useState<Record<string, number>>({});
@@ -686,7 +674,6 @@ export default function RoomView() {
     socket.on('playback-start', (data: any) => {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      setPendingPlaybackAction(null);
       setResolution(data?.resolution || null);
       if (data?.videoUrl) {
         // 网络视频模式：观众各自加载直链，不经过房主带宽
@@ -716,14 +703,8 @@ export default function RoomView() {
     socket.on('playback-stop', () => {
       setIsPlaying(false);
       isPlayingRef.current = false;
-      setPendingPlaybackAction(null);
       remoteVideoRef.current?.pause();
       localVideoRef.current?.pause();
-    });
-
-    // 房主发起「暂停/结束放映」投票 → 观众收到确认弹窗
-    socket.on('playback-vote-request', (data: any) => {
-      setPlaybackVote({ action: data.action, initiator: data.initiator, needed: data.needed, total: data.total });
     });
 
     // 进度同步（本地 mesh 模式由 WebRTC 自带；网络视频模式按此对齐播放位置）
@@ -844,8 +825,13 @@ export default function RoomView() {
       }
     };
 
-    pc.onnegotiationneeded = async () => {
+    // 主动发起一次协商（发送 offer）。既用于 onnegotiationneeded（加轨触发），
+    // 也用于「观众未加入语音、无本地轨」的场景——否则观众永远不发 offer，
+    // 房主侧收不到 offer 就不会创建 PC，房主的视频流永远推不过去 → 观众黑屏。
+    const makeOffer = async () => {
       try {
+        // 防抖：若已有 offer 在途，避免并发 setLocalDescription 导致 InvalidStateError
+        if (makingOfferRef.current.get(targetSocketId)) return;
         makingOfferRef.current.set(targetSocketId, true);
         await pc.setLocalDescription();
         socketRef.current?.emit('offer', {
@@ -859,6 +845,10 @@ export default function RoomView() {
       }
     };
 
+    pc.onnegotiationneeded = () => {
+      void makeOffer();
+    };
+
     pc.ontrack = (event) => {
       handleRemoteTrack(targetSocketId, event.track);
     };
@@ -870,6 +860,14 @@ export default function RoomView() {
     };
 
     addLocalTracksTo(pc);
+
+    // 关键修复：观众加入时若没有任何本地轨（未加入语音），addLocalTracksTo 不会
+    // 触发 onnegotiationneeded，观众就永远不发 offer，房主侧因此不会创建 PC，
+    // 本地文件模式下房主的视频流无法送达观众 → 黑屏。
+    // 这里兜底：PC 没有任何 sender 时，主动发一次 offer 建立连接。
+    if (pc.getSenders().length === 0) {
+      void makeOffer();
+    }
 
     return pc;
   };
@@ -1379,7 +1377,13 @@ export default function RoomView() {
 
   const loadRemoteVideo = (url: string, isHls: boolean) => {
     const el = remoteVideoRef.current;
-    if (!el) return;
+    // 关键修复：room-joined 回调可能在 React 渲染 <video>（remoteVideoRef 赋值）之前
+    // 就执行，此时 el 为 null，直接 return 会导致观众中途加入时画面永远不加载 → 黑屏。
+    // 这里改为延迟重试，直到 video 元素挂载就绪。
+    if (!el) {
+      setTimeout(() => loadRemoteVideo(url, isHls), 100);
+      return;
+    }
     setVideoError('');
     destroyHls();
     const target = toProxiedUrl(url);
@@ -1529,21 +1533,18 @@ export default function RoomView() {
     });
   };
 
-  // 暂停/继续已改为房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
-  // 结束放映仍走观众投票。
+  // 暂停/继续由房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
+  // 结束放映也由房主一键操作（已删除观众投票机制）。
 
-  // 结束放映（之后才能解散房间）
+  // 结束放映（房主一键结束，无需观众投票）
   const stopPlayback = () => {
     if (!socketRef.current) return;
-    setPendingPlaybackAction('stop');
-    socketRef.current.emit('playback-vote-request', { roomId: id, action: 'stop' });
-    appendSystemMessage('🗳️ 已发起「结束放映」投票，需房间内观众同意后生效...');
-  };
-
-  const answerPlaybackVote = (agree: boolean) => {
-    if (!playbackVote || !socketRef.current) return;
-    socketRef.current.emit('playback-vote', { roomId: id, action: playbackVote.action, agree });
-    setPlaybackVote(null);
+    // 本地暂停视频，并通知观众结束
+    const el = hostSessionRef.current?.video || localVideoRef.current;
+    el?.pause();
+    setIsPlaying(false);
+    isPlayingRef.current = false;
+    socketRef.current.emit('host-stop-play', { roomId: id });
   };
 
   // ===== 全屏观看 =====
@@ -1743,15 +1744,6 @@ export default function RoomView() {
 
           {/* 中间：视频区域 */}
           <div className="video-area">
-            {/* 房主发起放映投票时显示的提示条 */}
-            {isHost && pendingPlaybackAction && (
-              <div className="vote-banner">
-                <span>
-                  🗳️ 正在发起「{pendingPlaybackAction === 'pause' ? '暂停放映' : '结束放映'}」投票，等待房间内观众同意...
-                </span>
-              </div>
-            )}
-
             <div className="video-container" ref={videoContainerRef}>
               {isHost ? (
                 // 房主本地视频：使用模块级单例元素（session.video），跨页面切换存活。
@@ -1967,9 +1959,8 @@ export default function RoomView() {
                     <button
                       onClick={stopPlayback}
                       className="btn btn-secondary"
-                      disabled={pendingPlaybackAction !== null}
                     >
-                      {pendingPlaybackAction === 'stop' ? '🗳️ 投票中...' : '⏹️ 结束放映'}
+                      ⏹️ 结束放映
                     </button>
                     {/* 房主本地静音：只静自己的扬声器，观众不受影响（本地文件模式） */}
                     {!usingRemoteUrl && (
@@ -2067,28 +2058,6 @@ export default function RoomView() {
                   </button>
                   <button className="btn btn-danger" onClick={() => answerKickVote(true)}>
                     是（同意踢出）
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* 放映控制投票（房主发起暂停/结束放映后观众收到） */}
-          {playbackVote && (
-            <div className="modal-mask">
-              <div className="modal-card card">
-                <h3>🗳️ 放映控制投票</h3>
-                <p>
-                  「{playbackVote.initiator}」发起投票：是否同意
-                  <strong>{playbackVote.action === 'pause' ? '暂停放映' : '结束本场放映'}</strong>？<br />
-                  需房间内 1/3 的人同意（{playbackVote.needed}/{playbackVote.total} 人）后生效。
-                </p>
-                <div className="modal-actions">
-                  <button className="btn btn-secondary" onClick={() => answerPlaybackVote(false)}>
-                    不同意
-                  </button>
-                  <button className="btn btn-primary" onClick={() => answerPlaybackVote(true)}>
-                    同意
                   </button>
                 </div>
               </div>
