@@ -2,16 +2,21 @@ import { useState, useEffect } from 'react';
 import { Outlet, Link, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 import { useVerifyStore } from '../store/verifyStore';
-// 走 import 让 Vite 处理资源路径：vite.config 里 base 为 './'（file:// 协议需要），
-// 硬编码 "/tip-qr-wechat.png" 在打包后会被解析成 file:///tip-qr-wechat.png（根目录）而 404。
+// 走 import 让 Vite 处理资源路径，避免打包后资源路径失效 404
 import tipQrWechat from '/tip-qr-wechat.png';
 import tipQrAlipay from '/tip-qr-alipay.png';
 import './Layout.css';
+
+// 打赏弹窗推送间隔：7 天
+const TIP_POPUP_INTERVAL = 7 * 24 * 60 * 60 * 1000;
+const TIP_POPUP_KEY = 'mr_support_popup_at';
 
 export default function Layout() {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
   const [showTip, setShowTip] = useState(false);
+  // 每 7 天自动弹出一次的支持弹窗
+  const [showSupportPopup, setShowSupportPopup] = useState(false);
 
   const handleLogout = () => {
     logout();
@@ -21,11 +26,25 @@ export default function Layout() {
     navigate('/login');
   };
 
+  // 每 7 天弹出一次支持弹窗（记录时间戳在展示时写入，避免反复打扰）
+  useEffect(() => {
+    try {
+      const last = Number(localStorage.getItem(TIP_POPUP_KEY) || 0);
+      if (!last || Date.now() - last > TIP_POPUP_INTERVAL) {
+        setShowSupportPopup(true);
+        localStorage.setItem(TIP_POPUP_KEY, String(Date.now()));
+      }
+    } catch { /* localStorage 不可用时静默跳过 */ }
+  }, []);
+
   // 弹窗：Escape 关闭 + 背景锁滚动 + 组件卸载时复原
   useEffect(() => {
-    if (!showTip) return;
+    if (!showTip && !showSupportPopup) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setShowTip(false);
+      if (e.key === 'Escape') {
+        setShowTip(false);
+        setShowSupportPopup(false);
+      }
     };
     document.addEventListener('keydown', onKey);
     document.body.style.overflow = 'hidden';
@@ -33,7 +52,10 @@ export default function Layout() {
       document.removeEventListener('keydown', onKey);
       document.body.style.overflow = '';
     };
-  }, [showTip]);
+  }, [showTip, showSupportPopup]);
+
+  // 头像：优先用户自定义头像，否则用渐变底 + 首字符的默认头像
+  const displayName = user?.nickname || user?.username || '?';
 
   return (
     <div className="layout">
@@ -47,7 +69,6 @@ export default function Layout() {
               ❤️ 打赏作者
             </button>
           </div>
-          <p className="tip-slogan">维护不易，如果你喜欢这个平台，可以请作者喝杯咖啡 ☕</p>
         </div>
 
         <nav className="nav">
@@ -60,8 +81,16 @@ export default function Layout() {
         </nav>
 
         <div className="user-menu">
-          <span className="user-name">{user?.nickname || user?.username}</span>
-          <Link to="/profile" className="nav-link">个人中心</Link>
+          {/* 头像即个人中心入口：点击头像图片进入个人中心 */}
+          <Link to="/profile" className="avatar-link" title="个人中心">
+            {user?.avatar ? (
+              <img src={user.avatar} alt="个人中心" className="header-avatar" />
+            ) : (
+              <span className="header-avatar header-avatar-fallback">
+                {displayName.charAt(0).toUpperCase()}
+              </span>
+            )}
+          </Link>
           <button onClick={handleLogout} className="btn btn-secondary btn-sm">
             退出
           </button>
@@ -71,6 +100,39 @@ export default function Layout() {
       <main className="main-content">
         <Outlet />
       </main>
+
+      {/* 每 7 天一次的支持弹窗 */}
+      {showSupportPopup && (
+        <div className="modal-mask" onClick={() => setShowSupportPopup(false)}>
+          <div
+            className="tip-modal support-popup card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="支持作者"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="support-popup-emoji">☕</div>
+            <h3>喜欢这个平台吗？</h3>
+            <p className="tip-modal-text">
+              本网站所有费用均为作者自费，如果喜欢本网站可以请作者喝杯咖啡 ☕
+            </p>
+            <div className="support-popup-actions">
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  setShowSupportPopup(false);
+                  setShowTip(true);
+                }}
+              >
+                ☕ 打赏作者
+              </button>
+              <button className="btn btn-secondary" onClick={() => setShowSupportPopup(false)}>
+                先用用看
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 打赏二维码弹窗 */}
       {showTip && (
@@ -83,7 +145,7 @@ export default function Layout() {
             onClick={(e) => e.stopPropagation()}
           >
             <h3>❤️ 打赏作者</h3>
-            <p className="tip-modal-text">维护不易，如果你喜欢这个平台，可以请作者喝杯咖啡 ☕</p>
+            <p className="tip-modal-text">感谢你的支持，这是作者持续维护的动力！</p>
             <div className="tip-qr-row">
               <div className="tip-qr-item">
                 <img src={tipQrWechat} alt="微信打赏二维码" />

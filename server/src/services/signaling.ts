@@ -30,6 +30,50 @@ interface RoomPlaybackState {
 }
 const roomPlaybackStates = new Map<string, RoomPlaybackState>();
 
+// 房主断线宽限期：刷新页面/网络抖动时旧 socket 断开，但房主很快会重连。
+// 宽限期内房主重新上线则取消解散/放映中断处理，避免「刷新页面房间就消失」。
+const HOST_GRACE_MS = 20_000;
+const pendingHostLeaves = new Map<string, NodeJS.Timeout>();
+
+/**
+ * 安排一个延迟的房主离开处理（解散 WAITING 房间 / 放映中断处理）。
+ * 到期时若房主已重新在线（重新 join-room），则跳过处理。
+ */
+function scheduleHostLeave(
+  roomId: string,
+  io: Server,
+  hostUserId: string,
+  action: 'dissolve' | 'abrupt'
+): void {
+  if (pendingHostLeaves.has(`${roomId}:${action}`)) return; // 已有倒计时在跑
+  const t = setTimeout(async () => {
+    pendingHostLeaves.delete(`${roomId}:${action}`);
+    try {
+      const room = await prisma.room.findUnique({
+        where: { id: roomId },
+        select: { id: true, hostId: true, status: true }
+      });
+      if (!room || room.hostId !== hostUserId) return;
+
+      // 房主已重新在线（新 socket 已 join-room），取消处理
+      const hostOnline = Array.from(roomUsers.get(roomId) || []).some(sid => {
+        const s = io.sockets.sockets.get(sid) as AuthenticatedSocket | undefined;
+        return s?.userId === hostUserId;
+      });
+      if (hostOnline) return;
+
+      if (action === 'dissolve') {
+        await dissolveRoom(roomId, { io, reason: '房主已离开，房间自动解散' }).catch(() => {});
+      } else if (room.status === 'PLAYING') {
+        await handleHostAbruptLeave(io, roomId, hostUserId);
+      }
+    } catch (error) {
+      console.error('Scheduled host leave error:', error);
+    }
+  }, HOST_GRACE_MS);
+  pendingHostLeaves.set(`${roomId}:${action}`, t);
+}
+
 // io 实例引用：供 admin 路由主动断开被封禁用户的连接（避免与 index.ts 形成循环依赖）
 let ioRef: Server | null = null;
 
@@ -717,20 +761,21 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
     });
     if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
       if (voluntary) {
-        // 放映途中房主主动解散已被 HTTP 接口拦截，这里兜底：转为结束放映
-        await prisma.room.update({
-          where: { id: roomId },
-          data: { status: 'WAITING' }
-        });
-        io.to(roomId).emit('playback-stop', { hostId: socket.userId });
+        // 放映途中房主主动解散（HTTP 接口已放行房主随时解散，此处为 socket 兜底）：直接解散
+        await dissolveRoom(roomId, { io }).catch(() => {});
       } else {
-        // 强行关闭网页导致放映中断
+        // 强行关闭网页导致放映中断：进入宽限期，房主快速重连（如刷新页面）则取消
         hostAbrupt = true;
-        await handleHostAbruptLeave(io, roomId, socket.userId!);
+        scheduleHostLeave(roomId, io, socket.userId!, 'abrupt');
       }
     } else if (room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
-      // 房主在非放映状态（等待中/已结束）退出：彻底解散并清除房间，不留历史记录
-      await dissolveRoom(roomId, { io }).catch(() => {});
+      if (voluntary) {
+        // 房主主动退出（含放映已结束的房间）：彻底解散并清除房间，不留历史记录
+        await dissolveRoom(roomId, { io }).catch(() => {});
+      } else {
+        // 断线（刷新页面/网络抖动）：宽限期内房主重连则取消解散
+        scheduleHostLeave(roomId, io, socket.userId!, 'dissolve');
+      }
     }
   } catch (error) {
     console.error('Leave room check error:', error);

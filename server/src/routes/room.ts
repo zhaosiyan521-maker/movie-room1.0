@@ -189,6 +189,14 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
       return res.status(400).json({ error: '房间描述不能超过 500 个字符' });
     }
 
+    // 每名用户最多同时拥有 5 个活跃房间（WAITING/PLAYING），各房间互不干扰
+    const activeRoomCount = await prisma.room.count({
+      where: { hostId: req.user!.id, status: { in: ['WAITING', 'PLAYING'] } }
+    });
+    if (activeRoomCount >= 5) {
+      return res.status(400).json({ error: '每名用户最多同时创建 5 个房间，请先解散部分房间再创建' });
+    }
+
     // 房间名称全局唯一（活跃房间内不允许重复）
     const duplicate = await prisma.room.findFirst({
       where: {
@@ -435,20 +443,10 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: '你不在该房间中' });
     }
 
-    // 如果是房主，解散房间
+    // 如果是房主，解散房间（房主拥有随时解散权，包括放映途中）
     if (member.role === 'HOST') {
-      const room = await prisma.room.findUnique({ where: { id: roomId } });
-
-      // 放映途中不允许解散房间
-      if (room?.status === 'PLAYING') {
-        return res.status(400).json({ error: '放映途中不能解散房间，请先结束放映' });
-      }
-
-      // 房主退出（含放映已结束的房间）：彻底解散并删除房间，
-      // 服务器端不保留任何历史记录（房间/成员/黑名单/图片全部清除）
       const io = getIO();
       await dissolveRoom(roomId, { io });
-
       return res.json({ message: '房间已解散' });
     }
 

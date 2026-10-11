@@ -1,17 +1,19 @@
 :root {
-  --primary-color: #e50914;
-  --primary-hover: #f40612;
-  --bg-color: #141414;
-  --bg-secondary: #1f1f1f;
-  --bg-card: #2a2a2a;
+  --primary-color: #7c4dff;
+  --primary-hover: #651fff;
+  --primary-gradient: linear-gradient(135deg, #7c4dff 0%, #448aff 100%);
+  --accent-gradient: linear-gradient(135deg, #00e5ff 0%, #7c4dff 100%);
+  --bg-color: #12101f;
+  --bg-secondary: #1a1730;
+  --bg-card: #211d3a;
   --text-primary: #ffffff;
-  --text-secondary: #b3b3b3;
-  --text-muted: #808080;
-  --border-color: #333333;
+  --text-secondary: #b8b3d6;
+  --text-muted: #7d78a0;
+  --border-color: #35305a;
   --success-color: #46d369;
   --warning-color: #f5c518;
-  --error-color: #e50914;
-  --shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --error-color: #ff4d6d;
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -23,6 +25,11 @@
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   background-color: var(--bg-color);
+  background-image:
+    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(124, 77, 255, 0.22), transparent),
+    radial-gradient(ellipse 60% 40% at 90% 10%, rgba(0, 229, 255, 0.10), transparent),
+    radial-gradient(ellipse 50% 40% at 50% 110%, rgba(124, 77, 255, 0.12), transparent);
+  background-attachment: fixed;
   color: var(--text-primary);
   line-height: 1.6;
   min-height: 100vh;
@@ -54,7 +61,7 @@ body {
 .btn {
   padding: 10px 24px;
   border: none;
-  border-radius: 4px;
+  border-radius: 10px;
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
@@ -66,12 +73,12 @@ body {
 }
 
 .btn-primary {
-  background-color: var(--primary-color);
+  background: var(--primary-gradient);
   color: white;
 }
 
 .btn-primary:hover {
-  background-color: var(--primary-hover);
+  background: linear-gradient(135deg, #8b5cff 0%, #559aff 100%);
   transform: translateY(-1px);
 }
 
@@ -87,7 +94,7 @@ body {
 
 .btn-outline {
   background-color: transparent;
-  color: var(--primary-color);
+  color: #b388ff;
   border: 1px solid var(--primary-color);
 }
 
@@ -108,7 +115,7 @@ body {
   padding: 12px 16px;
   background-color: var(--bg-secondary);
   border: 1px solid var(--border-color);
-  border-radius: 4px;
+  border-radius: 10px;
   color: var(--text-primary);
   font-size: 14px;
   transition: border-color 0.2s ease;
@@ -126,7 +133,8 @@ body {
 /* 卡片样式 */
 .card {
   background-color: var(--bg-card);
-  border-radius: 8px;
+  border: 1px solid rgba(124, 77, 255, 0.14);
+  border-radius: 16px;
   padding: 20px;
   box-shadow: var(--shadow);
 }
@@ -209,12 +217,12 @@ a, button, .card, input, select, textarea {
 }
 
 .btn-primary:not(:disabled):hover {
-  box-shadow: 0 4px 18px rgba(229, 9, 20, 0.45);
+  box-shadow: 0 4px 18px rgba(124, 77, 255, 0.5);
 }
 
 /* 输入框聚焦光晕 */
 .input:focus {
-  box-shadow: 0 0 0 3px rgba(229, 9, 20, 0.15);
+  box-shadow: 0 0 0 3px rgba(124, 77, 255, 0.2);
 }
 
 /* 弹窗进入动画 */

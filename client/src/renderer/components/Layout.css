@@ -10,11 +10,12 @@
   justify-content: space-between;
   padding: 0 24px;
   min-height: 64px;
-  background-color: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-color);
+  background: linear-gradient(135deg, rgba(46, 32, 92, 0.92) 0%, rgba(26, 23, 48, 0.95) 55%, rgba(18, 16, 31, 0.95) 100%);
+  border-bottom: 1px solid rgba(124, 77, 255, 0.28);
   position: sticky;
   top: 0;
   z-index: 100;
+  backdrop-filter: blur(10px);
 }
 
 .brand-area {
@@ -33,7 +34,10 @@
 .logo {
   font-size: 24px;
   font-weight: bold;
-  color: var(--primary-color);
+  background: linear-gradient(135deg, #b388ff, #00e5ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
   text-decoration: none;
   display: flex;
   align-items: center;
@@ -41,7 +45,7 @@
 }
 
 .tip-author-btn {
-  background: linear-gradient(135deg, #ff5f6d, #e50914);
+  background: linear-gradient(135deg, #ff5f9e, #ff5252);
   color: #fff;
   border: none;
   border-radius: 20px;
@@ -54,18 +58,71 @@
 
 .tip-author-btn:hover {
   transform: translateY(-1px) scale(1.03);
-  box-shadow: 0 4px 14px rgba(229, 9, 20, 0.4);
+  box-shadow: 0 4px 14px rgba(255, 95, 158, 0.45);
 }
 
 .tip-slogan {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-top: 2px;
-  white-space: nowrap;
+  display: none;
 }
 
 .admin-link {
   color: var(--warning-color);
+}
+
+/* 顶部用户头像 = 个人中心入口 */
+.avatar-link {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 50%;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.avatar-link:hover {
+  transform: scale(1.08);
+  box-shadow: 0 0 0 3px rgba(124, 77, 255, 0.45);
+}
+
+.header-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.header-avatar-fallback {
+  background: linear-gradient(135deg, #7c4dff, #448aff);
+  color: #fff;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.user-name {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+/* 每 7 天一次的支持弹窗 */
+.support-popup {
+  max-width: 420px;
+  text-align: center;
+  padding: 32px 28px;
+}
+
+.support-popup-emoji {
+  font-size: 52px;
+  margin-bottom: 8px;
+  animation: popIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.support-popup-actions {
+  display: flex;
+  gap: 14px;
+  justify-content: center;
+  flex-wrap: wrap;
 }
 
 /* 打赏弹窗 */

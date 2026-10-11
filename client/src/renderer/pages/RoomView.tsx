@@ -163,6 +163,19 @@ export default function RoomView() {
   // 视频加载错误提示：网络直链可能因跨域/失效而失败，需要明确反馈而非"点了没反应"
   const [videoError, setVideoError] = useState('');
 
+  // ===== 房主本地静音（不影响观众）=====
+  // 原理：视频元素音频经 WebAudio 分流为两路——
+  //   监听路（经过增益节点）→ 房主扬声器，可本地静音；
+  //   采集路（不经过增益节点）→ 发给观众的音频流，房主静音不影响。
+  const [hostMuted, setHostMuted] = useState(false);
+  const hostMutedRef = useRef(false);
+  const hostAudioCtxRef = useRef<AudioContext | null>(null);
+  const hostMonitorGainRef = useRef<GainNode | null>(null);
+  const hostCaptureAudioTrackRef = useRef<MediaStreamTrack | null>(null);
+
+  // 电影播放完毕：房主弹窗「是否解散该房间」
+  const [endedPrompt, setEndedPrompt] = useState(false);
+
   const hlsRef = useRef<any>(null);
   const setupDoneRef = useRef(false);
   const recentMsgSigRef = useRef<Set<string>>(new Set());
@@ -243,6 +256,15 @@ export default function RoomView() {
     setRemotePlayUrl('');
     setVideoError('');
     setIsPlaying(false);
+    setEndedPrompt(false);
+    // 重置本地静音状态（音频图与元素复用，仅复位增益与状态）
+    setHostMuted(false);
+    hostMutedRef.current = false;
+    if (hostMonitorGainRef.current) {
+      try { hostMonitorGainRef.current.gain.value = 1; } catch {}
+      hostMonitorGainRef.current = null;
+    }
+    hostCaptureAudioTrackRef.current = null;
     recentMsgSigRef.current.clear();
   };
 
@@ -647,7 +669,14 @@ export default function RoomView() {
     if (isHost && !usingRemoteUrl && localVideoRef.current) {
       const stream = getVideoCaptureStream();
       if (stream) {
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
+        stream.getVideoTracks().forEach(track => pc.addTrack(track, stream));
+        const audioTrack = hostCaptureAudioTrackRef.current;
+        if (audioTrack) {
+          try { pc.addTrack(audioTrack, stream); } catch {}
+        } else {
+          stream.getAudioTracks().forEach(track => pc.addTrack(track, stream));
+        }
       }
     }
   };
@@ -659,6 +688,59 @@ export default function RoomView() {
     if (!capture) return null;
     const stream: MediaStream = capture.call(video);
     return stream.getTracks().length > 0 ? stream : null;
+  };
+
+  /**
+   * 房主音频分流：把视频元素音频接入 WebAudio，拆成「本地监听」与「观众采集」两路。
+   * 房主静音只把监听路增益置 0，观众采集路不受影响。
+   * 注意：同一个媒体元素只能 createMediaElementSource 一次，源节点挂在元素属性上复用。
+   */
+  const setupHostAudioGraph = () => {
+    const el = localVideoRef.current as any;
+    if (!el) return;
+    try {
+      if (!hostAudioCtxRef.current) {
+        hostAudioCtxRef.current = new AudioContext();
+      }
+      const ctx = hostAudioCtxRef.current;
+      ctx.resume?.().catch(() => {});
+
+      let source: MediaElementAudioSourceNode | undefined = el.__mrAudioSource;
+      if (!source) {
+        source = ctx.createMediaElementSource(el);
+        el.__mrAudioSource = source;
+
+        // 监听路：房主扬声器（可本地静音）
+        const monitorGain = ctx.createGain();
+        source.connect(monitorGain);
+        monitorGain.connect(ctx.destination);
+        hostMonitorGainRef.current = monitorGain;
+        monitorGain.gain.value = hostMutedRef.current ? 0 : 1;
+
+        // 采集路：发给观众（不经过监听增益，房主静音不影响观众）
+        const dest = ctx.createMediaStreamDestination();
+        source.connect(dest);
+        hostCaptureAudioTrackRef.current = dest.stream.getAudioTracks()[0] || null;
+      } else {
+        ctx.resume?.().catch(() => {});
+        if (hostMonitorGainRef.current) {
+          hostMonitorGainRef.current.gain.value = hostMutedRef.current ? 0 : 1;
+        }
+      }
+    } catch (err) {
+      // WebAudio 不可用时静默回退：音频仍走 captureStream 原路径，本地静音功能降级
+      console.error('初始化房主音频分流失败:', err);
+    }
+  };
+
+  /** 房主本地静音开关：只影响自己的扬声器，不影响观众听到的音频 */
+  const toggleHostMute = () => {
+    const next = !hostMuted;
+    setHostMuted(next);
+    hostMutedRef.current = next;
+    if (hostMonitorGainRef.current) {
+      try { hostMonitorGainRef.current.gain.value = next ? 0 : 1; } catch {}
+    }
   };
 
   const handleRemoteTrack = (socketId: string, track: MediaStreamTrack) => {
@@ -1136,6 +1218,8 @@ export default function RoomView() {
 
     if (localVideoRef.current) {
       try {
+        // 先建立音频分流（需要用户手势才能启动 AudioContext，此刻正好是点击事件内）
+        setupHostAudioGraph();
         await localVideoRef.current.play();
       } catch (err) {
         console.error('播放失败:', err);
@@ -1149,11 +1233,24 @@ export default function RoomView() {
     if (stream) {
       peersRef.current.forEach(pc => {
         const existingKinds = pc.getSenders().map(s => s.track?.kind);
-        stream.getTracks().forEach(track => {
-          if (!existingKinds.includes(track.kind) || track.kind === 'video') {
+        // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
+        stream.getVideoTracks().forEach(track => {
+          if (!existingKinds.includes('video')) {
             try { pc.addTrack(track, stream); } catch {}
           }
         });
+        const audioTrack = hostCaptureAudioTrackRef.current;
+        if (audioTrack) {
+          if (!existingKinds.includes('audio')) {
+            try { pc.addTrack(audioTrack, stream); } catch {}
+          }
+        } else {
+          stream.getAudioTracks().forEach(track => {
+            if (!existingKinds.includes('audio')) {
+              try { pc.addTrack(track, stream); } catch {}
+            }
+          });
+        }
       });
     }
 
@@ -1241,12 +1338,7 @@ export default function RoomView() {
   }, []);
 
   const leaveRoom = async () => {
-    // 放映途中房主不允许解散房间
-    if (isHost && isPlaying) {
-      alert('放映途中不能解散房间，请先点击「⏹️ 结束放映」');
-      return;
-    }
-
+    // 房主拥有随时解散权（放映途中也可解散），观众为离开房间
     if (socketRef.current) {
       socketRef.current.emit('leave-room', id);
     }
@@ -1263,6 +1355,15 @@ export default function RoomView() {
     }
 
     navigate('/');
+  };
+
+  // 电影播放完毕（仅房主触发）：暂停同步 + 房间回到等待状态 + 弹窗询问是否解散
+  const handleHostMovieEnded = () => {
+    setIsPlaying(false);
+    socketRef.current?.emit('host-pause', { roomId: id });
+    // 房间状态回到等待，房主可开始新电影或解散房间
+    api.patch(`/rooms/${id}/status`, { status: 'WAITING' }).catch(() => {});
+    setEndedPrompt(true);
   };
 
   // ===== 渲染 =====
@@ -1395,6 +1496,7 @@ export default function RoomView() {
                   controls
                   playsInline
                   onLoadedMetadata={() => setResolution(getResolution())}
+                  onEnded={handleHostMovieEnded}
                   onError={() => {
                     const code = localVideoRef.current?.error?.code;
                     let msg = '视频加载失败，请检查文件格式或网络链接是否有效';
@@ -1560,7 +1662,6 @@ export default function RoomView() {
                   </button>
                 </>
               )}
-              <span className="voice-hint">点击左侧头像可静音某人{isHost ? '或踢出房间' : ''}</span>
             </div>
 
             {/* 房主控制面板 */}
@@ -1634,19 +1735,22 @@ export default function RoomView() {
                     >
                       {pendingPlaybackAction === 'stop' ? '🗳️ 投票中...' : '⏹️ 结束放映'}
                     </button>
-                    <span className="host-hint">放映途中无法解散房间</span>
+                    {/* 房主本地静音：只静自己的扬声器，观众不受影响（本地文件模式） */}
+                    {!usingRemoteUrl && (
+                      <button onClick={toggleHostMute} className="btn btn-secondary">
+                        {hostMuted ? '🔇 本地已静音' : '🔊 本地静音'}
+                      </button>
+                    )}
                   </>
                 )}
 
-                {/* 未播放时允许解散房间 */}
-                {!isPlaying && (
-                  <button
-                    onClick={() => { if (confirm('确定要解散房间吗？')) leaveRoom(); }}
-                    className="btn btn-danger"
-                  >
-                    ❌ 解散房间
-                  </button>
-                )}
+                {/* 房主随时可解散房间 */}
+                <button
+                  onClick={() => { if (confirm('确定要解散房间吗？房间将被彻底删除，所有观众将被请出。')) leaveRoom(); }}
+                  className="btn btn-danger"
+                >
+                  ❌ 解散房间
+                </button>
               </div>
             )}
           </div>
@@ -1690,6 +1794,27 @@ export default function RoomView() {
               </button>
             )}
           </div>
+
+          {/* 电影播放完毕：询问房主是否解散房间 */}
+          {isHost && endedPrompt && (
+            <div className="modal-mask">
+              <div className="modal-card card">
+                <h3>🎬 电影播放完毕</h3>
+                <p>是否解散该房间？</p>
+                <div className="modal-actions">
+                  <button className="btn btn-secondary" onClick={() => setEndedPrompt(false)}>
+                    否（保留房间）
+                  </button>
+                  <button className="btn btn-danger" onClick={leaveRoom}>
+                    是（解散房间）
+                  </button>
+                </div>
+                <p className="chat-rules" style={{ marginTop: 10 }}>
+                  保留的房间可随时进入开始新电影，或使用「❌ 解散房间」按钮解散。
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* 加入语音询问弹窗 */}
           {showVoicePrompt && (
