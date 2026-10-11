@@ -87,6 +87,61 @@ adminRouter.get('/users', async (req: AuthRequest, res: Response) => {
   }
 });
 
+// 房间列表：管理员查看/搜索所有用户创建的房间（含已结束），点击可进入（管理员无视密码）
+adminRouter.get('/rooms', async (req: AuthRequest, res: Response) => {
+  try {
+    const { search, status } = req.query;
+    const keyword = String(search || '').trim().slice(0, 50);
+    const statusFilter = String(status || '').trim().toUpperCase();
+
+    const where: Record<string, unknown> = {};
+    if (keyword) {
+      where.OR = [
+        { name: { contains: keyword } },
+        { currentMovie: { contains: keyword } },
+        { host: { is: { username: { contains: keyword } } } },
+        { host: { is: { nickname: { contains: keyword } } } }
+      ];
+    }
+    if (['WAITING', 'PLAYING', 'ENDED'].includes(statusFilter)) {
+      where.status = statusFilter;
+    }
+
+    const rooms = await prisma.room.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        images: true,
+        status: true,
+        password: true,
+        maxViewers: true,
+        currentMovie: true,
+        createdAt: true,
+        updatedAt: true,
+        host: { select: { id: true, username: true, nickname: true } },
+        _count: { select: { members: true } }
+      },
+      // 活跃房间靠前，同状态下新的靠前
+      orderBy: [{ status: 'asc' }, { updatedAt: 'desc' }],
+      take: 500
+    });
+
+    // 只下发是否存在密码，不下发明文
+    res.json({
+      rooms: rooms.map(r => ({
+        ...r,
+        password: undefined,
+        hasPassword: !!r.password
+      }))
+    });
+  } catch (error) {
+    console.error('Admin get rooms error:', error);
+    res.status(500).json({ error: '获取房间列表失败' });
+  }
+});
+
 // 封禁用户（永久封禁账号 + IP + 邮箱）
 adminRouter.post('/users/:id/ban', async (req: AuthRequest, res: Response) => {
   try {

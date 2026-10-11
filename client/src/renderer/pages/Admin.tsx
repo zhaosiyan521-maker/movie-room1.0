@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../store/authStore';
+import { parseRoomImages } from './RoomList';
 import './Admin.css';
 
 interface AdminUser {
@@ -24,15 +26,32 @@ interface BannedIp {
   createdAt: string;
 }
 
+interface AdminRoom {
+  id: string;
+  name: string;
+  description?: string | null;
+  images?: string | null;
+  status: string;
+  hasPassword?: boolean;
+  maxViewers: number;
+  currentMovie?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  host: { id: string; username: string; nickname: string };
+  _count?: { members: number };
+}
+
 export default function Admin() {
+  const navigate = useNavigate();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [bannedIps, setBannedIps] = useState<BannedIp[]>([]);
+  const [rooms, setRooms] = useState<AdminRoom[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   // 消息带类型：原先所有消息（含「封禁失败」）都用 success 绿色样式渲染，
   // 管理员会看到一片绿色的失败提示，误判操作已生效。
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [tab, setTab] = useState<'users' | 'ips'>('users');
+  const [tab, setTab] = useState<'users' | 'ips' | 'rooms'>('users');
 
   // 请求序号：只采纳最新请求结果，防止旧响应覆盖新状态
   const reqIdRef = useRef(0);
@@ -43,7 +62,11 @@ export default function Admin() {
     try {
       const params = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';
       // 搜索时无需拉取与搜索无关的封禁 IP 列表（原实现每次按键都会多打一个请求）
-      if (params) {
+      if (tab === 'rooms') {
+        const { data: roomsData } = await api.get(`/admin/rooms${params}`);
+        if (reqId !== reqIdRef.current) return;
+        setRooms(roomsData.rooms || []);
+      } else if (params) {
         const { data: usersData } = await api.get(`/admin/users${params}`);
         if (reqId !== reqIdRef.current) return;
         setUsers(usersData.users || []);
@@ -62,7 +85,7 @@ export default function Admin() {
     } finally {
       if (reqId === reqIdRef.current) setLoading(false);
     }
-  }, [search]);
+  }, [search, tab]);
 
   // 防抖：原先每敲一个字符触发 2 个请求
   useEffect(() => {
@@ -140,6 +163,9 @@ export default function Admin() {
           <button className={`filter-btn ${tab === 'ips' ? 'active' : ''}`} onClick={() => setTab('ips')}>
             🚫 封禁 IP ({bannedIps.length})
           </button>
+          <button className={`filter-btn ${tab === 'rooms' ? 'active' : ''}`} onClick={() => { setTab('rooms'); setSearch(''); }}>
+            🏠 房间列表 ({rooms.length})
+          </button>
         </div>
         {tab === 'users' && (
           <input
@@ -150,12 +176,64 @@ export default function Admin() {
             onChange={(e) => setSearch(e.target.value)}
           />
         )}
+        {tab === 'rooms' && (
+          <input
+            type="text"
+            className="input admin-search"
+            placeholder="🔍 搜索房间名 / 电影名 / 房主"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        )}
       </div>
 
       {message && <div className={`message ${message.type}`}>{message.text}</div>}
 
       {loading ? (
         <div className="loading">加载中...</div>
+      ) : tab === 'rooms' ? (
+        <div className="admin-room-list card">
+          {rooms.length === 0 ? (
+            <div className="loading">{search.trim() ? '没有找到匹配的房间' : '暂无房间'}</div>
+          ) : (
+            rooms.map(room => {
+              const images = parseRoomImages(room.images);
+              const cover = images[0];
+              return (
+                <button
+                  key={room.id}
+                  className="admin-room-item"
+                  onClick={() => navigate(`/room/${room.id}`)}
+                  title="点击进入房间（管理员无视密码）"
+                >
+                  {cover ? (
+                    <img className="admin-room-cover" src={cover} alt={room.name} loading="lazy" />
+                  ) : (
+                    <span className="admin-room-cover admin-room-cover-empty">🎬</span>
+                  )}
+                  <span className="admin-room-info">
+                    <span className="admin-room-name">
+                      {room.name}
+                      {room.hasPassword && <span className="admin-room-lock">🔒</span>}
+                    </span>
+                    <span className="admin-room-sub">
+                      👤 {room.host.nickname || room.host.username}
+                      {room.currentMovie ? ` · 🎬 ${room.currentMovie}` : ''}
+                    </span>
+                  </span>
+                  <span className="admin-room-meta">
+                    <span className={`status-badge ${room.status.toLowerCase()}`}>
+                      {room.status === 'WAITING' ? '等待中' :
+                       room.status === 'PLAYING' ? '播放中' : '已结束'}
+                    </span>
+                    <span className="admin-room-sub">👥 {room._count?.members || 0}/{room.maxViewers}</span>
+                    <span className="admin-room-sub">{new Date(room.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
       ) : tab === 'users' ? (
         <div className="admin-table-wrap card">
           <table className="admin-table">
