@@ -55,7 +55,7 @@ userRouter.patch('/profile', async (req: AuthRequest, res: Response) => {
         return res.status(400).json({ error: '昵称不能为空且不能超过 10 个字' });
       }
       // 唯一性：排除自己
-      const existing = await prisma.user.findUnique({ where: { nickname: trimmed } });
+      const existing = await prisma.user.findFirst({ where: { nickname: trimmed } });
       if (existing && existing.id !== req.user!.id) {
         return res.status(409).json({ error: '该昵称已被使用，请换一个' });
       }

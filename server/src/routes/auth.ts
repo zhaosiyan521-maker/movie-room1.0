@@ -194,7 +194,7 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
 
     // 昵称全局唯一：提前检查（并捕获唯一约束冲突），避免重名
     const trimmedNickname = nickname ? nickname.trim() : username;
-    const existingNickname = await prisma.user.findUnique({ where: { nickname: trimmedNickname } });
+    const existingNickname = await prisma.user.findFirst({ where: { nickname: trimmedNickname } });
     if (existingNickname) {
       return res.status(409).json({ error: '该昵称已被使用，请换一个' });
     }
