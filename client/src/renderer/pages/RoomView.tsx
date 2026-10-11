@@ -216,11 +216,14 @@ export default function RoomView() {
   const cleanupAll = (disposeHostSession = false) => {
     // 房主：切换页面（disposeHostSession=false）时保留推流会话（socket + 本地视频 + WebRTC peers 继续存活），
     // 只有观众或房主主动「解散/退出」（disposeHostSession=true）才彻底断开。
-    const isHostNow = isHost;
-    const shouldDisposeHost = isHostNow && disposeHostSession;
+    // 用全局 hostStreaming Map 判断是否为房主（最可靠，不受组件 state 时序影响）。
+    const hasHostSession = !!getHostSession(id!) || !!hostSessionRef.current;
+    const shouldDisposeHost = hasHostSession && disposeHostSession;
 
     if (socketRef.current) {
-      if (!isHostNow || shouldDisposeHost) {
+      // 房主切页：保留 socket 连接（不 disconnect），但清空组件内引用；
+      // 连接仍由 hostStreaming 单例的 session.socket 持有，观众画面/服务端状态不受影响。
+      if (!hasHostSession || shouldDisposeHost) {
         socketRef.current.disconnect();
       }
       socketRef.current = null;
@@ -232,10 +235,13 @@ export default function RoomView() {
     setupDoneRef.current = false;
 
     // 销毁 HLS 实例：否则旧实例会继续拉取分片，占用带宽与内存
-    destroyHls();
+    // 注意：房主切页时不清 HLS，否则网络直链模式下房主回来后需重新加载（观众不受影响）。
+    if (!hasHostSession || shouldDisposeHost) {
+      destroyHls();
+    }
 
     // 房主：切页时保留 peers（推流通道）与本地视频；观众或房主主动离开：关闭所有 peers
-    if (!isHostNow || shouldDisposeHost) {
+    if (!hasHostSession || shouldDisposeHost) {
       peersRef.current.forEach(pc => pc.close());
       peersRef.current.clear();
     } else {
@@ -259,6 +265,8 @@ export default function RoomView() {
         localEl.onended = null;
         localEl.onerror = null;
         localEl.ontimeupdate = null;
+        localEl.onpause = null;
+        localEl.onplay = null;
         // 重置挂载信号，房主回到房间时由 setupWebSocket 重新置 true 触发重挂载
         setHostSessionReady(false);
       }
@@ -283,7 +291,7 @@ export default function RoomView() {
 
     // 释放 ObjectURL，避免 Blob 泄漏（房主切页时不释放，视频仍要用）
     if (localObjectUrlRef.current) {
-      if (!isHostNow) {
+      if (!hasHostSession) {
         URL.revokeObjectURL(localObjectUrlRef.current);
         localObjectUrlRef.current = null;
       }
@@ -441,6 +449,18 @@ export default function RoomView() {
           currentTime: el.currentTime,
           duration: el.duration || 0
         });
+      };
+      // 房主用原生控制条暂停/继续时，广播给观众同步（移除自定义按钮后由这里兜底）
+      v.onpause = () => {
+        // 仅当正在放映中才广播，避免切页隐藏/加载时误触发
+        if (isPlaying && socketRef.current) {
+          socketRef.current.emit('host-pause', { roomId: id });
+        }
+      };
+      v.onplay = () => {
+        if (isPlaying && socketRef.current) {
+          socketRef.current.emit('host-resume', { roomId: id });
+        }
       };
     }
 
@@ -1375,19 +1395,8 @@ export default function RoomView() {
     });
   };
 
-  // 暂停改为房主直接操作，无需投票；结束放映仍走观众投票
-  const pausePlayback = () => {
-    if (!socketRef.current) return;
-    if (usingRemoteUrl) remoteVideoRef.current?.pause(); else localVideoRef.current?.pause();
-    socketRef.current.emit('host-pause', { roomId: id });
-  };
-
-  const resumePlayback = () => {
-    setIsPlaying(true);
-    if (usingRemoteUrl) remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
-    else localVideoRef.current?.play();
-    socketRef.current?.emit('host-resume', { roomId: id });
-  };
+  // 暂停/继续已改为房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
+  // 结束放映仍走观众投票。
 
   // 结束放映（之后才能解散房间）
   const stopPlayback = () => {
@@ -1816,15 +1825,7 @@ export default function RoomView() {
                   </button>
                 ) : (
                   <>
-                    <button
-                      onClick={pausePlayback}
-                      className="btn btn-warning"
-                    >
-                      ⏸️ 暂停放映
-                    </button>
-                    <button onClick={resumePlayback} className="btn btn-success" disabled={pendingPlaybackAction !== null}>
-                      ▶️ 继续
-                    </button>
+                    {/* 暂停/继续改用视频原生控制条，此处仅保留结束放映与本地静音 */}
                     <button
                       onClick={stopPlayback}
                       className="btn btn-secondary"
