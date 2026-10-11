@@ -260,6 +260,19 @@ export default function RoomView() {
       const localEl = localVideoRef.current;
       if (localEl && hostSessionRef.current) {
         hostSessionRef.current.video = localEl;
+        // 关键修复：先解绑事件，再移动 DOM。
+        // appendChild 把 video 移出 React 容器会触发一次「假 pause」。若 onpause 仍绑定，
+        // 此时 isPlayingRef 还是 true、suppressPauseRef 又是旧值，会误广播 host-pause 给观众，
+        // 服务端把 playing 置 false → 观众暂停、新加入观众黑屏（网络直链模式尤为明显）。
+        // 因此先解绑事件（假 pause 无处理器可触发），再移动，彻底阻断误广播。
+        localEl.onloadedmetadata = null;
+        localEl.onended = null;
+        localEl.onerror = null;
+        localEl.ontimeupdate = null;
+        localEl.onpause = null;
+        localEl.onplay = null;
+        // 设置抑制窗口兜底（双保险），即使有其他路径触发 pause 也不会误广播
+        suppressPauseRef.current = Date.now();
         // 注意：绝不能 pause()！房主切页后视频仍需继续播放，captureStream 的
         // 推流轨道才会持续产出帧，观众画面才不会冻结。只做隐藏，不暂停。
         localEl.style.position = 'fixed';
@@ -270,13 +283,6 @@ export default function RoomView() {
         if (localEl.parentNode !== document.body) {
           document.body.appendChild(localEl);
         }
-        // 解绑组件级事件：房主切页后这些 UI 事件不再需要，回到房间时重新绑定
-        localEl.onloadedmetadata = null;
-        localEl.onended = null;
-        localEl.onerror = null;
-        localEl.ontimeupdate = null;
-        localEl.onpause = null;
-        localEl.onplay = null;
         // 重置挂载信号，房主回到房间时由 setupWebSocket 重新置 true 触发重挂载
         setHostSessionReady(false);
       }
@@ -825,13 +831,16 @@ export default function RoomView() {
       }
     };
 
-    // 主动发起一次协商（发送 offer）。既用于 onnegotiationneeded（加轨触发），
-    // 也用于「观众未加入语音、无本地轨」的场景——否则观众永远不发 offer，
-    // 房主侧收不到 offer 就不会创建 PC，房主的视频流永远推不过去 → 观众黑屏。
+    // 主动发起一次协商（发送 offer）。用于 onnegotiationneeded（加轨触发）。
+    // 关键：setLocalDescription 前必须确保 signalingState 是 stable，否则会与
+    // 正在处理的对方 offer 冲突（InvalidStateError），破坏协商导致黑屏。
     const makeOffer = async () => {
       try {
         // 防抖：若已有 offer 在途，避免并发 setLocalDescription 导致 InvalidStateError
         if (makingOfferRef.current.get(targetSocketId)) return;
+        // 若正在处理对方的 offer（have-remote-offer），此时 setLocalDescription 会失败，
+        // 但 offer 处理器会回 answer，无需在此发 offer，直接跳过。
+        if (pc.signalingState !== 'stable') return;
         makingOfferRef.current.set(targetSocketId, true);
         await pc.setLocalDescription();
         socketRef.current?.emit('offer', {
@@ -864,9 +873,12 @@ export default function RoomView() {
     // 关键修复：观众加入时若没有任何本地轨（未加入语音），addLocalTracksTo 不会
     // 触发 onnegotiationneeded，观众就永远不发 offer，房主侧因此不会创建 PC，
     // 本地文件模式下房主的视频流无法送达观众 → 黑屏。
-    // 这里兜底：PC 没有任何 sender 时，主动发一次 offer 建立连接。
+    // 这里兜底：PC 没有任何 sender 时，延迟到当前同步栈清空后再主动发 offer。
+    // 用 setTimeout 而非同步调用：房主处理对方 offer 时，同步调用会抢占
+    // setLocalDescription，导致 offer 处理器的 setRemoteDescription 抛 InvalidStateError。
+    // 延迟后 offer 处理器已先完成 setRemoteDescription + answer，兜底再发 offer 不会冲突。
     if (pc.getSenders().length === 0) {
-      void makeOffer();
+      setTimeout(() => { void makeOffer(); }, 0);
     }
 
     return pc;
@@ -978,11 +990,22 @@ export default function RoomView() {
     }
 
     if (track.kind === 'video') {
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = stream;
+      // 关键修复：ontrack 可能在 React 渲染 <video>（remoteVideoRef 赋值）之前触发，
+      // 此时 remoteVideoRef.current 为 null，直接跳过会导致视频轨永远没设置到元素上 → 黑屏。
+      // 这里改为：元素未就绪时延迟重试，直到挂载后设置 srcObject。
+      const applyVideo = () => {
+        const el = remoteVideoRef.current;
+        if (!el) {
+          setTimeout(applyVideo, 100);
+          return;
+        }
+        if (el.srcObject !== stream) {
+          el.srcObject = stream;
+        }
         // 观众完全被动：播放失败不做任何兜底（不弹窗/不静音/不加按钮），浏览器自动播放策略由观众本地决定。
-        remoteVideoRef.current.play().catch(() => {});
-      }
+        el.play().catch(() => {});
+      };
+      applyVideo();
     } else if (track.kind === 'audio') {
       let audioEl = audioElsRef.current.get(socketId);
       if (!audioEl) {
