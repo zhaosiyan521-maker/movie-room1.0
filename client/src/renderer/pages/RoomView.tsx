@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, useAuthStore } from '../store/authStore';
 import { getAbsoluteApiBase, toProxiedUrl } from '../store/apiBase';
@@ -208,7 +208,11 @@ export default function RoomView() {
     }
   }, []);
 
-  useEffect(() => {
+  // 关键：用 useLayoutEffect 而非 useEffect 做卸载清理。
+  // React 卸载组件时先移除 DOM（房主的 <video> 会被 removeChild，进入 detached 状态），
+  // 后异步执行 useEffect cleanup；detached 会让 captureStream 推流轨道停止产帧、观众画面冻结。
+  // useLayoutEffect 的 cleanup 在 DOM 移除之前同步执行，能先把视频移回 body，避免 detached。
+  useLayoutEffect(() => {
     fetchRoom();
 
     return () => {
@@ -424,6 +428,16 @@ export default function RoomView() {
       socket.removeAllListeners();
       // 触发重渲染，让挂载 effect 把 session.video 挂进展示容器（否则房主看不到画面）
       setHostSessionReady(true);
+      // 关键修复：socket 是模块级单例，房主切页后再回来时它已经处于 connected 状态，
+      // 不会再触发 'connect' 事件，导致 join-room 永不重新 emit、服务端不下发 room-joined，
+      // 房主回来后 isPlaying 停在 false，UI 显示「请选择视频文件并开始放映」——看起来就像视频自动结束了。
+      // 因此：若 socket 已连接，直接补发 join-room，让服务端重新下发播放状态（playbackState）。
+      if (socket.connected) {
+        socket.emit('join-room', id);
+        if (hostSessionRef.current) {
+          hostSessionRef.current.joinedRoom = true;
+        }
+      }
     } else {
       socket = io(`${getAbsoluteApiBase()}`, {
         auth: { token },
@@ -513,13 +527,31 @@ export default function RoomView() {
         }
       }
 
-      // 新观众加入：若房间正在放映，立即续播并追到房主当前进度
+      // 若房间正在放映，立即续播并追到房主当前进度。
+      // 关键：区分「房主自己回来」与「观众加入」——
+      //   观众：用 remoteVideoRef 加载/续播；
+      //   房主：恢复本地视频（session.video）的播放状态，而不是去操作 remoteVideoRef。
       if (data.playbackState?.playing) {
         const ps = data.playbackState;
         setIsPlaying(true);
         setResolution(ps.resolution || null);
-        if (ps.videoUrl) {
-          // 网络视频模式：加载直链，并在媒体可播放后追进度
+
+        if (isHostRef.current) {
+          // 房主切页回来：session.video 一直存活（挂在 body 隐藏），只需恢复播放态；
+          // 若视频因切页时被 React 移除 DOM 而暂停，这里主动续播。
+          const lv = hostSessionRef.current?.video;
+          if (lv) {
+            if (ps.videoUrl) {
+              // 网络直链模式：确保片源仍在（切页未清 HLS/片源，理论上无需重载）
+              setRemotePlayUrl(ps.videoUrl);
+            } else {
+              setRemotePlayUrl('');
+            }
+            // 恢复播放：视频元素可能已因 detached 被浏览器暂停，重新 play
+            lv.play().catch(() => setNeedClickPlay(true));
+          }
+        } else if (ps.videoUrl) {
+          // 观众 + 网络视频模式：加载直链，并在媒体可播放后追进度
           setRemotePlayUrl(ps.videoUrl);
           loadRemoteVideo(ps.videoUrl, !!ps.isHls);
           // 等待媒体就绪后跳转到房主当前进度
@@ -538,7 +570,7 @@ export default function RoomView() {
           };
           setTimeout(seekToProgress, 300);
         } else {
-          // 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
+          // 观众 + 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
           setRemotePlayUrl('');
           destroyHls();
           remoteVideoRef.current?.play().catch(() => setNeedClickPlay(true));
