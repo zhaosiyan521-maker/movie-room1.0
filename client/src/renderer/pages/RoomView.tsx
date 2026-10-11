@@ -174,6 +174,9 @@ export default function RoomView() {
 
   // 观众端只读进度显示（当前播放时间 / 总时长）
   const [progress, setProgress] = useState<{ current: number; duration: number }>({ current: 0, duration: 0 });
+  // 观众端进度条显隐：鼠标移动/点击时显示，3 秒无操作自动隐藏
+  const [showViewerBar, setShowViewerBar] = useState(false);
+  const viewerBarTimerRef = useRef<number | null>(null);
 
   // 网络视频播放模式（房主粘贴直链，观众各自加载，不经过房主带宽）
   const [usingRemoteUrl, setUsingRemoteUrl] = useState(false);
@@ -207,6 +210,8 @@ export default function RoomView() {
   const lastSyncProgressRef = useRef(0);
   // 观众端 seek 冷却：记录上次强制 seek 时间戳，避免 HLS 缓冲期间被反复 seek 打断
   const lastViewerSeekRef = useRef(0);
+  // 观众加入房间时刻：加入后前 5 秒内不参与周期纠偏，避免初始加载期间纠偏 seek 与缓冲打架
+  const viewerJoinedAtRef = useRef(0);
   // 房主推流会话（模块级单例）：房主切页时推流资源跨页面存活
   const hostSessionRef = useRef<HostSession | null>(null);
 
@@ -615,24 +620,13 @@ export default function RoomView() {
             }
           }
         } else if (ps.videoUrl) {
-          // 观众 + 网络视频模式：加载直链，并在媒体可播放后追进度
+          // 观众 + 网络视频模式：加载直链，并把房主当前进度直接传入，
+          // 让 HLS 从目标位置开始拉流（startPosition），跳过「从 0 缓冲再 seek」的双重缓冲。
           setRemotePlayUrl(ps.videoUrl);
-          loadRemoteVideo(ps.videoUrl, !!ps.isHls);
-          // 等待媒体就绪后跳转到房主当前进度
-          const seekToProgress = () => {
-            const el = remoteVideoRef.current;
-            if (!el) return;
-            const target = typeof ps.currentTime === 'number' ? ps.currentTime : 0;
-            const applySeek = () => {
-              if (el.readyState >= 1 && target > 0) {
-                try { el.currentTime = target; } catch {}
-              }
-              el.play().catch(() => {});
-            };
-            if (el.readyState >= 1) applySeek();
-            else el.addEventListener('loadedmetadata', applySeek, { once: true });
-          };
-          setTimeout(seekToProgress, 300);
+          const startAt = typeof ps.currentTime === 'number' ? ps.currentTime : 0;
+          // 记录加入时刻：前 5 秒内不参与周期纠偏，避免初始加载期间纠偏 seek 与缓冲打架
+          viewerJoinedAtRef.current = Date.now();
+          loadRemoteVideo(ps.videoUrl, !!ps.isHls, startAt);
         } else {
           // 观众 + 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
           setRemotePlayUrl('');
@@ -765,6 +759,8 @@ export default function RoomView() {
       const el = remoteVideoRef.current;
       const t = typeof data?.currentTime === 'number' ? data.currentTime : 0;
       if (!el || !Number.isFinite(t)) return;
+      // 加入后前 5 秒内不纠偏，避免初始加载/缓冲期间被 seek 打断
+      if (Date.now() - viewerJoinedAtRef.current < 5000) return;
       // 冷却期内不重复 seek
       if (Date.now() - lastViewerSeekRef.current < 3000) return;
       // 正在缓冲 / seek 中，跳过本轮
@@ -1420,7 +1416,11 @@ export default function RoomView() {
    * 否则在 attachMedia 之后立即 play() 会因媒体尚未就绪而静默失败。
    */
   const attachHls = (el: HTMLVideoElement, url: string, seekTo?: number) => {
-    const hls = new Hls();
+    // 关键优化：通过 config.startPosition 让 hls.js 加载时直接从目标位置定位、只拉该位置
+    // 附近的分片，跳过「从 0 缓冲一遍再 seek 到目标」的双重缓冲，观众中途进入可秒开。
+    const hls = new Hls(
+      typeof seekTo === 'number' && seekTo > 0 ? { startPosition: seekTo } : {}
+    );
     hlsRef.current = hls;
     // 房主：HLS 实例持久化到 session.hls，房主切页后 hlsRef（组件级）随组件卸载丢失，
     // 但 session.hls 仍持有实例继续拉流播放；房主回来时 loadLocalUrl 会复用同一实例，
@@ -1432,7 +1432,7 @@ export default function RoomView() {
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setVideoError('');
-      // 房主切页回来重载直链时，追回原进度后再播放，避免从 0 重新播
+      // 兜底：startPosition 已定位，若仍未到位则显式 seek 一次（房主切页回来重载时追进度）
       if (typeof seekTo === 'number' && seekTo > 0) {
         try { el.currentTime = seekTo; } catch {}
       }
@@ -1463,29 +1463,45 @@ export default function RoomView() {
     });
   };
 
-  const loadRemoteVideo = (url: string, isHls: boolean) => {
+  const loadRemoteVideo = (url: string, isHls: boolean, seekTo?: number) => {
     const el = remoteVideoRef.current;
     // 关键修复：room-joined 回调可能在 React 渲染 <video>（remoteVideoRef 赋值）之前
     // 就执行，此时 el 为 null，直接 return 会导致观众中途加入时画面永远不加载 → 黑屏。
     // 这里改为延迟重试，直到 video 元素挂载就绪。
     if (!el) {
-      setTimeout(() => loadRemoteVideo(url, isHls), 100);
+      setTimeout(() => loadRemoteVideo(url, isHls, seekTo), 100);
       return;
     }
     setVideoError('');
     destroyHls();
-    const target = toProxiedUrl(url);
     // 增强 HLS 识别：显式标记 或 启发式判断
     const useHls = isHls || looksLikeHls(url);
+    // 带宽优化：非 HLS 直链由 <video src> 直连源站播放（不走代理）；HLS 走代理（跨域限制）。
+    const target = useHls ? toProxiedUrl(url) : url;
+    const applySeekAndPlay = (e: HTMLVideoElement) => {
+      if (typeof seekTo === 'number' && seekTo > 0) {
+        if (e.readyState >= 1) {
+          try { e.currentTime = seekTo; } catch {}
+          e.play().catch(() => {});
+        } else {
+          e.addEventListener('loadedmetadata', () => {
+            try { e.currentTime = seekTo; } catch {}
+            e.play().catch(() => {});
+          }, { once: true });
+        }
+      } else {
+        e.play().catch(() => {});
+      }
+    };
     if (useHls && Hls.isSupported()) {
-      attachHls(el, target);
+      attachHls(el, target, seekTo);
     } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
       // 原生 HLS 支持（Safari）：直接交给 <video>
       el.src = target;
-      el.play().catch(() => {});
+      applySeekAndPlay(el);
     } else {
       el.src = target;
-      el.play().catch(() => {});
+      applySeekAndPlay(el);
     }
   };
 
@@ -1494,7 +1510,10 @@ export default function RoomView() {
     const el = hostSessionRef.current?.video || localVideoRef.current;
     if (!el) return;
     setVideoError('');
-    const target = toProxiedUrl(url);
+    const useHls = isHls || looksLikeHls(url);
+    // 带宽优化：非 HLS 直链（mp4/webm 等）由 <video src> 直连源站播放，不经过服务器代理，
+    // 充分利用 CDN 带宽、降低服务器中转压力；HLS 必须走代理（hls.js 用 XHR 拉分片受跨域限制）。
+    const target = useHls ? toProxiedUrl(url) : url;
 
     // 房主切页回来：若 session.hls 仍存活、attach 在同一个 video 上、且加载的还是同一
     // 条直链（url 一致），说明切页期间 HLS 一直在后台播放、进度持续推进。此时直接复用，
@@ -1510,7 +1529,6 @@ export default function RoomView() {
     }
 
     destroyHls();
-    const useHls = isHls || looksLikeHls(url);
     // 房主切页回来重载直链时，加载完成后追回原进度（否则会从 0 重新播放，进度与观众脱节）
     const resumeAt = (e: HTMLVideoElement) => {
       if (typeof seekTo === 'number' && seekTo > 0) {
@@ -1675,6 +1693,14 @@ export default function RoomView() {
     } catch (err) {
       console.error('退出全屏失败:', err);
     }
+  };
+
+  // 观众端进度条：显示并重置 3 秒自动隐藏定时器
+  const pokeViewerBar = () => {
+    if (isHost) return;
+    setShowViewerBar(true);
+    if (viewerBarTimerRef.current) clearTimeout(viewerBarTimerRef.current);
+    viewerBarTimerRef.current = window.setTimeout(() => setShowViewerBar(false), 3000);
   };
 
   const toggleFullscreen = () => {
@@ -1846,7 +1872,12 @@ export default function RoomView() {
 
           {/* 中间：视频区域 */}
           <div className="video-area">
-            <div className="video-container" ref={videoContainerRef}>
+            <div
+              className="video-container"
+              ref={videoContainerRef}
+              onMouseMove={pokeViewerBar}
+              onClick={pokeViewerBar}
+            >
               {isHost ? (
                 // 房主本地视频：使用模块级单例元素（session.video），跨页面切换存活。
                 // 挂载由 useEffect（见 hostVideoMountEffect）在 session 就绪后执行，
@@ -1889,9 +1920,10 @@ export default function RoomView() {
                 <div className="res-badge">{resolution}</div>
               )}
 
-              {/* 观众端只读进度条：原生 <progress> + 时间文本，不可拖动 */}
+              {/* 观众端只读进度条：原生 <progress> + 时间文本，不可拖动。
+                  鼠标移动/点击时显示，3 秒无操作自动淡出，避免常驻影响观感。 */}
               {!isHost && isPlaying && (
-                <div className="viewer-progress">
+                <div className={`viewer-progress ${showViewerBar ? 'visible' : ''}`}>
                   <progress
                     className="viewer-progress-bar"
                     max={progress.duration > 0 ? progress.duration : 1}

@@ -485,7 +485,7 @@
   pointer-events: none;
 }
 
-/* 观众端只读进度条（底部，不可拖动） */
+/* 观众端只读进度条（底部，不可拖动；默认透明，鼠标移动/点击时淡入） */
 .viewer-progress {
   position: absolute;
   left: 0;
@@ -498,6 +498,12 @@
   padding: 8px 12px;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0));
   pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.viewer-progress.visible {
+  opacity: 1;
 }
 
 .viewer-progress-bar {
