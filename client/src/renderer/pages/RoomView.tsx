@@ -240,6 +240,12 @@ export default function RoomView() {
       // 房主切页：保留 socket 连接（不 disconnect），但清空组件内引用；
       // 连接仍由 hostStreaming 单例的 session.socket 持有，观众画面/服务端状态不受影响。
       if (!hasHostSession || shouldDisposeHost) {
+        // 观众（或房主主动解散）离开：先主动 emit leave-room 让服务端同步移除，
+        // 再 disconnect。否则只 disconnect 时服务端要等断开事件异步触发才清理，
+        // 观众切房间后会短暂残留在旧房间（旧房间仍显示其在线）。
+        if (id) {
+          try { socketRef.current.emit('leave-room', id); } catch {}
+        }
         socketRef.current.disconnect();
       }
       socketRef.current = null;
@@ -882,7 +888,10 @@ export default function RoomView() {
     //      改用 hostSessionRef.current?.video（模块级单例，创建即可用），
     //      否则房主的视频轨道从未加到 PC，导致「本地文件观众无法观看」。
     const hostVideo = hostSessionRef.current?.video;
-    if (isHostRef.current && !usingRemoteUrlRef.current && hostVideo) {
+    // 仅当房主正在放映时才推视频/音频轨。房主未播放时 captureStream 得到的是「未激活」
+    // 轨道（视频未产帧），加入 PC 后观众看到的会是黑屏，且房主点播放时旧轨不会复活。
+    // 因此：房主播放中观众加入 → 立即推流；房主未播放观众加入 → 不加轨，等 startPlayback 补推。
+    if (isHostRef.current && !usingRemoteUrlRef.current && hostVideo && isPlayingRef.current) {
       const stream = getVideoCaptureStream();
       if (stream) {
         // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
@@ -1481,21 +1490,31 @@ export default function RoomView() {
     const stream = getVideoCaptureStream();
     if (stream) {
       peersRef.current.forEach(pc => {
-        const existingKinds = pc.getSenders().map(s => s.track?.kind);
-        // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
-        stream.getVideoTracks().forEach(track => {
-          if (!existingKinds.includes('video')) {
-            try { pc.addTrack(track, stream); } catch {}
+        // 关键修复：先移除旧的「视频」sender，再重新 addTrack。
+        // 观众加入时（房主未播放）addLocalTracksTo 已把「未激活」的 captureStream 视频轨加进 PC，
+        // 该未激活轨不会在房主播放后复活 → 观众黑屏直到切页重连。因此必须 removeTrack 旧视频轨，
+        // 再 addTrack 播放中的新视频轨，触发 onnegotiationneeded 重新协商。
+        // 注意：只移除视频 sender；音频 sender 含麦克风轨（语音聊天），不能一并移除。
+        pc.getSenders().forEach(sender => {
+          if (sender.track && sender.track.kind === 'video') {
+            try { pc.removeTrack(sender); } catch {}
           }
         });
+        stream.getVideoTracks().forEach(track => {
+          try { pc.addTrack(track, stream); } catch {}
+        });
+        // 音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）。
+        // 仅当该音轨尚未加入此 PC 时才补充（避免重复 addTrack 同一 track 抛错）。
         const audioTrack = hostCaptureAudioTrackRef.current;
         if (audioTrack) {
-          if (!existingKinds.includes('audio')) {
+          const alreadyAdded = pc.getSenders().some(s => s.track === audioTrack);
+          if (!alreadyAdded) {
             try { pc.addTrack(audioTrack, stream); } catch {}
           }
         } else {
           stream.getAudioTracks().forEach(track => {
-            if (!existingKinds.includes('audio')) {
+            const alreadyAdded = pc.getSenders().some(s => s.track === track);
+            if (!alreadyAdded) {
               try { pc.addTrack(track, stream); } catch {}
             }
           });
