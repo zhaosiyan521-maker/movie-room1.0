@@ -119,6 +119,9 @@ export default function RoomView() {
   // 这里用一个回调 ref 把它挂载进组件展示区，切页时再移回 document.body 隐藏。
   const hostVideoMountRef = useRef<HTMLDivElement | null>(null);
   const [isHost, setIsHost] = useState(false);
+  // 房主推流会话是否已就绪（session 在 setupWebSocket 里创建，晚于首次渲染；
+  // 用它触发一次重渲染，让挂载 effect 把 session.video 挂进展示容器）
+  const [hostSessionReady, setHostSessionReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
@@ -256,6 +259,8 @@ export default function RoomView() {
         localEl.onended = null;
         localEl.onerror = null;
         localEl.ontimeupdate = null;
+        // 重置挂载信号，房主回到房间时由 setupWebSocket 重新置 true 触发重挂载
+        setHostSessionReady(false);
       }
     }
     audioElsRef.current.forEach(el => {
@@ -360,6 +365,28 @@ export default function RoomView() {
 
   const handleJoin = () => doJoin(passwordInput);
 
+  // 房主本地视频挂载：session.video 是模块级单例（切页后继续存活），
+  // 当房主进入房间且 session 就绪时，把它从 body 移回组件展示容器，恢复可见。
+  // 必须在 session 创建（setupWebSocket）之后执行，故依赖 hostSessionReady 而非回调 ref。
+  useEffect(() => {
+    if (!isHost || !hostSessionReady) return;
+    const container = hostVideoMountRef.current;
+    const session = hostSessionRef.current;
+    const v = session?.video;
+    if (!container || !v) return;
+    if (v.parentNode !== container) {
+      v.style.position = '';
+      v.style.left = '';
+      v.style.top = '';
+      v.style.width = '100%';
+      v.style.height = '100%';
+      v.style.opacity = '';
+      v.style.pointerEvents = '';
+      container.appendChild(v);
+    }
+    localVideoRef.current = v;
+  }, [isHost, hostSessionReady]);
+
   // ===== WebSocket =====
 
   const setupWebSocket = () => {
@@ -378,6 +405,8 @@ export default function RoomView() {
       socket = session.socket;
       // 房主回到房间（或首次进入）时，清掉旧组件残留的监听器，避免叠加
       socket.removeAllListeners();
+      // 触发重渲染，让挂载 effect 把 session.video 挂进展示容器（否则房主看不到画面）
+      setHostSessionReady(true);
     } else {
       socket = io(`${getAbsoluteApiBase()}`, {
         auth: { token },
@@ -1582,28 +1611,10 @@ export default function RoomView() {
             <div className="video-container" ref={videoContainerRef}>
               {isHost ? (
                 // 房主本地视频：使用模块级单例元素（session.video），跨页面切换存活。
-                // 通过回调 ref 把单例元素挂载进组件展示区；切页时由 cleanupAll 移回 body 隐藏。
+                // 挂载由 useEffect（见 hostVideoMountEffect）在 session 就绪后执行，
+                // 因为 session 是在 doJoin -> setupWebSocket 里才创建的，晚于首次渲染。
                 <div
-                  ref={(el) => {
-                    hostVideoMountRef.current = el;
-                    if (!el) return;
-                    const session = hostSessionRef.current;
-                    const v = session?.video;
-                    if (v && v.parentNode !== el) {
-                      // 恢复可见并挂载进组件
-                      v.style.position = '';
-                      v.style.left = '';
-                      v.style.top = '';
-                      v.style.width = '100%';
-                      v.style.height = '100%';
-                      v.style.opacity = '';
-                      v.style.pointerEvents = '';
-                      el.appendChild(v);
-                      localVideoRef.current = v;
-                    } else if (v) {
-                      localVideoRef.current = v;
-                    }
-                  }}
+                  ref={hostVideoMountRef}
                   className="video-player"
                   style={{ width: '100%', height: '100%' }}
                 />
