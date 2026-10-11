@@ -119,6 +119,9 @@ export default function RoomView() {
   // 这里用一个回调 ref 把它挂载进组件展示区，切页时再移回 document.body 隐藏。
   const hostVideoMountRef = useRef<HTMLDivElement | null>(null);
   const [isHost, setIsHost] = useState(false);
+  // isHost 的同步镜像：setupWebSocket 在 doJoin（async，捕获旧闭包）里被调用时，
+  // isHost state 可能尚未更新，故用 ref 同步记录，确保房主分支判断准确。
+  const isHostRef = useRef(false);
   // 房主推流会话是否已就绪（session 在 setupWebSocket 里创建，晚于首次渲染；
   // 用它触发一次重渲染，让挂载 effect 把 session.video 挂进展示容器）
   const [hostSessionReady, setHostSessionReady] = useState(false);
@@ -333,7 +336,9 @@ export default function RoomView() {
 
       const me = useAuthStore.getState().user;
       if (me) {
-        setIsHost(r.hostId === me.id);
+        const hostFlag = r.hostId === me.id;
+        isHostRef.current = hostFlag;
+        setIsHost(hostFlag);
         const alreadyMember = r.members.some(m => m.user.id === me.id);
         if (alreadyMember) {
           doJoin();
@@ -348,7 +353,9 @@ export default function RoomView() {
 
   useEffect(() => {
     if (user && room && !joined) {
-      setIsHost(room.hostId === user.id);
+      const hostFlag = room.hostId === user.id;
+      isHostRef.current = hostFlag;
+      setIsHost(hostFlag);
       const alreadyMember = room.members.some(m => m.user.id === user.id);
       if (alreadyMember) {
         doJoin();
@@ -406,8 +413,10 @@ export default function RoomView() {
 
     // 房主：复用模块级持久 socket（跨页面切换存活），切换页面不断推流、服务端不判离开。
     // 观众：每次进入房间新建 socket（组件卸载即断开）。
+    // 用 isHostRef（同步镜像）而非 isHost state：setupWebSocket 在 doJoin 的 await 之后被调用，
+    // 此时闭包里的 isHost 可能仍是旧值，导致房主被误判为观众。
     let socket: Socket;
-    if (isHost) {
+    if (isHostRef.current) {
       const session = getOrCreateHostSession(id!);
       hostSessionRef.current = session;
       socket = session.socket;
@@ -426,7 +435,7 @@ export default function RoomView() {
 
     // 房主：为持久 video 元素绑定组件级事件（进度同步 / 播完 / 错误 / 分辨率）。
     // 组件卸载（切页）时由 cleanupAll 解绑，回到房间时重新绑定，避免监听器叠加。
-    if (isHost && hostSessionRef.current) {
+    if (isHostRef.current && hostSessionRef.current) {
       const v = hostSessionRef.current.video as HTMLVideoElement;
       v.onloadedmetadata = () => setResolution(getResolution());
       v.onended = handleHostMovieEnded;
@@ -466,7 +475,7 @@ export default function RoomView() {
 
     socket.on('connect', () => {
       socket.emit('join-room', id);
-      if (isHost && hostSessionRef.current) {
+      if (isHostRef.current && hostSessionRef.current) {
         hostSessionRef.current.joinedRoom = true;
       }
       const me = useAuthStore.getState().user;
@@ -721,7 +730,7 @@ export default function RoomView() {
 
     socket.on('kicked', (data: any) => {
       alert(data.reason || '你已被踢出该房间');
-      if (isHost) { destroyHostSession(id!); hostSessionRef.current = null; }
+      if (isHostRef.current) { destroyHostSession(id!); hostSessionRef.current = null; }
       cleanupAll(true);
       navigate('/');
     });
@@ -729,7 +738,7 @@ export default function RoomView() {
     // 房间被彻底解散并清除（房主退出后自动解散），所有人退出到首页
     socket.on('room-dissolved', (data: any) => {
       alert(data.reason || '房间已解散并清除');
-      if (isHost) { destroyHostSession(id!); hostSessionRef.current = null; }
+      if (isHostRef.current) { destroyHostSession(id!); hostSessionRef.current = null; }
       cleanupAll(true);
       navigate('/');
     });
