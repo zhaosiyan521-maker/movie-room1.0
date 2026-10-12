@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --primary-color: #7c4dff;
   --primary-hover: #651fff;
   --primary-gradient: linear-gradient(135deg, #7c4dff 0%, #448aff 100%);
