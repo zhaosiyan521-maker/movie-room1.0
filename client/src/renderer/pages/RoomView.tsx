@@ -960,7 +960,7 @@ export default function RoomView() {
           next.delete(data.targetUserId);
           return next;
         });
-        appendSystemMessage(`🚨 「${data.targetName}」已被投票踢出房间（同意 ${data.agrees}/${data.total}），本场电影无法再次进入`);
+        appendSystemMessage(`🚨 「${data.targetName}」已被投票踢出房间（同意 ${data.agrees}/${data.total}），5 小时内无法再次进入`);
       }
     });
 
@@ -1562,7 +1562,7 @@ export default function RoomView() {
     if (!socketRef.current) return;
     const target = members.find(m => m.userId === targetUserId);
     if (!target) return;
-    if (!confirm(`确定要发起踢出「${target.nickname}」吗？\n房间内 1/3 的人同意后，TA 将被踢出且本场电影无法再次进入。`)) return;
+    if (!confirm(`确定要发起踢出「${target.nickname}」吗？\n房间内 1/3 的人同意后，TA 将被踢出且 5 小时内无法再次进入。`)) return;
     socketRef.current.emit('kick-request', { roomId: id, targetUserId });
     appendSystemMessage(`🗳️ 你已发起踢出「${target.nickname}」的投票，等待其他观众确认...`);
   };
@@ -2797,7 +2797,7 @@ export default function RoomView() {
                 <h3>🗳️ 踢出投票</h3>
                 <p>
                   房主发起投票：是否同意踢出「<strong>{kickVote.targetName}</strong>」？<br />
-                  房间内 1/3 的人同意（{kickVote.needed}/{kickVote.total} 人）即踢出，且本场电影无法再次进入。
+                  房间内 1/3 的人同意（{kickVote.needed}/{kickVote.total} 人）即踢出，且 5 小时内无法再次进入。
                 </p>
                 <div className="modal-actions">
                   <button className="btn btn-secondary" onClick={() => answerKickVote(false)}>

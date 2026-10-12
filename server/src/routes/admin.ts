@@ -73,7 +73,7 @@ adminRouter.get('/users', async (req: AuthRequest, res: Response) => {
         banReason: true,
         bannedAt: true,
         lastIp: true,
-        abruptLeaves: true,
+        maxRoomsPerIp: true,
         createdAt: true,
         _count: { select: { rooms: true } }
       },
@@ -140,6 +140,41 @@ adminRouter.get('/rooms', async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('Admin get rooms error:', error);
     res.status(500).json({ error: '获取房间列表失败' });
+  }
+});
+
+// 【需求2】管理员解散指定房间：彻底删除房间及其全部关联数据（成员、黑名单、图片文件），
+// 并向房间内所有在线用户广播 room-dissolved、请出房间。
+// 复用「房主主动解散」完全相同的 roomDissolve 服务，避免两套解散逻辑行为不一致。
+adminRouter.post('/rooms/:id/dissolve', async (req: AuthRequest, res: Response) => {
+  try {
+    const roomId = String(req.params.id || '');
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        host: { select: { nickname: true, username: true } }
+      }
+    });
+    if (!room) {
+      return res.status(404).json({ error: '房间不存在或已被解散' });
+    }
+
+    const hostName = room.host?.nickname || room.host?.username || '未知用户';
+    const ok = await dissolveRoom(roomId, {
+      io: getIO(),
+      reason: `管理员已解散房间「${room.name}」`
+    });
+    if (!ok) {
+      return res.status(404).json({ error: '房间不存在或已被解散' });
+    }
+
+    res.json({ message: `已解散房间「${room.name}」（房主：${hostName}）` });
+  } catch (error) {
+    console.error('Admin dissolve room error:', error);
+    res.status(500).json({ error: '解散房间失败' });
   }
 });
 
@@ -243,6 +278,52 @@ adminRouter.post('/users/:id/unban', async (req: AuthRequest, res: Response) => 
   } catch (error) {
     console.error('Admin unban user error:', error);
     res.status(500).json({ error: '解除封禁失败' });
+  }
+});
+
+// 【需求3】调整某用户「每个 IP 同时可开设的房间数」（0–20）。
+// 取值 0 表示禁止该用户开设房间 —— 但**不影响其加入他人房间**，这一条不可混为一谈。
+adminRouter.post('/users/:id/max-rooms', async (req: AuthRequest, res: Response) => {
+  try {
+    const raw = req.body?.value;
+    // 三层校验缺一不可，后端不能依赖前端已校验过：
+    //  ① 空值：Number('') === 0、Number(null) === 0，若不拦，一次缺参请求就会把
+    //     用户配额静默改成「禁止开房」。
+    //  ② 非数值类型：Number(false) === 0、Number(true) === 1，布尔会被静默当成数字通过；
+    //     对象/数组同理（Number([]) === 0）。
+    //  ③ 越界：宽松比较下 'abc' < 0 与 'abc' > 20 同时为 false，会绕过范围校验。
+    if (
+      raw === null || raw === undefined ||
+      typeof raw === 'boolean' || typeof raw === 'object' ||
+      String(raw).trim() === ''
+    ) {
+      return res.status(400).json({ error: '开设数量必须是 0 到 20 之间的整数' });
+    }
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0 || value > 20) {
+      return res.status(400).json({ error: '开设数量必须是 0 到 20 之间的整数' });
+    }
+
+    const target = await prisma.user.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, username: true, nickname: true, maxRoomsPerIp: true }
+    });
+    if (!target) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    await prisma.user.update({
+      where: { id: target.id },
+      data: { maxRoomsPerIp: value }
+    });
+
+    const name = target.nickname || target.username;
+    res.json({
+      message: `已将「${name}」的开设数量从 ${target.maxRoomsPerIp} 改为 ${value}${value === 0 ? '（禁止开房，但不影响加入他人房间）' : ''}`
+    });
+  } catch (error) {
+    console.error('Admin set max rooms error:', error);
+    res.status(500).json({ error: '设置开设数量失败' });
   }
 });
 

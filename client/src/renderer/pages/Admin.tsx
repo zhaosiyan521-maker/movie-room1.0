@@ -14,7 +14,7 @@ interface AdminUser {
   banReason?: string | null;
   bannedAt?: string | null;
   lastIp?: string | null;
-  abruptLeaves: number;
+  maxRoomsPerIp: number;
   createdAt: string;
   _count?: { rooms: number };
 }
@@ -140,6 +140,46 @@ export default function Admin() {
     }
   };
 
+  // 【需求3】调整某用户「每个 IP 同时可开设的房间数」（0–20）。
+  // 取 0 即禁止该用户开房，但**不影响其加入他人房间**。
+  const changeMaxRooms = async (user: AdminUser) => {
+    const input = prompt(
+      `请输入「${user.nickname || user.username}」每个 IP 可同时开设的房间数（0 – 20）：\n\n` +
+      `0 = 禁止开设房间（仍可正常加入他人的房间）`,
+      String(user.maxRoomsPerIp)
+    );
+    if (input === null) return;
+    const trimmed = input.trim();
+    const n = Number(trimmed);
+    if (!trimmed || !Number.isInteger(n) || n < 0 || n > 20) {
+      setMessage({ type: 'error', text: '开设数量必须是 0 到 20 之间的整数' });
+      return;
+    }
+    try {
+      const { data } = await api.post(`/admin/users/${user.id}/max-rooms`, { value: n });
+      setMessage({ type: 'success', text: data.message || `已将该用户的开设数量设为 ${n}` });
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '设置开设数量失败' });
+    }
+  };
+
+  // 【需求2】解散房间：彻底删除房间及其全部成员记录，房间内在线用户会被立即请出
+  const dissolveRoom = async (room: AdminRoom) => {
+    if (!confirm(
+      `⚠️ 确定解散房间「${room.name}」吗？\n\n` +
+      `房间及其全部成员记录将被彻底删除，房间内的用户会被立即请出。\n` +
+      `此操作不可恢复。`
+    )) return;
+    try {
+      const { data } = await api.post(`/admin/rooms/${room.id}/dissolve`);
+      setMessage({ type: 'success', text: data.message || `已解散房间「${room.name}」` });
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '解散房间失败' });
+    }
+  };
+
   const unbanIp = async (ip: BannedIp) => {
     if (!confirm(`确定解除 IP ${ip.ip} 的封禁吗？`)) return;
     try {
@@ -200,10 +240,21 @@ export default function Admin() {
               const images = parseRoomImages(room.images);
               const cover = images[0];
               return (
-                <button
+                // 【需求2】原本整张卡片就是一个 <button>，若直接在内部再放「解散」按钮，
+                // 会构成 HTML 非法的按钮嵌套，且点击解散时会连带触发进房跳转。
+                // 故外层降级为 div 并保留键盘可达性，解散按钮用 stopPropagation 阻断冒泡。
+                <div
                   key={room.id}
                   className="admin-room-item"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => navigate(`/room/${room.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      navigate(`/room/${room.id}`);
+                    }
+                  }}
                   title="点击进入房间（管理员无视密码）"
                 >
                   {cover ? (
@@ -229,7 +280,14 @@ export default function Admin() {
                     <span className="admin-room-sub">👥 {room._count?.members || 0}/{room.maxViewers}</span>
                     <span className="admin-room-sub">{new Date(room.updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
                   </span>
-                </button>
+                  <button
+                    className="btn btn-danger btn-sm admin-room-dissolve"
+                    onClick={(e) => { e.stopPropagation(); dissolveRoom(room); }}
+                    title="解散该房间：房间及成员记录将被彻底删除，房间内用户会被立即请出"
+                  >
+                    🗑️ 解散
+                  </button>
+                </div>
               );
             })
           )}
@@ -242,7 +300,7 @@ export default function Admin() {
                 <th>用户</th>
                 <th>邮箱</th>
                 <th>最后 IP</th>
-                <th>中断次数</th>
+                <th>开设数量</th>
                 <th>房间数</th>
                 <th>状态</th>
                 <th>操作</th>
@@ -268,9 +326,14 @@ export default function Admin() {
                   <td className="cell-muted">{u.email}</td>
                   <td className="cell-muted">{u.lastIp || '-'}</td>
                   <td>
-                    <span className={u.abruptLeaves >= 2 ? 'warn-text' : ''}>
-                      {u.abruptLeaves} 次
-                    </span>
+                    <div className="quota-cell">
+                      <span className={u.maxRoomsPerIp === 0 ? 'warn-text' : ''} title={u.maxRoomsPerIp === 0 ? '禁止开设房间（仍可加入他人房间）' : '每个 IP 可同时开设的房间数'}>
+                        {u.maxRoomsPerIp}
+                      </span>
+                      <button className="btn btn-secondary btn-sm" onClick={() => changeMaxRooms(u)}>
+                        更改
+                      </button>
+                    </div>
                   </td>
                   <td className="cell-muted">{u._count?.rooms || 0}</td>
                   <td>

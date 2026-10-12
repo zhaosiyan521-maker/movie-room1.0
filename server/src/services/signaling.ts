@@ -16,6 +16,16 @@ const lastSpeakingAt = new Map<string, number>();
 // 踢出投票：roomId -> targetUserId -> { agrees, declines, targetName }
 const kickVotes = new Map<string, Map<string, { agrees: Set<string>; declines: Set<string>; targetName: string }>>();
 
+// 【需求4】被投票踢出后禁止再次进入该房间的时长：5 小时。
+// room.ts 的「加入房间」校验复用同一常量，故导出，避免两处各写一份导致口径漂移。
+export const KICK_BAN_DURATION_MS = 5 * 60 * 60 * 1000;
+
+// 【需求4】房主每场电影的踢人配额：每场 2 次。
+// 在换片（host-start-play）时清零；暂停/继续属于同一场，不清零。
+const KICK_QUOTA_PER_MOVIE = 2;
+// roomId -> userId -> 本场电影已发起的踢人次数
+const kickQuotaUsed = new Map<string, Map<string, number>>();
+
 // 房间当前播放状态缓存：新观众加入时据此立即续播，避免「等待房主开始播放」。
 // roomId -> { playing, videoUrl?, isHls?, resolution?, currentTime, duration, updatedAt }
 interface RoomPlaybackState {
@@ -237,13 +247,22 @@ export function setupSocketHandlers(io: Server) {
           return;
         }
 
-        // 检查黑名单（被投票踢出的用户本场电影禁止进入）
+        // 【需求4】检查踢出记录： KICK_BAN_DURATION_MS（5 小时）内禁止再次进入。
+        // 这是独立时效，与房间是否换片、是否换过电影无关（跨电影依然有效）。
+        // 超过 5 小时的记录虽然仍留在库中，但视为已失效，放行进入。
         const ban = await prisma.roomBan.findUnique({
           where: { roomId_userId: { roomId: roomIdStr, userId: socket.userId! } }
         });
         if (ban) {
-          socket.emit('kicked', { roomId: roomIdStr, reason: '你已被投票踢出该房间，本场电影无法再次进入' });
-          return;
+          const elapsed = Date.now() - new Date(ban.createdAt).getTime();
+          if (elapsed < KICK_BAN_DURATION_MS) {
+            const leftMin = Math.ceil((KICK_BAN_DURATION_MS - elapsed) / 60000);
+            socket.emit('kicked', {
+              roomId: roomIdStr,
+              reason: `你已被投票踢出该房间，还需 ${leftMin} 分钟才能再次进入`
+            });
+            return;
+          }
         }
 
         // 离开之前的房间
@@ -378,6 +397,11 @@ export function setupSocketHandlers(io: Server) {
         currentTime: 0,
         duration: 0
       });
+
+      // 【需求4】换片 = 新的一场电影，房主的踢人配额在此清零。
+      // 注意只在 host-start-play（真正开始一部影片）时重置；
+      // playback-resume / playback-pause 属于同一场的暂停继续，不重置。
+      kickQuotaUsed.delete(room.id);
 
       socket.to(room.id).emit('playback-start', {
         hostId: socket.userId,
@@ -591,6 +615,36 @@ export function setupSocketHandlers(io: Server) {
           return;
         }
 
+        // 【需求4】目标不得是房主。房间归属于 hostId，房主一旦被踢出房间归属即悬空。
+        // 由于发起权限仅限房主、且上面已禁止踢自己，正常流程下本分支不会命中；
+        // 保留作为防御性校验，避免日后权限再次放宽时出现漏洞。
+        if (room.hostId === targetUserId) {
+          socket.emit('error', { message: '房主不可被踢出' });
+          return;
+        }
+
+        // 【需求4】同一目标已有进行中的投票时禁止重复发起。
+        // 旧实现是无条件 set()：重复发起会直接覆盖并清零已有表决记录，
+        // 等于任何人都能一键重置正在进行的表决。发起被拒不扣配额。
+        if (kickVotes.get(roomId)?.has(targetUserId)) {
+          socket.emit('error', { message: '该用户的踢出投票正在进行中，请勿重复发起' });
+          return;
+        }
+
+        // 【需求4】房主每场电影 2 次踢人配额，超出需等到换片才恢复
+        let quotaMap = kickQuotaUsed.get(roomId);
+        if (!quotaMap) {
+          quotaMap = new Map<string, number>();
+          kickQuotaUsed.set(roomId, quotaMap);
+        }
+        const used = quotaMap.get(socket.userId!) || 0;
+        if (used >= KICK_QUOTA_PER_MOVIE) {
+          socket.emit('error', {
+            message: `本场电影的踢人次数已用完（${KICK_QUOTA_PER_MOVIE}/${KICK_QUOTA_PER_MOVIE}），换片后自动恢复`
+          });
+          return;
+        }
+
         // 目标必须是房间成员，否则可对任意用户写入黑名单
         const targetMember = await prisma.roomMember.findUnique({
           where: { roomId_userId: { roomId, userId: targetUserId } }
@@ -615,6 +669,8 @@ export function setupSocketHandlers(io: Server) {
           declines: new Set(),
           targetName
         });
+        // 走到这里才算真正发起了投票，此时才扣配额（前面各种被拒的情形一律不扣）
+        quotaMap.set(socket.userId!, used + 1);
 
         const total = distinctUserCount(io, roomId);
         const needed = voteThreshold(total);
@@ -688,11 +744,14 @@ async function checkKickVotes(io: Server, roomId: string, targetUserId: string) 
     const targetName = vote.targetName;
     kickVotes.get(roomId)?.delete(targetUserId);
 
-    // 写入黑名单（本场电影禁止再进）
+    // 【需求4】写入 / 刷新踢出记录。禁入有效期 KICK_BAN_DURATION_MS（5 小时）。
+    // 关键：update 必须刷新 createdAt —— 旧实现的 update 是空的 {}，
+    // 同一用户第二次被踢时 createdAt 不更新，5 小时会从上一次被踢起算，
+    // 实际禁入时长远短于预期（甚至早已过期，等于完全没有惩罚）。
     await prisma.roomBan.upsert({
       where: { roomId_userId: { roomId, userId: targetUserId } },
       create: { roomId, userId: targetUserId, reason: '投票踢出' },
-      update: {}
+      update: { createdAt: new Date() }
     });
     await prisma.roomMember.deleteMany({
       where: { roomId, userId: targetUserId }
@@ -708,7 +767,7 @@ async function checkKickVotes(io: Server, roomId: string, targetUserId: string) 
     for (const sid of targetSockets) {
       const s = io.sockets.sockets.get(sid);
       if (s) {
-        s.emit('kicked', { roomId, reason: '你已被投票踢出该房间，本场电影无法再次进入' });
+        s.emit('kicked', { roomId, reason: '你已被投票踢出该房间，5 小时内无法再次进入' });
         await leaveRoom(s as AuthenticatedSocket, roomId, io);
       }
     }
@@ -803,6 +862,7 @@ export function purgeRoomSignalingState(roomId: string): void {
   }
   roomUsers.delete(roomId);
   kickVotes.delete(roomId);
+  kickQuotaUsed.delete(roomId);
   roomPlaybackStates.delete(roomId);
   for (const action of ['dissolve', 'abrupt'] as const) {
     const key = `${roomId}:${action}`;

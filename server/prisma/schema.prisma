@@ -35,6 +35,10 @@ model User {
   // JWT 令牌版本：改密/封禁时自增，使此前签发的 JWT 立即失效
   tokenVersion  Int       @default(0)
 
+  // 每 IP 地址允许同时开设的房间数上限（0 = 禁止开房，但不影响加入他人房间）。
+  // 管理员可在后台逐个用户调整，取值 0–20。
+  maxRoomsPerIp   Int       @default(1)
+
   rooms         Room[]   @relation("HostedRooms")
   memberships   RoomMember[]
   bans          RoomBan[]
@@ -48,6 +52,10 @@ model Room {
   images          String?         // 房间图片（JSON 数组，最多 5 张）
   hostId          String
   host            User      @relation("HostedRooms", fields: [hostId], references: [id])
+  // 创建房间那一刻房主的 IP，用于「每个 IP 每名用户同时可开设房间数」的限制。
+  // 历史房间（本字段上线前创建的）为 null，统计限额时只计非 null 的数据，
+  // 以免老房间挤占新配额。
+  hostIp          String?
 
   // 房间设置
   password        String?         // 密码保护（可选）

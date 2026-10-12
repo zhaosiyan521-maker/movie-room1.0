@@ -5,7 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../config/database';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { dissolveRoom } from '../services/roomDissolve';
-import { getIO } from '../services/signaling';
+import { getIO, KICK_BAN_DURATION_MS } from '../services/signaling';
 
 export const roomRouter = Router();
 
@@ -189,12 +189,37 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
       return res.status(400).json({ error: '房间描述不能超过 500 个字符' });
     }
 
-    // 每名用户最多同时拥有 5 个活跃房间（WAITING/PLAYING），各房间互不干扰
-    const activeRoomCount = await prisma.room.count({
-      where: { hostId: req.user!.id, status: { in: ['WAITING', 'PLAYING'] } }
+    // 【需求1】开设配额：每个「IP + 用户」最多同时拥有 N 个在建房间（WAITING/PLAYING）。
+    // N 取自 User.maxRoomsPerIp（管理员在后台按用户配置，默认 1；0 = 禁止开房）。
+    // 注意与「加入房间」无关 —— 配额为 0 只是不能自己开房，照样能进别人的房间。
+    //
+    // IP 取法与登录/注册保持一致：trust proxy 已关闭，直接读 socket 远端地址，
+    // 忽略 X-Forwarded-For（否则攻击者可伪造该头绕过配额）。
+    const hostIp = String(req.socket?.remoteAddress || req.ip || '').replace(/^::ffff:/, '');
+
+    const hostUser = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { maxRoomsPerIp: true }
     });
-    if (activeRoomCount >= 5) {
-      return res.status(400).json({ error: '每名用户最多同时创建 5 个房间，请先解散部分房间再创建' });
+    const maxRoomsPerIp = hostUser?.maxRoomsPerIp ?? 1;
+    if (maxRoomsPerIp <= 0) {
+      return res.status(403).json({ error: '你当前没有开设房间的权限（配额为 0）' });
+    }
+
+    // 统计口径：只计入 hostIp 非空的在建房间。本字段上线前创建的历史房间 hostIp 为 null，
+    // 若一并计入会白白挤占配额，让老用户建不了新房。
+    // 事务外先粗筛一次 —— 正常路径在这里返回，避免图片已落盘后才被拒、产生孤儿文件。
+    const activeRoomCount = await prisma.room.count({
+      where: {
+        hostId: req.user!.id,
+        hostIp: { not: null },
+        status: { in: ['WAITING', 'PLAYING'] }
+      }
+    });
+    if (activeRoomCount >= maxRoomsPerIp) {
+      return res.status(400).json({
+        error: `当前 IP 下你最多同时开设 ${maxRoomsPerIp} 个房间，请先解散已有房间再创建`
+      });
     }
 
     // 保存房间图片（最多 5 张）
@@ -206,6 +231,22 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
     // 创建出同名的活跃房间。事务内的读写处于同一序列化边界，可关闭该窗口。
     try {
       const room = await prisma.$transaction(async (tx) => {
+        // 【需求1】配额复核：上面的事务外检查与此处之间存在并发窗口，
+        // 连点两次建房会同时读到旧房间数、双双通过校验，实际建出超过配额的房间。
+        // 事务内的读写处于同一序列化边界，可关闭该窗口。
+        const quotaCount = await tx.room.count({
+          where: {
+            hostId: req.user!.id,
+            hostIp: { not: null },
+            status: { in: ['WAITING', 'PLAYING'] }
+          }
+        });
+        if (quotaCount >= maxRoomsPerIp) {
+          const quota: any = new Error('ROOM_QUOTA_EXCEEDED');
+          quota.appCode = 'ROOM_QUOTA_EXCEEDED';
+          throw quota;
+        }
+
         const duplicate = await tx.room.findFirst({
           where: {
             name: trimmedName,
@@ -227,6 +268,7 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
             password: (typeof password === 'string' && password) ? password : null,
             maxViewers: mv,
             hostId: req.user!.id,
+            hostIp: hostIp || null,
             status: 'WAITING'
           },
           select: {
@@ -252,6 +294,11 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
     } catch (err: any) {
       if (err?.appCode === 'ROOM_NAME_DUPLICATE' || err?.code === 'P2002') {
         return res.status(409).json({ error: '该房间名称已被使用，请换一个' });
+      }
+      if (err?.appCode === 'ROOM_QUOTA_EXCEEDED') {
+        return res.status(400).json({
+          error: `当前 IP 下你最多同时开设 ${maxRoomsPerIp} 个房间，请先解散已有房间再创建`
+        });
       }
       throw err;
     }
@@ -394,12 +441,17 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
       });
     }
 
-    // 检查是否被投票踢出（本场电影禁止再进）
+    // 【需求4】检查踢出记录：5 小时内不得再次进入该房间。
+    // 与 socket 层 join-room 的校验共用 KICK_BAN_DURATION_MS，保证两条入口口径一致。
+    // 超过 5 小时的记录视为已过期，放行进入。
     const ban = await prisma.roomBan.findUnique({
       where: { roomId_userId: { roomId, userId } }
     });
-    if (ban) {
-      return res.status(403).json({ error: '你已被投票踢出该房间，本场电影无法再次进入' });
+    if (ban && Date.now() - new Date(ban.createdAt).getTime() < KICK_BAN_DURATION_MS) {
+      const leftMin = Math.ceil(
+        (KICK_BAN_DURATION_MS - (Date.now() - new Date(ban.createdAt).getTime())) / 60000
+      );
+      return res.status(403).json({ error: `你已被投票踢出该房间，还需 ${leftMin} 分钟才能再次进入` });
     }
 
     // 统计当前房间总人数（房主也占一个名额）

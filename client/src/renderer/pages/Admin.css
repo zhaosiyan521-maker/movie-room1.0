@@ -277,3 +277,21 @@
   gap: 4px;
   flex-shrink: 0;
 }
+
+/* 【需求3】开设数量单元格：数字与「更改」按钮同行排列 */
+.quota-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quota-cell > span {
+  min-width: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 【需求2】房间卡片右侧「解散」按钮：不参与中间信息的弹性伸缩 */
+.admin-room-dissolve {
+  flex-shrink: 0;
+}
