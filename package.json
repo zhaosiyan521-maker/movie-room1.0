@@ -14,6 +14,8 @@
     "build:client": "npm run build --workspace=client",
     "build:server": "npm run build --workspace=server",
     "build": "npm run build:server && npm run build:client",
+    "db:push": "npm run prisma:push --workspace=server",
+    "db:generate": "npm run prisma:generate --workspace=server",
     "start": "npm run start --workspace=server",
     "start:web": "npm run build && npm run start",
     "verify:security": "node scripts/verify-security.js",
