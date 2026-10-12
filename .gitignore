@@ -3,6 +3,11 @@ node_modules/
 .pnp
 .pnp.js
 
+# lock 文件不入库：开发在 Windows、部署在 Linux，npm 只会把「当前平台」的原生
+# 可选依赖写进 lock，跨平台会导致 @rollup/rollup-linux-x64-gnu / @esbuild/linux-x64
+# 等条目缺失，服务器 build 直接崩溃（npm/cli#4828）。各环境自行 npm install 生成。
+package-lock.json
+
 # Build outputs
 dist/
 release/
