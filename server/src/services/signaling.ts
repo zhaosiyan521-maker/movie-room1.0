@@ -346,8 +346,9 @@ export function setupSocketHandlers(io: Server) {
       const room = await requireHost(socket, data?.roomId);
       if (!room) return;
 
-      // movieName 仅用于展示与落库（可直接等于网络直链 URL），不做长度硬截断，
-      // 否则超过 200 字符的直链会被整体拒绝，导致"点了播放观众端毫无反应"。
+      // movieName 用于展示与落库。网络直链模式下房主端已改为发送推导出的可读片名，
+      // 不再是整条 URL。此处只做类型校验；长度统一按 200 字符处理：
+      // 广播 slice(0, 200)（下一段），落库同样 slice(0, 200)（下方 prisma.update）。
       if (typeof data.movieName !== 'string') {
         socket.emit('error', { message: '电影名称无效' });
         return;
@@ -357,6 +358,13 @@ export function setupSocketHandlers(io: Server) {
       if (data.videoUrl != null) {
         if (typeof data.videoUrl !== 'string' || !/^https?:\/\//i.test(data.videoUrl)) {
           socket.emit('error', { message: '视频地址格式无效（仅支持 http/https）' });
+          return;
+        }
+        // 【直链-4】超过上限的直链若被静默截断，广播出去的就是一条注定失效的残缺地址，
+        // 观众只会看到「视频加载失败」而根本不知道发生了什么。
+        // 与其让所有观众一起失败，不如在这里明确拒绝并告诉房主。
+        if (data.videoUrl.length > 8000) {
+          socket.emit('error', { message: '视频直链过长（超过 8000 字符），无法同步给观众' });
           return;
         }
       }
@@ -375,8 +383,9 @@ export function setupSocketHandlers(io: Server) {
         hostId: socket.userId,
         movieName: data.movieName.slice(0, 200),
         resolution: typeof data.resolution === 'string' ? data.resolution.slice(0, 20) : null,
-        // 直链可能较长，保留完整地址（上限 4000 字符，避免极端超长请求）
-        videoUrl: typeof data.videoUrl === 'string' ? data.videoUrl.slice(0, 4000) : null,
+        // 【直链-4】已在上面对超长直链做了硬性拒绝，这里不需要再截断，
+        // 直接下发完整地址，保证观众拿到的一定是可用链接。
+        videoUrl: typeof data.videoUrl === 'string' ? data.videoUrl : null,
         isHls: !!data.isHls
       });
 
@@ -384,7 +393,12 @@ export function setupSocketHandlers(io: Server) {
         where: { id: room.id },
         data: {
           status: 'PLAYING',
-          currentMovie: data.movieName
+          // 【S8】落库与广播必须同样截断到 200 字符。
+          // 旧实现广播时 slice(0, 200)、落库却原样写入，与 PATCH /rooms/:id/status 的
+          // 200 字符校验不一致。网络直链模式下 movieName 传的是整条 URL（可能很长），
+          // 未截断会直接把超长字符串写进 currentMovie 字段并展示在房间列表上。
+          currentMovie:
+            typeof data.movieName === 'string' ? data.movieName.slice(0, 200) : null
         }
       }).catch(console.error);
     });
@@ -770,6 +784,34 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   }
 
   dbg(`${socket.username} 离开了房间 ${roomId}`);
+}
+
+/**
+ * 房间解散后清理其在内存中的全部信令状态：
+ * roomUsers/userRooms/kickVotes/播放状态缓存/语音与限流记录，以及挂起的房主宽限计时器。
+ * dissolveRoom 只做了 socketsLeave（适配器层），不经过 leaveRoom，内存状态会残留，需显式清理。
+ */
+export function purgeRoomSignalingState(roomId: string): void {
+  const sids = roomUsers.get(roomId);
+  if (sids) {
+    for (const sid of sids) {
+      userRooms.delete(sid);
+      voiceStates.delete(sid);
+      lastChatTime.delete(sid);
+      lastSpeakingAt.delete(sid);
+    }
+  }
+  roomUsers.delete(roomId);
+  kickVotes.delete(roomId);
+  roomPlaybackStates.delete(roomId);
+  for (const action of ['dissolve', 'abrupt'] as const) {
+    const key = `${roomId}:${action}`;
+    const t = pendingHostLeaves.get(key);
+    if (t) {
+      clearTimeout(t);
+      pendingHostLeaves.delete(key);
+    }
+  }
 }
 
 // 房主放映中断线：结束本场放映、房间回到等待状态，并通知房间内观众。

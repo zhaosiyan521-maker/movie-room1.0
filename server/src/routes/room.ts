@@ -197,48 +197,64 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
       return res.status(400).json({ error: '每名用户最多同时创建 5 个房间，请先解散部分房间再创建' });
     }
 
-    // 房间名称全局唯一（活跃房间内不允许重复）
-    const duplicate = await prisma.room.findFirst({
-      where: {
-        name: trimmedName,
-        status: { in: ['WAITING', 'PLAYING'] }
-      }
-    });
-    if (duplicate) {
-      return res.status(409).json({ error: '该房间名称已被使用，请换一个' });
-    }
-
     // 保存房间图片（最多 5 张）
     const imagePaths = saveImages(images);
 
-    // 创建房间
-    const room = await prisma.room.create({
-      data: {
-        name: trimmedName,
-        description: typeof description === 'string' ? description : null,
-        images: imagePaths.length > 0 ? JSON.stringify(imagePaths) : null,
-        password: (typeof password === 'string' && password) ? password : null,
-        maxViewers: mv,
-        hostId: req.user!.id,
-        status: 'WAITING'
-      },
-      select: {
-        ...ROOM_PUBLIC_SELECT,
-        host: { select: ROOM_HOST_SELECT },
-        _count: { select: { members: true } },
-      }
-    });
+    // 【S7】房间名查重与写入置于同一事务。
+    // Prisma schema 的 Room.name 没有唯一约束（无法靠数据库兜底并发），
+    // 旧实现的 findFirst → create 之间存在竞态窗口，并发请求会同时通过查重，
+    // 创建出同名的活跃房间。事务内的读写处于同一序列化边界，可关闭该窗口。
+    try {
+      const room = await prisma.$transaction(async (tx) => {
+        const duplicate = await tx.room.findFirst({
+          where: {
+            name: trimmedName,
+            status: { in: ['WAITING', 'PLAYING'] }
+          }
+        });
+        if (duplicate) {
+          const dup: any = new Error('ROOM_NAME_DUPLICATE');
+          dup.appCode = 'ROOM_NAME_DUPLICATE';
+          throw dup;
+        }
 
-    // 房主自动加入房间
-    await prisma.roomMember.create({
-      data: {
-        roomId: room.id,
-        userId: req.user!.id,
-        role: 'HOST'
-      }
-    });
+        // 创建房间
+        const created = await tx.room.create({
+          data: {
+            name: trimmedName,
+            description: typeof description === 'string' ? description : null,
+            images: imagePaths.length > 0 ? JSON.stringify(imagePaths) : null,
+            password: (typeof password === 'string' && password) ? password : null,
+            maxViewers: mv,
+            hostId: req.user!.id,
+            status: 'WAITING'
+          },
+          select: {
+            ...ROOM_PUBLIC_SELECT,
+            host: { select: ROOM_HOST_SELECT },
+            _count: { select: { members: true } },
+          }
+        });
 
-    res.status(201).json({ room: publicRoom(room) });
+        // 房主自动加入房间（与建房间同事务，避免建出无人认领的孤儿房间）
+        await tx.roomMember.create({
+          data: {
+            roomId: created.id,
+            userId: req.user!.id,
+            role: 'HOST'
+          }
+        });
+
+        return created;
+      });
+
+      res.status(201).json({ room: publicRoom(room) });
+    } catch (err: any) {
+      if (err?.appCode === 'ROOM_NAME_DUPLICATE' || err?.code === 'P2002') {
+        return res.status(409).json({ error: '该房间名称已被使用，请换一个' });
+      }
+      throw err;
+    }
   } catch (error) {
     console.error('Create room error:', error);
     res.status(500).json({ error: '创建房间失败' });
@@ -407,18 +423,43 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
       return res.status(403).json({ error: '房间密码错误' });
     }
 
-    // 加入房间
-    const member = await prisma.roomMember.create({
-      data: {
-        roomId,
-        userId,
-        role: isHost ? 'HOST' : 'VIEWER'
+    // 【S4】「计数 → 创建成员」必须在同一事务内完成。
+    // 旧实现是两条独立语句：并发加入时多个请求会同时读到「未满」，然后都执行 create，
+    // 突破 maxViewers 上限；同一用户的并发重复请求还会撞 @@unique([roomId, userId])
+    // 唯一约束，最终落到外层 catch 返回 500。这里统一处理为幂等/明确的业务响应。
+    const joinResult = await prisma.$transaction(async (tx) => {
+      // 事务内重新计数：上面那次快速检查只用于提前给出友好提示，
+      // 真正决定是否放行的是事务内这次读（与 create 处在同一序列化边界内）。
+      const cnt = await tx.roomMember.count({ where: { roomId } });
+      if (cnt >= room.maxViewers) {
+        const full: any = new Error('ROOM_FULL');
+        full.appCode = 'ROOM_FULL';
+        throw full;
       }
+      return tx.roomMember.create({
+        data: {
+          roomId,
+          userId,
+          role: isHost ? 'HOST' : 'VIEWER'
+        }
+      });
+    }).catch((err: any) => {
+      if (err?.appCode === 'ROOM_FULL') return { roomFull: true as const };
+      // 并发下同一用户重复加入会撞唯一约束：此时用户确实已是成员，按幂等返回成功
+      if (err?.code === 'P2002') return { alreadyMember: true as const };
+      throw err;
     });
+
+    if ('roomFull' in joinResult) {
+      return res.status(400).json({ error: '房间已满' });
+    }
+    if ('alreadyMember' in joinResult) {
+      return res.json({ message: '成功加入房间', member: null, alreadyMember: true });
+    }
 
     res.json({
       message: '成功加入房间',
-      member
+      member: joinResult
     });
   } catch (error) {
     console.error('Join room error:', error);

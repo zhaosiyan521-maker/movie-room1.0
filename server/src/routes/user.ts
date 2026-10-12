@@ -105,19 +105,39 @@ userRouter.patch('/profile', async (req: AuthRequest, res: Response) => {
       updateData.usernameChangedAt = new Date();
     }
 
-    const user = await prisma.user.update({
-      where: { id: req.user!.id },
-      data: updateData,
-      select: {
-        id: true,
-        username: true,
-        email: true,
-        nickname: true,
-        avatar: true,
-        isAdmin: true,
-        usernameChangedAt: true
+    // 【S10】昵称/用户名的唯一性检查（findFirst）与本次 update 之间存在并发窗口，
+    // 两个请求可能同时通过查重，最终由数据库唯一约束拦截（P2002）。
+    // 旧实现未捕获该异常 → 直接落到外层 catch 返回 500，用户看到"更新用户信息失败"
+    // 却不知道真实原因是名字被抢先占用了。这里识别 P2002 并给出友好的 409。
+    let user;
+    try {
+      user = await prisma.user.update({
+        where: { id: req.user!.id },
+        data: updateData,
+        select: {
+          id: true,
+          username: true,
+          email: true,
+          nickname: true,
+          avatar: true,
+          isAdmin: true,
+          usernameChangedAt: true
+        }
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        // meta.target 可能指向具体字段，据此给出精确提示
+        const target = Array.isArray(err?.meta?.target) ? err.meta.target.join(',') : '';
+        if (target.includes('nickname')) {
+          return res.status(409).json({ error: '该昵称已被使用，请换一个' });
+        }
+        if (target.includes('username')) {
+          return res.status(409).json({ error: '该用户名已被使用，请换一个' });
+        }
+        return res.status(409).json({ error: '该昵称或用户名已被使用，请换一个' });
       }
-    });
+      throw err;
+    }
 
     res.json({ message: '更新成功', user });
   } catch (error) {

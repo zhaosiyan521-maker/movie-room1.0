@@ -64,5 +64,12 @@ export async function dissolveRoom(
     try { opts.io.in(roomId).socketsLeave(roomId); } catch { /* ignore */ }
   }
 
+  // 4. 清理信令层内存状态（socketsLeave 只移除适配器房间，roomUsers/userRooms/播放缓存等会残留）
+  //    动态引入避免与 signaling 形成静态循环依赖（signaling 已静态引入本模块）
+  try {
+    const { purgeRoomSignalingState } = await import('./signaling');
+    purgeRoomSignalingState(roomId);
+  } catch { /* ignore */ }
+
   return true;
 }

@@ -4,6 +4,7 @@ import path from 'path';
 import { prisma } from '../config/database';
 import { authMiddleware, adminMiddleware, AuthRequest } from '../middleware/auth';
 import { getIO, disconnectUser } from '../services/signaling';
+import { dissolveRoom } from '../services/roomDissolve';
 
 export const adminRouter = Router();
 
@@ -175,7 +176,22 @@ adminRouter.post('/users/:id/ban', async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // 解散其开设的所有活跃房间
+    // 【S6】先按「房主正常退出」的语义彻底解散其活跃房间。
+    // 旧实现只做 updateMany(status: ENDED) + deleteMany(members)：既不广播 room-dissolved，
+    // 也不清理信令内存（roomUsers / roomPlaybackStates / kickVotes）。在线观众会滞留在一个
+    // 没有房主的幽灵房间里，画面冻结且收不到任何提示。
+    // 这里改为直接复用 dissolveRoom(io)：房间记录、成员、黑名单、图片一并删除，
+    // 并向房间内所有在线用户广播 room-dissolved 后将其请出信令房间。
+    const io = getIO();
+    const activeRooms = await prisma.room.findMany({
+      where: { hostId: target.id, status: { in: ['WAITING', 'PLAYING'] } },
+      select: { id: true }
+    });
+    for (const r of activeRooms) {
+      await dissolveRoom(r.id, { io, reason: '房主账号已被管理员处置，房间已解散' }).catch(() => {});
+    }
+
+    // 余下的非活跃房间（已 END 的历史房间，以及并发创建的新房间）同样收尾
     await prisma.room.updateMany({
       where: { hostId: target.id, status: { in: ['WAITING', 'PLAYING'] } },
       data: { status: 'ENDED' }
@@ -189,7 +205,6 @@ adminRouter.post('/users/:id/ban', async (req: AuthRequest, res: Response) => {
 
     // 主动断开其在线 Socket：否则已连接的客户端仍能收发房间广播，
     // 封禁对实时通道形同虚设（authMiddleware 只在下次 HTTP 请求时才拦截）。
-    const io = getIO();
     if (io) {
       disconnectUser(io, target.id, '你的账号已被永久封禁');
     }
@@ -247,8 +262,21 @@ adminRouter.post('/users/:id/force-logout', async (req: AuthRequest, res: Respon
       return res.status(400).json({ error: '不能强制注销自己' });
     }
 
-    // 断开其在线 Socket（实时通道），使其立即掉线
+    // 【S6】先取 io 并解散活跃房间。
+    // 旧顺序是「先删库 → 再断连」，而 leaveRoom 依赖 prisma.room.findUnique 判断房主离场行为；
+    // 房间已被删 → 整个分支跳过 → 观众收不到 room-dissolved，房间内 socketIds 也不清理，
+    // 在线观众永久滞留幽灵房间。必须先解散广播，再删其余数据。
     const io = getIO();
+    const activeRooms = await prisma.room.findMany({
+      where: { hostId: target.id, status: { in: ['WAITING', 'PLAYING'] } },
+      select: { id: true }
+    });
+    const dissolvedIds = new Set(activeRooms.map(r => r.id));
+    for (const r of activeRooms) {
+      await dissolveRoom(r.id, { io, reason: '房主账号已被注销，房间已解散' }).catch(() => {});
+    }
+
+    // 断开其在线 Socket（实时通道），使其立即掉线
     if (io) disconnectUser(io, target.id, '你的账号已被强制注销');
 
     // 该用户作为房主开设的房间：先收集图片，再按外键依赖顺序删除关联
@@ -256,14 +284,16 @@ adminRouter.post('/users/:id/force-logout', async (req: AuthRequest, res: Respon
       where: { hostId: target.id },
       select: { id: true, images: true }
     });
-    const roomIds = hostedRooms.map(r => r.id);
+    // 上面已解散的房间记录已被删除，这里只处理剩余（未活跃）房间，避免重复操作
+    const remaining = hostedRooms.filter(r => !dissolvedIds.has(r.id));
+    const roomIds = remaining.map(r => r.id);
     if (roomIds.length > 0) {
       await prisma.roomMember.deleteMany({ where: { roomId: { in: roomIds } } });
       await prisma.roomBan.deleteMany({ where: { roomId: { in: roomIds } } });
       await prisma.room.deleteMany({ where: { id: { in: roomIds } } });
     }
     // 删除房间后清理其图片文件（带跨房间引用检查）
-    await purgeRoomImages(hostedRooms);
+    await purgeRoomImages(remaining);
 
     // 该用户作为成员的记录、被房间封禁的记录
     await prisma.roomMember.deleteMany({ where: { userId: target.id } });

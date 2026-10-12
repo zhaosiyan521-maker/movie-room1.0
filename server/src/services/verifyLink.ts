@@ -71,17 +71,34 @@ export async function verifyEmailToken(
 }
 
 /**
+ * 事务内的数据库客户端形态。
+ *
+ * 【S5】为了让「消费验证凭据」与「创建用户」处在同一个事务里（建号失败时凭据自动回滚），
+ * consumeEmailToken / consumeEmailVerified 需要接受事务客户端 tx。
+ * 这里只用最小结构接口描述所需能力，事务客户端与全局 prisma 都满足它，
+ * 避免引入 Prisma.TransactionClient 带来的类型摩擦。
+ */
+interface TokenDb {
+  usedToken: { create(args: { data: { jti: string } }): Promise<unknown> };
+  emailVerify: {
+    deleteMany(args: { where: { email: string; purpose: string } }): Promise<{ count: number }>;
+  };
+}
+
+/**
  * 原子消费令牌：利用 jti 作为主键，插入冲突即说明已被使用。
  * 返回 true 表示本次消费成功（此前未被使用）。
  *
- * 注意：必须在执行业务副作用「之前」调用，否则并发请求会同时通过
- * verifyEmailToken 检查（TOCTOU），使同一个链接被使用两次。
+ * 注意：审计旧实现时在「必须早于副作用执行」与「建号失败要还回令牌」之间存在矛盾——
+ * 单纯把调用顺序挪到 create 之后会重新引入 TOCTOU（并发请求可重复利用同一令牌），
+ * 而先消费则在建号失败时白白浪费用户好不容易完成的邮箱验证。
+ * 正解是把两者放进同一个事务：由 @param db 传入事务客户端即可实现原子性。
  */
-export async function consumeEmailToken(token: string): Promise<boolean> {
+export async function consumeEmailToken(token: string, db: TokenDb = prisma): Promise<boolean> {
   try {
     const payload = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] }) as any;
     if (!payload.jti) return false;
-    await prisma.usedToken.create({ data: { jti: payload.jti } });
+    await db.usedToken.create({ data: { jti: payload.jti } });
     return true;
   } catch {
     // 唯一约束冲突 = 已被消费
@@ -146,9 +163,13 @@ export async function isEmailVerified(email: string, purpose: VerifyPurpose): Pr
  * 按邮箱消费一条已验证记录（注册成功后调用，避免同一份验证被重复用于多次注册）。
  * 返回是否成功消费（存在该记录）。
  */
-export async function consumeEmailVerified(email: string, purpose: VerifyPurpose): Promise<boolean> {
+export async function consumeEmailVerified(
+  email: string,
+  purpose: VerifyPurpose,
+  db: TokenDb = prisma
+): Promise<boolean> {
   try {
-    const res = await prisma.emailVerify.deleteMany({
+    const res = await db.emailVerify.deleteMany({
       where: { email, purpose }
     });
     return res.count > 0;

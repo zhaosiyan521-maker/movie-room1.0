@@ -21,7 +21,19 @@ setInterval(() => {
   for (const [key, b] of windows) {
     if (now > b.resetAt) windows.delete(key);
   }
-  if (windows.size > MAX_KEYS) windows.clear();
+  if (windows.size > MAX_KEYS) {
+    // 【S9】超限不能再整体 clear()。
+    // 旧实现在 key 数超过 MAX_KEYS 时清空整个 Map，等于让所有 IP 同时获得限流豁免——
+    // 攻击者只要持续用伪造 IP 把 Map 撑大并触发一次清空，就能反复重置他人的限流计数。
+    // 改为按 LRU 顺序淘汰最旧的 key：Map 的迭代顺序即插入顺序，命中时会把 key 刷新到末尾，
+    // 因此从头部开始删除淘汰的就是最久未被使用的记录。
+    let overflow = windows.size - MAX_KEYS;
+    for (const key of windows.keys()) {
+      if (overflow <= 0) break;
+      windows.delete(key);
+      overflow -= 1;
+    }
+  }
 }, CLEANUP_INTERVAL_MS).unref();
 
 /**
@@ -40,6 +52,11 @@ export function rateLimit(options: { windowMs: number; max: number; message?: st
     let bucket = windows.get(key);
     if (!bucket || now > bucket.resetAt) {
       bucket = { count: 0, resetAt: now + windowMs };
+      windows.set(key, bucket);
+    } else {
+      // 命中已存在的桶：把这个 key 重新插到 Map 末尾，维持 LRU 顺序，
+      // 保证超限淘汰时删掉的是最久未被使用的 key（配合上面的淘汰逻辑）。
+      windows.delete(key);
       windows.set(key, bucket);
     }
 

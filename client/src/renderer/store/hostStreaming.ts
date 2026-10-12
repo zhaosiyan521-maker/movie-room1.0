@@ -40,6 +40,11 @@ export interface HostSession {
   listenersBound: boolean;
   /** 房主是否已加入该信令房间 */
   joinedRoom: boolean;
+  /**
+   * 与房间内各观众的 WebRTC 连接（socketId -> RTCPeerConnection）。
+   * 必须是会话级持有：组件级 useRef 不跨组件实例存活，房主切页后旧 PC 会失控泄漏（僵尸连接）。
+   */
+  peers: Map<string, RTCPeerConnection>;
 }
 
 const sessions = new Map<string, HostSession>();
@@ -79,7 +84,8 @@ export function getOrCreateHostSession(roomId: string): HostSession {
       hls: null,
       playing: false,
       listenersBound: false,
-      joinedRoom: false
+      joinedRoom: false,
+      peers: new Map()
     };
     sessions.set(roomId, s);
   }
@@ -116,6 +122,11 @@ export function destroyHostSession(roomId: string): void {
     s.video.src = '';
     s.video.srcObject = null;
     if (s.video.parentNode) s.video.parentNode.removeChild(s.video);
+  } catch { /* ignore */ }
+  try {
+    // 关闭全部 WebRTC 连接（否则切页残留的僵尸 PC 会继续占连接与带宽直到 ICE 超时）
+    s.peers.forEach(pc => { try { pc.close(); } catch { /* ignore */ } });
+    s.peers.clear();
   } catch { /* ignore */ }
   try {
     s.socket.disconnect();

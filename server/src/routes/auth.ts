@@ -199,44 +199,51 @@ authRouter.post('/register', authLimiter, async (req: Request, res: Response) =>
       return res.status(409).json({ error: '该昵称已被使用，请换一个' });
     }
 
-    // 原子消费验证凭据：必须在创建用户「之前」消费。
-    // 若放在之后，两个并发请求会同时通过校验（TOCTOU），导致同一份验证被使用两次。
-    // 优先消费前端传来的 token（若有）；同时清理邮箱验证记录，防止重复注册。
-    if (emailVerifyToken) {
-      const consumed = await consumeEmailToken(emailVerifyToken);
-      if (!consumed) {
-        // token 消费失败（已被使用），但邮箱仍可能处于已验证状态（本次走的是兜底分支）
-        // 此时按邮箱消费记录即可，不必拒绝
-        await consumeEmailVerified(email, 'register');
-      } else {
-        // token 消费成功，一并清理邮箱验证记录
-        await consumeEmailVerified(email, 'register');
-      }
-    } else {
-      // 无 token，纯兜底：消费邮箱验证记录，防止同一邮箱重复注册
-      await consumeEmailVerified(email, 'register');
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
 
+    // 【S5】把「消费验证凭据」与「创建用户」放进同一个事务。
+    // 旧实现先消费凭据再建号，且 catch 里只打印日志（注释写着"需把令牌还回"却没实现）——
+    // 用户名/邮箱并发冲突时凭据已被消耗，用户被迫重走一遍邮箱验证。
+    // 同一事务可以让建号失败时凭据自动回滚；同时保留「先写 consume」的原子性，
+    // 不会因为把消费挪到 create 之后而重新引入同一令牌被并发复用的 TOCTOU。
     let user;
     try {
-      user = await prisma.user.create({
-        data: {
-          username,
-          email,
-          passwordHash,
-          nickname: trimmedNickname,
-          lastIp: ip,
-          // 管理员不再依据用户名自动授予（否则任何人都可抢注 admin 成为管理员）。
-          // 管理员只能通过 server/scripts/reset-admin.ts 或人工改库创建。
-          isAdmin: false,
-        },
+      user = await prisma.$transaction(async (tx) => {
+        if (emailVerifyToken) {
+          const consumed = await consumeEmailToken(emailVerifyToken, tx);
+          if (!consumed) {
+            // token 消费失败（已被使用），但邮箱仍可能处于已验证状态（本次走的是兜底分支）
+            // 此时按邮箱消费记录即可，不必拒绝
+            await consumeEmailVerified(email, 'register', tx);
+          } else {
+            // token 消费成功，一并清理邮箱验证记录
+            await consumeEmailVerified(email, 'register', tx);
+          }
+        } else {
+          // 无 token，纯兜底：消费邮箱验证记录，防止同一邮箱重复注册
+          await consumeEmailVerified(email, 'register', tx);
+        }
+
+        return tx.user.create({
+          data: {
+            username,
+            email,
+            passwordHash,
+            nickname: trimmedNickname,
+            lastIp: ip,
+            // 管理员不再依据用户名自动授予（否则任何人都可抢注 admin 成为管理员）。
+            // 管理员只能通过 server/scripts/reset-admin.ts 或人工改库创建。
+            isAdmin: false,
+          },
+        });
       });
     } catch (err: any) {
-      // 消费令牌后建号失败（多为并发下唯一约束冲突），需把令牌还回，避免用户白跑一趟
+      // 事务回滚：此处验证凭据一并还原，用户可直接重试而无需重新验证邮箱
       console.error('Create user error:', err?.message);
-      return res.status(409).json({ error: '该用户名或邮箱已被注册' });
+      if (err?.code === 'P2002') {
+        return res.status(409).json({ error: '该用户名、邮箱或昵称已被注册' });
+      }
+      return res.status(409).json({ error: '注册失败，请稍后重试' });
     }
 
     const token = jwt.sign({ userId: user.id, tv: user.tokenVersion }, config.jwtSecret, { expiresIn: '7d' });

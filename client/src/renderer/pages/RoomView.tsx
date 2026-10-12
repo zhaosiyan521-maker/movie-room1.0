@@ -137,6 +137,13 @@ export default function RoomView() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const makingOfferRef = useRef<Map<string, boolean>>(new Map());
+  // 完美协商（Perfect Negotiation）所需状态：
+  //   isSettingRemoteAnswerPending —— 正在/已经应用远端 answer。此状态下收到对方的 offer
+  //     属于「双向协商同时进行」，必须允许非 collision 判定。
+  //   makeOfferRef —— 每个 peer 专属的「发起一次协商」函数。原来挂在 pc 实例的私有属性上，
+  //     改为 Map 管理，避免污染 RTCPeerConnection 对象。
+  const isSettingRemoteAnswerPendingRef = useRef<Map<string, boolean>>(new Map());
+  const makeOfferRef = useRef<Map<string, () => Promise<void>>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -158,6 +165,11 @@ export default function RoomView() {
   const isPlayingRef = useRef(false);
   const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
+  // 观众端「声音被浏览器自动播放策略拦截」提示：
+  // 观众 <video> 属于远程流且通常在无用户手势时自动 play()，带声音的自动播放会被浏览器拒绝。
+  // 此时改为静音自动播放（保证有画面），并提示用户点击一次解锁声音。
+  // 注意：不能用上面的 needClickPlay —— 它的渲染条件是 isHost，观众侧永远不会显示。
+  const [needUnmute, setNeedUnmute] = useState(false);
   // 假暂停抑制窗口：房主切页回来时，挂载 effect 把 session.video 从 body 移回容器，
   // HTML 规范下媒体元素在 DOM 中移动会触发一次 pause 事件。这个窗口用于忽略该「假暂停」，
   // 避免误判为「房主主动暂停」而向观众广播 host-pause。
@@ -176,6 +188,11 @@ export default function RoomView() {
   const [speakingUserIds, setSpeakingUserIds] = useState<Set<string>>(new Set());
   const [mutedUserIds, setMutedUserIds] = useState<Set<string>>(new Set());
   const [micOn, setMicOn] = useState(true);
+  // micOn 的同步镜像：startSpeakingDetection 里的说话检测是一个通过 setTimeout
+  // 永久自递归的循环，闭包永远停留在创建那一次的渲染上。若直接读 micOn state，
+  // 用户「关闭麦克风 → 重新打开」后检测函数里拿到的仍是最初的 true/false，
+  // 导致重新打开麦克风后说话高亮永久失效。这里用 ref 同步镜像解决。
+  const micOnRef = useRef(true);
   const [chatInput, setChatInput] = useState('');
   const [chatCooldown, setChatCooldown] = useState(0);
   const [menuUserId, setMenuUserId] = useState<string | null>(null);
@@ -258,6 +275,17 @@ export default function RoomView() {
   const speakingRef = useRef(false);
   const cooldownTimerRef = useRef<any>(null);
 
+  // 【直链-1】当前正在播放的「原始直链」及其是否 HLS。
+  // 非 HLS 直链默认由 <video src> 直连源站以节省服务器带宽；一旦加载失败，
+  // 需要据此把同一条链接改为「走服务端代理」再重试一次（见 retryDirectViaProxy）。
+  const directUrlRef = useRef('');
+  const directIsHlsRef = useRef(false);
+  // 【直链-5】观众端 loadRemoteVideo 的「元素未就绪」重试定时器句柄。
+  // 旧实现每 100ms 无条件递归重试，若 room-joined 与 playback-start 在 <video>
+  // 挂载前先后到达，会拉起两条互相独立的重试链，各自 attachHls 到同一个元素，
+  // 产生多个 HLS 实例争抢（旧实例成为无人持有的孤儿，后台持续拉分片）。
+  const viewerLoadTimerRef = useRef<any>(null);
+
   useEffect(() => {
     if (!user) {
       fetchUser();
@@ -302,6 +330,13 @@ export default function RoomView() {
     // setupWebSocket() 会命中 if (setupDoneRef.current) return 而直接早退，
     // 导致切换房间后聊天/语音/视频/投票全部永久失效（直到刷新页面）。
     setupDoneRef.current = false;
+
+    // 【直链-5】组件卸载时作废观众端的加载重试定时器，
+    // 避免它在组件销毁后仍然触发 loadRemoteVideo（对已卸载的 <video> 发起重复加载）。
+    if (viewerLoadTimerRef.current) {
+      clearTimeout(viewerLoadTimerRef.current);
+      viewerLoadTimerRef.current = null;
+    }
 
     // 销毁 HLS 实例：否则旧实例会继续拉取分片，占用带宽与内存
     // 注意：房主切页时不清 HLS，否则网络直链模式下房主回来后需重新加载（观众不受影响）。
@@ -382,6 +417,7 @@ export default function RoomView() {
     setVoiceUserIds(new Set());
     setOnlineUserIds(new Set());
     setResolution(null);
+    setNeedUnmute(false);
     setUsingRemoteUrl(false);
     usingRemoteUrlRef.current = false;
     setRemotePlayUrl('');
@@ -501,6 +537,9 @@ export default function RoomView() {
       const session = getOrCreateHostSession(id!);
       hostSessionRef.current = session;
       socket = session.socket;
+      // 把组件级 peersRef 挂到会话级 Map 上：useRef 不跨组件实例存活，房主切页后旧 PC 会失控泄漏
+      // （僵尸连接继续占带宽）。挂到 session 后切页期间连接真正被保留，回房后可直接复用。
+      peersRef.current = session.peers;
       // 房主回到房间（或首次进入）时，清掉旧组件残留的监听器，避免叠加
       socket.removeAllListeners();
       // 触发重渲染，让挂载 effect 把 session.video 挂进展示容器（否则房主看不到画面）
@@ -531,6 +570,12 @@ export default function RoomView() {
       v.onloadedmetadata = () => setResolution(getResolution());
       v.onended = handleHostMovieEnded;
       v.onerror = () => {
+        // 【直链-1】直连失败先降级走服务端代理重试（绕过防盗链），仍失败才算真的失败
+        if (retryDirectViaProxy(v)) {
+          // 房主自己的 <video> 没有 autoPlay 属性，换 src 后需要显式触发播放
+          v.play().catch(() => setNeedClickPlay(true));
+          return;
+        }
         const code = (v.error && v.error.code) || 0;
         let msg = '视频加载失败，请检查文件格式或网络链接是否有效';
         if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
@@ -609,11 +654,24 @@ export default function RoomView() {
       setMembers(prev => {
         const next = [...prev];
         data.users.forEach((u: any) => {
-          if (u.userId && !next.some(m => m.userId === u.userId)) {
+          if (!u.userId) return;
+          const idx = next.findIndex(m => m.userId === u.userId);
+          if (idx >= 0) {
+            // 已存在则刷新 socketId：断线重连会换新 socketId，旧值会让「静音此人」失效
+            next[idx] = { ...next[idx], socketId: u.socketId };
+          } else {
             next.push({ userId: u.userId, nickname: u.nickname || u.username, socketId: u.socketId });
           }
         });
         return next;
+      });
+
+      // 房主回房时 peers 是会话级持久 Map：清掉已不在房间的僵尸连接，避免残留占用
+      const presentSocketIds = new Set<string>(
+        data.users.map((u: any) => u.socketId).filter(Boolean)
+      );
+      peersRef.current.forEach((_pc, sid) => {
+        if (!presentSocketIds.has(sid)) removePeer(sid);
       });
 
       for (const u of data.users) {
@@ -666,7 +724,8 @@ export default function RoomView() {
           // 观众 + 本地文件 WebRTC 模式：房主转发的流会自动续播，无需手动追进度
           setRemotePlayUrl('');
           destroyHls();
-          remoteVideoRef.current?.play().catch(() => {});
+          // 【C3】观众端播放失败不再静默吞掉：自动播放被拦截时静音兜底 + 提示解锁声音
+          playViewerVideo(remoteVideoRef.current);
         }
       }
     });
@@ -675,7 +734,12 @@ export default function RoomView() {
       if (data.userId) {
         setOnlineUserIds(prev => new Set(prev).add(data.userId));
         setMembers(prev => {
-          if (prev.some(m => m.userId === data.userId)) return prev;
+          // 断线重连的同 userId 用户会换新 socketId：更新旧条目，否则「静音此人」拿到失效的 socketId
+          if (prev.some(m => m.userId === data.userId)) {
+            return prev.map(m => m.userId === data.userId
+              ? { ...m, socketId: data.socketId, nickname: data.nickname || data.username || m.nickname }
+              : m);
+          }
           return [...prev, { userId: data.userId, nickname: data.nickname || data.username, socketId: data.socketId }];
         });
       }
@@ -704,31 +768,51 @@ export default function RoomView() {
       }
     });
 
-    socket.on('offer', async (data: any) => {
-      const pc = await createPeerConnection(data.from);
-      const polite = isPolite(data.from);
-      const makingOffer = makingOfferRef.current.get(data.from) || false;
-      const offerCollision = makingOffer || pc.signalingState !== 'stable';
-      const ignoreOffer = !polite && offerCollision;
-      if (ignoreOffer) return;
+    // 统一处理远端协商描述（offer / answer）——完美协商模式。
+    // 相比旧实现（polite/impolite + 遇到非 stable 直接 return），这里的关键差别是：
+    //  1. collision 判定只针对 offer，且由 polite 的一方通过 setRemoteDescription
+    //     内部自动 rollback 来让步，impolite 方直接忽略冲突 offer；不再产生
+    //     InvalidStateError 导致的协商链断裂。
+    //  2. setRemoteDescription 触发 rollback 后，本端已 addTrack / addTransceiver 的
+    //     收发器仍然存在，浏览器会把 negotiation-needed 标志重新置位，从而自动补发
+    //     一次真正携带 m-line 的 offer。这正是「观众播放中途加入黑屏无声」的自愈通道。
+    const applyRemoteDescription = async (from: string, desc: any) => {
+      const pc = peersRef.current.get(from);
+      if (!pc || !desc) return;
+      const isOffer = desc.type === 'offer';
+
+      if (isOffer) {
+        const polite = isPolite(from);
+        const makingOffer = makingOfferRef.current.get(from) || false;
+        const isSettingRemoteAnswerPending = isSettingRemoteAnswerPendingRef.current.get(from) || false;
+        // 只有「我刚发了 offer」或「正在处理远端 answer」之外的情况才算可接受状态
+        const readyForOffer =
+          !makingOffer && (pc.signalingState === 'stable' || isSettingRemoteAnswerPending);
+        if (!polite && !readyForOffer) return; // impolite 方不让步，等对方 rollback
+      }
 
       try {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-        await pc.setLocalDescription();
-        socket.emit('answer', { target: data.from, answer: pc.localDescription });
+        isSettingRemoteAnswerPendingRef.current.set(from, !isOffer);
+        await pc.setRemoteDescription(new RTCSessionDescription(desc));
+        isSettingRemoteAnswerPendingRef.current.set(from, false);
+        if (isOffer) {
+          await pc.setLocalDescription();
+          socket.emit('answer', { target: from, answer: pc.localDescription });
+        }
       } catch (err) {
-        console.error('处理 offer 失败:', err);
+        console.error('处理远端协商描述失败:', err);
+      } finally {
+        isSettingRemoteAnswerPendingRef.current.set(from, false);
       }
+    };
+
+    socket.on('offer', async (data: any) => {
+      await createPeerConnection(data.from);
+      await applyRemoteDescription(data.from, data.offer);
     });
 
     socket.on('answer', async (data: any) => {
-      const pc = peersRef.current.get(data.from);
-      if (!pc) return;
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-      } catch (err) {
-        console.error('处理 answer 失败:', err);
-      }
+      await applyRemoteDescription(data.from, data.answer);
     });
 
     socket.on('ice-candidate', async (data: any) => {
@@ -746,13 +830,17 @@ export default function RoomView() {
       isPlayingRef.current = true;
       setResolution(data?.resolution || null);
       if (data?.videoUrl) {
-        // 网络视频模式：观众各自加载直链，不经过房主带宽
+        // 网络视频模式：观众各自加载直链，不经过房主带宽。
+        // 先清掉 srcObject：若上一场是本地文件（WebRTC）模式，<video> 上仍挂着 srcObject，
+        // 按规范 srcObject 优先于 src，不清掉则 src 设置不生效，观众会一直卡在旧流画面。
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setRemotePlayUrl(data.videoUrl);
         loadRemoteVideo(data.videoUrl, !!data.isHls);
       } else {
         setRemotePlayUrl('');
         destroyHls();
-        remoteVideoRef.current?.play().catch(() => {});
+        // 【C3】观众端的播放失败必须留出口，不能直接吞掉
+        playViewerVideo(remoteVideoRef.current);
       }
     });
 
@@ -766,7 +854,7 @@ export default function RoomView() {
     socket.on('playback-resume', () => {
       setIsPlaying(true);
       isPlayingRef.current = true;
-      remoteVideoRef.current?.play().catch(() => {});
+      playViewerVideo(remoteVideoRef.current);
       localVideoRef.current?.play().catch(() => {});
     });
 
@@ -906,6 +994,7 @@ export default function RoomView() {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     peersRef.current.set(targetSocketId, pc);
     makingOfferRef.current.set(targetSocketId, false);
+    isSettingRemoteAnswerPendingRef.current.set(targetSocketId, false);
 
     pc.onicecandidate = (event) => {
       if (event.candidate && socketRef.current) {
@@ -916,28 +1005,36 @@ export default function RoomView() {
       }
     };
 
-    // 主动发起一次协商（发送 offer）。用于 onnegotiationneeded（加轨触发）。
-    // 关键：setLocalDescription 前必须确保 signalingState 是 stable，否则会与
-    // 正在处理的对方 offer 冲突（InvalidStateError），破坏协商导致黑屏。
+    // 发起一次协商。
+    // 按「完美协商」模式实现：不再用 signalingState 做前置判断。
+    // 旧的写法 `if (pc.signalingState !== 'stable') return;` 会把正在 have-remote-offer
+    // 期间排队的 negotiationneeded 静默丢弃——观众端发的空 offer（0 个 m-line）会让房主
+    // 回出一个同样没有媒体行的 answer，房主刚 addTrack 的本地视频轨因此永远协商不出去，
+    // 观众端永久黑屏无声（且无任何自愈通道，必须刷新页面）。
+    // 完美协商把这个责任交还给 setRemoteDescription：对方 offer 到达时若本端也有在途
+    // offer，由 polite 的一方自动 rollback 并重新协商，不会被丢弃。
     const makeOffer = async () => {
       try {
-        // 防抖：若已有 offer 在途，避免并发 setLocalDescription 导致 InvalidStateError
+        // 防抖：同一 peer 已有一次协商在途时不再并发，避免 description 类型错乱
         if (makingOfferRef.current.get(targetSocketId)) return;
-        // 若正在处理对方的 offer（have-remote-offer），此时 setLocalDescription 会失败，
-        // 但 offer 处理器会回 answer，无需在此发 offer，直接跳过。
-        if (pc.signalingState !== 'stable') return;
         makingOfferRef.current.set(targetSocketId, true);
         await pc.setLocalDescription();
-        socketRef.current?.emit('offer', {
-          target: targetSocketId,
-          offer: pc.localDescription
-        });
+        const desc = pc.localDescription;
+        if (!desc) return;
+        // setLocalDescription 的产物不一定是 offer：若此刻恰好处于 have-remote-offer，
+        // 它会生成 answer。按实际类型分发，保证信令语义正确。
+        if (desc.type === 'offer') {
+          socketRef.current?.emit('offer', { target: targetSocketId, offer: desc });
+        } else if (desc.type === 'answer') {
+          socketRef.current?.emit('answer', { target: targetSocketId, answer: desc });
+        }
       } catch (err) {
         console.error('协商失败:', err);
       } finally {
         makingOfferRef.current.set(targetSocketId, false);
       }
     };
+    makeOfferRef.current.set(targetSocketId, makeOffer);
 
     pc.onnegotiationneeded = () => {
       void makeOffer();
@@ -953,18 +1050,26 @@ export default function RoomView() {
       }
     };
 
+    // 【C1 根治】观众端 + 本地文件 WebRTC 模式：先声明「只收不发」的收发器。
+    // 这样观众发出的第一个 offer 就携带 audio/video 两个 m-line，房主随后 addTrack 的
+    // 本地视频/音频轨能被直接关联到这两条轨道上，一次往返即可完成媒体协商，
+    // 不再依赖「先答一个空 answer、再补发 offer」的二次协商，从根上消除黑屏。
+    // 网络直链模式不声明：该模式下视频不经过 WebRTC，只会白白占用收发器。
+    if (!isHostRef.current && !usingRemoteUrlRef.current) {
+      try {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      } catch { /* 不支持 addTransceiver 的环境退化为原行为 */ }
+    }
+
     addLocalTracksTo(pc);
 
-    // 关键修复：观众加入时若没有任何本地轨（未加入语音），addLocalTracksTo 不会
-    // 触发 onnegotiationneeded，观众就永远不发 offer，房主侧因此不会创建 PC，
-    // 本地文件模式下房主的视频流无法送达观众 → 黑屏。
-    // 这里兜底：PC 没有任何 sender 时，延迟到当前同步栈清空后再主动发 offer。
-    // 用 setTimeout 而非同步调用：房主处理对方 offer 时，同步调用会抢占
-    // setLocalDescription，导致 offer 处理器的 setRemoteDescription 抛 InvalidStateError。
-    // 延迟后 offer 处理器已先完成 setRemoteDescription + answer，兜底再发 offer 不会冲突。
-    if (pc.getSenders().length === 0) {
-      setTimeout(() => { void makeOffer(); }, 0);
-    }
+    // 兜底：确保本端一定会主动发出一次 offer。
+    // addTransceiver / addTrack 会把 negotiationneeded 排入任务队列，正常情况下由
+    // onnegotiationneeded 发起；但个别浏览器在「同步创建 PC」窗口内的 add 操作存在
+    // 不派发该事件的边缘情况，届时双方都在等对方先开口 → 永久黑屏。
+    // 延迟一个任务补发一次；makeOffer 内部有防抖，重复调用安全无害。
+    setTimeout(() => { void makeOffer(); }, 0);
 
     return pc;
   };
@@ -1009,13 +1114,25 @@ export default function RoomView() {
   };
 
   const getVideoCaptureStream = (): MediaStream | null => {
-    // 优先用模块级单例 session.video（房主刚进房/切页回来时 localVideoRef 可能尚未赋值）
-    const video = (hostSessionRef.current?.video || localVideoRef.current) as any;
+    const session = hostSessionRef.current;
+    // 【C5】复用会话已缓存的推流。
+    // <video>.captureStream() 每次调用都会返回一个全新的 MediaStream 实例，反复调用会产生
+    // 多条彼此独立的流：旧实例无人持有也 stop 不掉（因为 session.captureStream 一直是 null），
+    // 房间解散时 destroyHostSession 的 stop() 是执行不到的死代码 → 推流轨道泄漏。
+    // 这里改为「首次创建后缓存到 session.captureStream，后续全部复用」。
+    // 注意：不校验 readyState 只需判空。视频元素换 src 后同一条 captureStream 会自动
+    // 跟随新片源（它采集的是元素本身的画面），因此换片无需重建缓存。
+    if (session?.captureStream && session.captureStream.getTracks().some(t => t.readyState === 'live')) {
+      return session.captureStream;
+    }
+    const video = (session?.video || localVideoRef.current) as any;
     if (!video) return null;
     const capture = video.captureStream || video.mozCaptureStream;
     if (!capture) return null;
     const stream: MediaStream = capture.call(video);
-    return stream.getTracks().length > 0 ? stream : null;
+    if (stream.getTracks().length === 0) return null;
+    if (session) session.captureStream = stream;
+    return stream;
   };
 
   /**
@@ -1071,6 +1188,66 @@ export default function RoomView() {
     }
   };
 
+  /** 停止并移除某个 peer 单独创建的 Audio 元素（取消第二路播放） */
+  const releaseAudioEl = (socketId: string) => {
+    const el = audioElsRef.current.get(socketId);
+    if (!el) return;
+    try {
+      el.pause();
+      el.srcObject = null;
+    } catch { /* ignore */ }
+    audioElsRef.current.delete(socketId);
+  };
+
+  /**
+   * 播放观众端视频，并处理浏览器的自动播放策略拦截。
+   * 【C3】旧实现是 el.play().catch(() => {}) —— 被拒绝时静默吞掉，用户既不知道发生了什么，
+   * 也没有任何可以自救的入口，表现就是「看得见画面但没声音」甚至直接黑屏。
+   * 这里改为：带声音播放被拒 → 退化为静音自动播放（至少保证出画面），
+   * 同时弹出「点击开启声音」浮层，用户点一次即可解锁。
+   */
+  const playViewerVideo = (el: HTMLVideoElement | null) => {
+    if (!el) return;
+    el.play().catch(() => {
+      el.muted = true;
+      el.play().catch(() => {});
+      setNeedUnmute(true);
+    });
+  };
+
+  /**
+   * 【直链-1】非 HLS 直链加载失败时，降级为「走服务端代理」重试一次。
+   *
+   * 背景：为了不让所有视频都挤占服务器带宽，非 HLS 直链（mp4/webm 等）原本直接交给
+   * `<video src>` 连源站。但 /api/video-proxy 存在的唯一目的，恰恰是伪造目标站的同源
+   * Referer 来绕过防盗链校验——结果最受保护的 mp4 反而绕开了代理，遇到防盗链一律失败，
+   * 用户只能看到「网络错误：直链不可达或已被服务器拒绝」，还以为是自己的链接不行。
+   *
+   * 这里改成「先直连、失败自动走代理」：无需代理的站点依旧享受直连 CDN 的带宽，
+   * 带防盗链的站点则被自动救回。返回 true 表示已发起重试（调用方应放弃本次报错）。
+   */
+  const retryDirectViaProxy = (el: HTMLVideoElement | null): boolean => {
+    if (!el) return false;
+    // HLS 本身就走代理，且 hls.js 用的是 blob: MediaSource 源，不能做二次降级
+    if (directIsHlsRef.current) return false;
+    const raw = directUrlRef.current;
+    if (!raw || !/^https?:\/\//i.test(raw)) return false;
+    // 当前 src 已经是代理地址 → 说明已经重试过且仍然失败，放弃避免来回震荡
+    if (el.src.includes('/api/video-proxy')) return false;
+    setVideoError('');
+    el.src = toProxiedUrl(raw);
+    return true;
+  };
+
+  /** 观众点击浮层解锁声音：解除静音并恢复播放 */
+  const unlockViewerAudio = () => {
+    const el = remoteVideoRef.current;
+    if (!el) return;
+    el.muted = false;
+    el.play().catch(() => {});
+    setNeedUnmute(false);
+  };
+
   const handleRemoteTrack = (socketId: string, track: MediaStreamTrack) => {
     let stream = remoteStreamsRef.current.get(socketId);
     if (!stream) {
@@ -1082,23 +1259,31 @@ export default function RoomView() {
     }
 
     if (track.kind === 'video') {
+      // 【C2】视频轨所在的流会被整体绑给 <video>，而 <video> 会连带播放这条流里的音轨。
+      // 若音轨先于视频轨到达并已创建了独立的 Audio 元素，同一条流的声音就会被播放两遍
+      // （双重声音 / 回声）。视频轨到达时撤掉该 Audio 元素，声音统一由 <video> 出。
+      releaseAudioEl(socketId);
       // 关键修复：ontrack 可能在 React 渲染 <video>（remoteVideoRef 赋值）之前触发，
       // 此时 remoteVideoRef.current 为 null，直接跳过会导致视频轨永远没设置到元素上 → 黑屏。
       // 这里改为：元素未就绪时延迟重试，直到挂载后设置 srcObject。
-      const applyVideo = () => {
+      const applyVideo = (attempt = 0) => {
         const el = remoteVideoRef.current;
         if (!el) {
-          setTimeout(applyVideo, 100);
+          // 重试加上限：元素长期不挂载（如组件已卸载/对端异常）时停止空转，避免无限 setTimeout 泄漏
+          if (attempt >= 100) return;
+          setTimeout(() => applyVideo(attempt + 1), 100);
           return;
         }
         if (el.srcObject !== stream) {
           el.srcObject = stream;
         }
-        // 观众完全被动：播放失败不做任何兜底（不弹窗/不静音/不加按钮），浏览器自动播放策略由观众本地决定。
-        el.play().catch(() => {});
+        playViewerVideo(el);
       };
       applyVideo();
     } else if (track.kind === 'audio') {
+      // 【C2】含视频轨的流，其声音已由 <video> 一并播放，此处不再单独播第二遍。
+      // 只有纯语音流（麦克风，本身无视频轨）才需要单独的 Audio 元素播放。
+      if (stream.getVideoTracks().length > 0) return;
       let audioEl = audioElsRef.current.get(socketId);
       if (!audioEl) {
         audioEl = new Audio();
@@ -1117,13 +1302,10 @@ export default function RoomView() {
       peersRef.current.delete(socketId);
     }
     makingOfferRef.current.delete(socketId);
+    isSettingRemoteAnswerPendingRef.current.delete(socketId);
+    makeOfferRef.current.delete(socketId);
     remoteStreamsRef.current.delete(socketId);
-    const audioEl = audioElsRef.current.get(socketId);
-    if (audioEl) {
-      audioEl.pause();
-      audioEl.srcObject = null;
-      audioElsRef.current.delete(socketId);
-    }
+    releaseAudioEl(socketId);
   };
 
   // ===== 直链获取（服务端嗅探）=====
@@ -1201,6 +1383,7 @@ export default function RoomView() {
       localMicRef.current = stream;
       setInVoice(true);
       setMicOn(true);
+      micOnRef.current = true;
 
       peersRef.current.forEach(pc => {
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
@@ -1226,6 +1409,10 @@ export default function RoomView() {
   };
 
   const leaveVoice = () => {
+    // 先记录麦克风轨道 id：下方移除 sender 时只能拔麦克风轨，
+    // 不能用 kind==='audio' 无差别移除——否则会把房主推流的电影声音轨（WebAudio 分流）
+    // 一并从所有 PC 拔掉，房主「加入语音→退出语音」后观众将永久失去电影声音。
+    const micTrackIds = new Set((localMicRef.current?.getTracks() || []).map(t => t.id));
     if (localMicRef.current) {
       localMicRef.current.getTracks().forEach(t => t.stop());
       localMicRef.current = null;
@@ -1245,7 +1432,7 @@ export default function RoomView() {
     socketRef.current?.emit('voice-leave', id);
     peersRef.current.forEach((pc) => {
       pc.getSenders().forEach(sender => {
-        if (sender.track?.kind === 'audio') {
+        if (sender.track && micTrackIds.has(sender.track.id)) {
           pc.removeTrack(sender);
         }
       });
@@ -1257,6 +1444,9 @@ export default function RoomView() {
     const next = !micOn;
     localMicRef.current.getAudioTracks().forEach(t => { t.enabled = next; });
     setMicOn(next);
+    // 【C4】同步更新 ref：说话检测循环读的是 ref 而不是 state，否则「关麦 → 再开麦」后
+    // 检测函数里的 micOn 永远是进入语音那一刻的旧值，说话高亮永久失效。
+    micOnRef.current = next;
     if (!next) {
       emitSpeaking(false);
     }
@@ -1276,7 +1466,9 @@ export default function RoomView() {
         if (!audioCtxRef.current) return;
         analyser.getByteFrequencyData(data);
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
-        const speaking = micOn && avg > 12;
+        // 【C4】读 micOnRef 而非 micOn。check() 通过 setTimeout 永久自递归，
+        // 闭包只捕获进入语音那一刻的渲染快照，读 state 会导致开关麦克风后判定失效。
+        const speaking = micOnRef.current && avg > 12;
         // 归一化音量到 0~1（用于头像按音量着色：绿→黄→红）
         const level = Math.max(0, Math.min(1, avg / 80));
         if (speaking !== speakingRef.current) {
@@ -1454,6 +1646,9 @@ export default function RoomView() {
 
   /** ownObjectUrl=true 表示 src 是 createObjectURL 产生的，换片/清理时需要 revoke */
   const loadVideoFile = (src: string, name: string, ownObjectUrl = false) => {
+    // 【直链-6】加载本地文件前先销毁可能存在的 HLS 实例（比如房主刚看过网络直链再换本地片源），
+    // 避免它与新的本地 src 争抢同一个 video 元素。
+    destroyHls();
     // 先释放上一个 ObjectURL
     if (localObjectUrlRef.current) {
       URL.revokeObjectURL(localObjectUrlRef.current);
@@ -1500,7 +1695,12 @@ export default function RoomView() {
     } catch {
       pathPart = url;
     }
-    return /(\.m3u8|m3u8|hls|\.ts)(\?|&|#|$)/i.test(pathPart);
+    // 【直链-2】结尾判定必须包含 `/`。旧正则只接受 ? & # 或字符串结尾，
+    // 导致 `https://cdn/hls/`、`https://cdn/live.m3u8/` 这类以斜杠收尾的真实 HLS 地址
+    // 被漏判为普通视频 → 把 m3u8 播放列表塞给 <video src> → 必然报「格式不支持」。
+    // 结尾允许 `/` 带来的旧误判代价极小（最多多走一次代理，仍能正常播放），
+    // 而漏判是致命的，因此这里偏向「宁可走代理也不能漏判 HLS」。
+    return /(\.m3u8|m3u8|hls|\.ts)(\?|&|#|\/|$)/i.test(pathPart);
   }
 
   /**
@@ -1529,9 +1729,9 @@ export default function RoomView() {
       if (typeof seekTo === 'number' && seekTo > 0) {
         try { el.currentTime = seekTo; } catch {}
       }
-      // 观众端播放失败静默忽略（不弹窗/不静音）；房主端保留点击播放兜底。
+      // 【C3】观众端播放失败需静音兜底 + 提示解锁声音；房主端保留点击播放兜底。
       if (el === remoteVideoRef.current) {
-        el.play().catch(() => {});
+        playViewerVideo(el);
       } else {
         el.play().catch(() => setNeedClickPlay(true));
       }
@@ -1562,28 +1762,47 @@ export default function RoomView() {
     // 就执行，此时 el 为 null，直接 return 会导致观众中途加入时画面永远不加载 → 黑屏。
     // 这里改为延迟重试，直到 video 元素挂载就绪。
     if (!el) {
-      setTimeout(() => loadRemoteVideo(url, isHls, seekTo), 100);
+      // 【直链-5】同一时刻只允许存在一条待重试的请求：先清掉上一条尚未触发的定时器。
+      // 旧实现无条件 setTimeout 递归，room-joined 与 playback-start 若在 <video> 挂载前
+      // 先后到达，就会并存两条互不感知的重试链，各自执行 destroyHls + attachHls，
+      // 最终在同一个 <video> 上叠加多个 HLS 实例（旧实例成为孤儿，后台持续拉分片）。
+      if (viewerLoadTimerRef.current) clearTimeout(viewerLoadTimerRef.current);
+      viewerLoadTimerRef.current = setTimeout(() => {
+        viewerLoadTimerRef.current = null;
+        loadRemoteVideo(url, isHls, seekTo);
+      }, 100);
       return;
     }
+    // 元素已就绪：作废仍在等待的重试定时器，确保只有本次加载真正生效
+    if (viewerLoadTimerRef.current) {
+      clearTimeout(viewerLoadTimerRef.current);
+      viewerLoadTimerRef.current = null;
+    }
+    // 【直链-1】记录原始直链，供加载失败后降级走服务端代理重试使用
+    directUrlRef.current = url;
     setVideoError('');
     destroyHls();
     // 增强 HLS 识别：显式标记 或 启发式判断
     const useHls = isHls || looksLikeHls(url);
-    // 带宽优化：非 HLS 直链由 <video src> 直连源站播放（不走代理）；HLS 走代理（跨域限制）。
+    // 【直链-1】HLS 本身已走代理，失败时不需要也不能再做「直连 → 代理」降级
+    directIsHlsRef.current = useHls;
+    // 带宽优化：非 HLS 直链先由 <video src> 直连源站，充分利用 CDN 带宽、降低中转压力；
+    // HLS 必须走代理（hls.js 用 XHR 拉分片受跨域限制）。
+    // 直连若被防盗链拒绝，会由 onError → retryDirectViaProxy 自动降级走代理重试一次。
     const target = useHls ? toProxiedUrl(url) : url;
     const applySeekAndPlay = (e: HTMLVideoElement) => {
       if (typeof seekTo === 'number' && seekTo > 0) {
         if (e.readyState >= 1) {
           try { e.currentTime = seekTo; } catch {}
-          e.play().catch(() => {});
+          playViewerVideo(e);
         } else {
           e.addEventListener('loadedmetadata', () => {
             try { e.currentTime = seekTo; } catch {}
-            e.play().catch(() => {});
+            playViewerVideo(e);
           }, { once: true });
         }
       } else {
-        e.play().catch(() => {});
+        playViewerVideo(e);
       }
     };
     if (useHls && Hls.isSupported()) {
@@ -1604,8 +1823,13 @@ export default function RoomView() {
     if (!el) return;
     setVideoError('');
     const useHls = isHls || looksLikeHls(url);
-    // 带宽优化：非 HLS 直链（mp4/webm 等）由 <video src> 直连源站播放，不经过服务器代理，
+    // 【直链-1】房主端同样记录原始直链与 HLS 标记。
+    // 房主自己也直接拉同一条直链观看，遇到防盗链同样会失败，需要同样的降级重试。
+    directUrlRef.current = url;
+    directIsHlsRef.current = useHls;
+    // 带宽优化：非 HLS 直链（mp4/webm 等）先由 <video src> 直连源站播放，不经过服务器代理，
     // 充分利用 CDN 带宽、降低服务器中转压力；HLS 必须走代理（hls.js 用 XHR 拉分片受跨域限制）。
+    // 直连失败时由 v.onerror → retryDirectViaProxy 自动降级走代理重试一次。
     const target = useHls ? toProxiedUrl(url) : url;
 
     // 房主切页回来：若 session.hls 仍存活、attach 在同一个 video 上、且加载的还是同一
@@ -1662,6 +1886,28 @@ export default function RoomView() {
     return null;
   };
 
+  /**
+   * 【直链-3】从直链推导一个可读的「片名」。
+   * 旧实现直接把整条 URL 当作 movieName 广播 + 落库，导致房间列表、我的房间、
+   * 个人中心、后台房间管理全都显示成一长串 URL（currentMovie 字段的数据来源就是它）。
+   */
+  const deriveMovieName = (url: string): string => {
+    try {
+      const u = new URL(url);
+      const seg = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '');
+      const cleaned = seg.replace(/\.(m3u8|mp4|webm|flv|mkv|mov)$/i, '').trim();
+      // 排除纯数字/哈希式的 CDN 文件名（如 20240512_1f3a9c），这类名字没有可读性，不如给兜底名
+      if (cleaned && /[a-z\u4e00-\u9fa5]/i.test(cleaned)) return cleaned.slice(0, 200);
+    } catch { /* URL 解析失败走兜底 */ }
+    return '网络视频直链';
+  };
+
+  /** 【直链-3】优先使用「🔗 直链获取」抓到的页面标题，否则回落到 URL 推导 */
+  const resolveRemoteMovieName = (url: string): string => {
+    if (sniffTitle && sniffUrls.includes(url)) return sniffTitle.slice(0, 200);
+    return deriveMovieName(url);
+  };
+
   // ===== 网络直链播放（房主端）：加载直链并广播给观众各自加载 =====
   // 注意：此分支与本地文件播放（startLocalFilePlayback）完全独立，互不影响。
   const startRemotePlayback = () => {
@@ -1674,7 +1920,8 @@ export default function RoomView() {
     loadLocalUrl(url, isHls);
     socketRef.current?.emit('host-start-play', {
       roomId: id,
-      movieName: url,
+      // 【直链-3】不再把整条 URL 当片名
+      movieName: resolveRemoteMovieName(url),
       videoUrl: url,
       isHls,
       resolution: getResolution()
@@ -2005,6 +2252,8 @@ export default function RoomView() {
                     setProgress({ current: el.currentTime, duration: el.duration || 0 });
                   }}
                   onError={() => {
+                    // 【直链-1】直连失败先降级走服务端代理重试（伪造同源 Referer 绕过防盗链）
+                    if (retryDirectViaProxy(remoteVideoRef.current)) return;
                     const code = remoteVideoRef.current?.error?.code;
                     let msg = '视频加载失败，请检查网络链接是否有效、是否支持跨域播放';
                     if (code === MediaError.MEDIA_ERR_NETWORK) msg = '网络错误：直链不可达或已被服务器拒绝（防盗链/失效/跨域）';
@@ -2171,6 +2420,22 @@ export default function RoomView() {
                   </button>
                 </div>
               )}
+
+              {/* 【C3】观众端：自动播放被浏览器拦截时，视频已处于静音播放状态，这里提示解锁声音。
+                  注意不能用上面的 needClickPlay —— 它的渲染条件带 isHost，观众侧永远不会显示。 */}
+              {(!isHost && needUnmute) && (
+                <div className="video-overlay">
+                  <p style={{ marginBottom: 12, maxWidth: 320 }}>
+                    🔇 浏览器拦截了自动播放，当前为静音播放
+                  </p>
+                  <button
+                    className="btn btn-primary"
+                    onClick={unlockViewerAudio}
+                  >
+                    🔊 点击开启声音
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* 语音控制条 */}
@@ -2215,7 +2480,16 @@ export default function RoomView() {
                 <div className="source-tabs">
                   <button
                     className={`tab ${!usingRemoteUrl ? 'active' : ''}`}
-                    onClick={() => { setUsingRemoteUrl(false); usingRemoteUrlRef.current = false; }}
+                    onClick={() => {
+                      setUsingRemoteUrl(false);
+                      usingRemoteUrlRef.current = false;
+                      // 【直链-6】切回「本地文件」必须销毁 HLS 实例。
+                      // 否则 session.hls 仍持有 attachMedia 绑在同一个 video 元素上的旧实例，
+                      // 接着 loadVideoFile 给 el.src 赋本地文件 → 两个片源争抢同一个播放器，
+                      // hls.js 还会尝试 recover 并在后台持续拉取旧链接的分片。
+                      destroyHls();
+                      setVideoError('');
+                    }}
                   >📁 本地文件</button>
                   <button
                     className={`tab ${usingRemoteUrl ? 'active' : ''}`}
