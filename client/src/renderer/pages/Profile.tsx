@@ -18,7 +18,7 @@ const USERNAME_COOLDOWN_DAYS = 30;
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 export default function Profile() {
-  const { user, fetchUser } = useAuthStore();
+  const { user, fetchUser, logout } = useAuthStore();
   const { pending, clear } = useVerifyStore();
   const navigate = useNavigate();
   const [nickname, setNickname] = useState(user?.nickname || '');
@@ -163,6 +163,14 @@ export default function Profile() {
     } finally {
       setBindSaving(false);
     }
+  };
+
+  const handleLogout = () => {
+    logout();
+    // 必须一并清除邮箱验证令牌：它是可用凭据，明文留在 localStorage 中，
+    // 在公用/共享机器上会被下一位使用者读出并冒用该邮箱完成注册或改密。
+    clear();
+    navigate('/login');
   };
 
   const statusText = (status: string) => {
@@ -403,6 +411,18 @@ export default function Profile() {
             })}
           </div>
         )}
+      </div>
+
+      {/* 退出登录 */}
+      <div className="card profile-card">
+        <h2>🚪 退出登录</h2>
+        <p className="empty-text" style={{ marginBottom: 16 }}>退出后需要重新登录才能继续使用。</p>
+        <button
+          onClick={handleLogout}
+          className="btn btn-danger"
+        >
+          退出登录
+        </button>
       </div>
     </div>
   );

@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Outlet, Link, useNavigate } from 'react-router-dom';
+import { Outlet, Link } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
-import { useVerifyStore } from '../store/verifyStore';
 // 走 import 让 Vite 处理资源路径，避免打包后资源路径失效 404
 import tipQrWechat from '/tip-qr-wechat.png';
 import tipQrAlipay from '/tip-qr-alipay.png';
@@ -12,19 +11,10 @@ const TIP_POPUP_INTERVAL = 7 * 24 * 60 * 60 * 1000;
 const TIP_POPUP_KEY = 'mr_support_popup_at';
 
 export default function Layout() {
-  const { user, logout } = useAuthStore();
-  const navigate = useNavigate();
+  const { user } = useAuthStore();
   const [showTip, setShowTip] = useState(false);
   // 每 7 天自动弹出一次的支持弹窗
   const [showSupportPopup, setShowSupportPopup] = useState(false);
-
-  const handleLogout = () => {
-    logout();
-    // 必须一并清除邮箱验证令牌：它是可用凭据，明文留在 localStorage 中，
-    // 在公用/共享机器上会被下一位使用者读出并冒用该邮箱完成注册或改密。
-    useVerifyStore.getState().clear();
-    navigate('/login');
-  };
 
   // 每 7 天弹出一次支持弹窗（记录时间戳在展示时写入，避免反复打扰）
   useEffect(() => {
@@ -91,9 +81,6 @@ export default function Layout() {
               </span>
             )}
           </Link>
-          <button onClick={handleLogout} className="btn btn-secondary btn-sm">
-            退出
-          </button>
         </div>
       </header>
 

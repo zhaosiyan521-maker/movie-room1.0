@@ -255,3 +255,123 @@ proxyRouter.get('/video-proxy', async (req, res: Response) => {
     }
   }
 });
+
+/**
+ * 从页面 HTML/JS 文本中提取媒体直链（.m3u8 / .mp4 / .webm / .flv）。
+ *
+ * 要点：
+ *   - 先反解常见 JS 转义（\/ \u002F \x2F），让藏在脚本字符串里的 URL 能被正则命中；
+ *   - 同时匹配绝对 URL 与「引号包裹的相对/裸路径」，相对路径用页面 base 解析为绝对地址；
+ *   - 去重 + 仅保留 http(s)。
+ */
+function extractMediaUrls(html: string, base: URL): string[] {
+  const found = new Set<string>();
+
+  const unescaped = html
+    .replace(/\\\//g, '/')
+    .replace(/\\u002F/gi, '/')
+    .replace(/\\x2F/gi, '/');
+
+  // 绝对 URL（含查询串），去掉末尾可能的引号/逗号/反斜杠等噪声
+  const absRe = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|webm|flv)(?:\?[^\s"'<>\\]*)?/gi;
+  for (const m of unescaped.match(absRe) || []) {
+    const cleaned = m.replace(/[\\'",;)\]]+$/, '');
+    found.add(cleaned);
+  }
+
+  // 引号包裹的路径形式（相对或裸路径），用 base 解析
+  const relRe = /(?:"|')([^"']*?\.(?:m3u8|mp4|webm|flv)(?:\?[^"']*)?)(?:"|')/gi;
+  let mm: RegExpExecArray | null;
+  while ((mm = relRe.exec(unescaped))) {
+    const candidate = mm[1];
+    try {
+      const abs = new URL(candidate, base).toString();
+      if (/^https?:/i.test(abs)) found.add(abs);
+    } catch { /* 忽略无法解析的路径 */ }
+  }
+
+  return Array.from(found).filter((u) => {
+    try {
+      const p = new URL(u);
+      return p.protocol === 'http:' || p.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * 网络视频直链嗅探。
+ *
+ * 房主输入一个视频页面地址，服务端抓取该页 HTML，提取其中的 .m3u8/.mp4/.webm/.flv
+ * 直链返回给前端展示。只覆盖「直链明文写在页面源码里」的资源站/解析站；
+ * 依赖 JS 动态拼接 + 加密的大平台不在能力范围内。
+ *
+ * 复用 video-proxy 同一套 SSRF 防护与 dispatcher（绕过系统代理劫持）。
+ */
+proxyRouter.get('/sniff', async (req, res: Response) => {
+  const raw = req.query.url;
+  if (typeof raw !== 'string' || !raw) {
+    return res.status(400).json({ error: '缺少 url 参数' });
+  }
+  if (!isHttpUrl(raw)) {
+    return res.status(400).json({ error: '仅支持 http/https 链接' });
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return res.status(400).json({ error: '链接格式无效' });
+  }
+
+  if (parsed.username || parsed.password) {
+    return res.status(400).json({ error: '不支持带凭据的链接' });
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) {
+    return res.status(400).json({ error: '禁止访问本地/内网主机' });
+  }
+  if (await hostResolvesPrivate(host)) {
+    return res.status(400).json({ error: '禁止访问内网地址' });
+  }
+
+  // 输入本身就是媒体直链：直接原样返回
+  if (/\.(m3u8|mp4|webm|flv)(\?|$)/i.test(parsed.pathname)) {
+    return res.json({ urls: [parsed.toString()], title: '' });
+  }
+
+  const headers: Record<string, string> = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    Referer: parsed.origin + '/',
+  };
+
+  let upstream: Awaited<ReturnType<typeof fetch>>;
+  try {
+    upstream = await fetch(parsed.toString(), {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      dispatcher,
+    } as any);
+  } catch (err) {
+    console.error('[sniff] 抓取失败:', (err as Error)?.message);
+    return res.status(502).json({ error: '无法获取目标页面' });
+  }
+
+  if (!upstream.ok) {
+    return res.status(upstream.status || 502).json({ error: `上游返回 ${upstream.status}` });
+  }
+
+  const html = await upstream.text();
+  const urls = extractMediaUrls(html, parsed);
+
+  let title = '';
+  const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
+  if (titleMatch) title = titleMatch[1].trim();
+
+  res.json({ urls, title });
+});

@@ -229,6 +229,16 @@ export default function RoomView() {
   // 电影播放完毕：房主弹窗「是否解散该房间」
   const [endedPrompt, setEndedPrompt] = useState(false);
 
+  // ===== 直链获取（服务端嗅探）=====
+  const [showSniffInput, setShowSniffInput] = useState(false); // 输入弹窗
+  const [sniffInput, setSniffInput] = useState('');            // 原视频网址
+  const [sniffLoading, setSniffLoading] = useState(false);     // 生成直链中
+  const [sniffError, setSniffError] = useState('');            // 错误提示
+  const [showSniffResult, setShowSniffResult] = useState(false); // 结果弹窗
+  const [sniffTitle, setSniffTitle] = useState('');            // 页面标题
+  const [sniffUrls, setSniffUrls] = useState<string[]>([]);    // 捕获到的直链列表
+  const [copiedUrl, setCopiedUrl] = useState<string | null>(null); // 已复制的直链
+
   const hlsRef = useRef<any>(null);
   const setupDoneRef = useRef(false);
   const recentMsgSigRef = useRef<Set<string>>(new Set());
@@ -1113,6 +1123,66 @@ export default function RoomView() {
       audioEl.pause();
       audioEl.srcObject = null;
       audioElsRef.current.delete(socketId);
+    }
+  };
+
+  // ===== 直链获取（服务端嗅探）=====
+
+  const openSniffInput = () => {
+    setSniffInput('');
+    setSniffError('');
+    setSniffLoading(false);
+    setShowSniffResult(false);
+    setSniffUrls([]);
+    setShowSniffInput(true);
+  };
+
+  const closeSniffInput = () => {
+    if (sniffLoading) return;
+    setShowSniffInput(false);
+  };
+
+  const generateDirectUrl = async () => {
+    const url = sniffInput.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      setSniffError('请输入以 http:// 或 https:// 开头的有效网址');
+      return;
+    }
+    setSniffError('');
+    setSniffLoading(true);
+    try {
+      const { data } = await api.get('/sniff', { params: { url } });
+      const urls: string[] = Array.isArray(data?.urls) ? data.urls : [];
+      setSniffUrls(urls);
+      setSniffTitle(typeof data?.title === 'string' ? data.title : '');
+      setCopiedUrl(null);
+      // 关闭输入弹窗，弹出结果弹窗
+      setShowSniffInput(false);
+      setShowSniffResult(true);
+    } catch (e: any) {
+      setSniffError(e?.response?.data?.error || '获取直链失败，请确认网址可访问或稍后重试');
+    } finally {
+      setSniffLoading(false);
+    }
+  };
+
+  const closeSniffResult = () => {
+    setShowSniffResult(false);
+    setSniffUrls([]);
+  };
+
+  const copySniffUrl = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedUrl(url);
+      // 复制成功后自动关闭结果弹窗
+      setTimeout(() => {
+        setShowSniffResult(false);
+        setSniffUrls([]);
+      }, 600);
+    } catch {
+      // 剪贴板不可用（非安全上下文等）：降级为选中文本让用户手动复制
+      window.prompt('复制失败，请手动复制：', url);
     }
   };
 
@@ -2118,9 +2188,14 @@ export default function RoomView() {
               ) : (
                 <>
                   <span className="voice-status">未加入语音</span>
-                  <button onClick={joinVoice} className="btn btn-primary btn-sm">
+                  <button onClick={joinVoice} className="btn btn-primary voice-action-btn">
                     🎤 加入语音聊天
                   </button>
+                  {isHost && (
+                    <button onClick={openSniffInput} className="btn btn-primary voice-action-btn">
+                      🔗 直链获取
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -2310,6 +2385,73 @@ export default function RoomView() {
                 <p className="chat-rules" style={{ marginTop: 10 }}>
                   保留的房间可随时进入开始新电影，或使用「❌ 解散房间」按钮解散。
                 </p>
+              </div>
+            </div>
+          )}
+
+          {/* 直链获取：输入原视频网址 */}
+          {showSniffInput && (
+            <div className="modal-mask" onClick={closeSniffInput}>
+              <div className="modal-card card" onClick={(e) => e.stopPropagation()}>
+                <h3>🔗 直链获取</h3>
+                <p className="chat-rules" style={{ marginTop: 4 }}>
+                  输入视频页面网址，自动嗅探其中的 .m3u8 / mp4 / webm 直链。
+                </p>
+                <div className="form-group" style={{ marginTop: 12 }}>
+                  <label className="label">原视频网址</label>
+                  <input
+                    type="text"
+                    className="input"
+                    placeholder="https://example.com/video..."
+                    value={sniffInput}
+                    onChange={(e) => setSniffInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && generateDirectUrl()}
+                  />
+                </div>
+                {sniffError && (
+                  <div className="message error" style={{ marginTop: 10 }}>{sniffError}</div>
+                )}
+                <div className="modal-actions" style={{ marginTop: 16 }}>
+                  <button className="btn btn-secondary" onClick={closeSniffInput} disabled={sniffLoading}>
+                    取消
+                  </button>
+                  <button className="btn btn-primary" onClick={generateDirectUrl} disabled={sniffLoading}>
+                    {sniffLoading ? '生成中...' : '生成直链'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 直链获取：捕获结果 */}
+          {showSniffResult && (
+            <div className="modal-mask" onClick={closeSniffResult}>
+              <div className="modal-card card" onClick={(e) => e.stopPropagation()}>
+                <h3>🎯 捕获到的直链</h3>
+                {sniffTitle && <p className="sniff-title">{sniffTitle}</p>}
+                {sniffUrls.length === 0 ? (
+                  <p className="empty-text" style={{ margin: '16px 0' }}>
+                    未捕获到任何视频直链。该页面可能使用了动态/加密加载，或直链不在源码中。
+                  </p>
+                ) : (
+                  <div className="sniff-result-list">
+                    {sniffUrls.map((u, idx) => (
+                      <div className="sniff-result-item" key={u}>
+                        <span className="sniff-index">{idx + 1}.</span>
+                        <span className="sniff-url" title={u}>{u}</span>
+                        <button
+                          className={`btn btn-sm ${copiedUrl === u ? 'btn-success' : 'btn-primary'}`}
+                          onClick={() => copySniffUrl(u)}
+                        >
+                          {copiedUrl === u ? '✅ 已复制' : '复制'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="modal-actions" style={{ marginTop: 16 }}>
+                  <button className="btn btn-secondary" onClick={closeSniffResult}>关闭</button>
+                </div>
               </div>
             </div>
           )}
