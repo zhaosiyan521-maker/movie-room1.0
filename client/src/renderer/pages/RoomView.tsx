@@ -285,6 +285,10 @@ export default function RoomView() {
   // 挂载前先后到达，会拉起两条互相独立的重试链，各自 attachHls 到同一个元素，
   // 产生多个 HLS 实例争抢（旧实例成为无人持有的孤儿，后台持续拉分片）。
   const viewerLoadTimerRef = useRef<any>(null);
+  // HLS 网络错误的自动重试计数。hls.js 遇到致命网络错误（多为直链失效/过期）时会
+  // 不断触发 ERROR，早期实现无条件 startLoad() 重试，于是永远填不满缓冲区、
+  // 也永远不报错，用户看到的就是「一直黑屏、且没有任何提示」。
+  const hlsRetryRef = useRef(0);
 
   useEffect(() => {
     if (!user) {
@@ -1206,12 +1210,40 @@ export default function RoomView() {
    * 这里改为：带声音播放被拒 → 退化为静音自动播放（至少保证出画面），
    * 同时弹出「点击开启声音」浮层，用户点一次即可解锁。
    */
+  /**
+   * 观众端播放兜底。
+   *
+   * 重要：必须区分失败原因，不能「凡是 play() 失败就弹提示」。
+   * play() 返回的 Promise 被 reject 有很多与自动播放策略无关的情形，最常见的是
+   * AbortError —— 典型如先给 currentTime 赋值触发 seek、紧接着又调用 play()，
+   * 浏览器会判定播放请求被新的加载请求打断而 reject。这类失败不需要任何兜底：
+   * <video> 自带 autoPlay 属性，数据就绪后浏览器会自行起播。
+   *
+   * 只有 NotAllowedError 才是真正的「自动播放策略拦截」，需要静音兜底 + 提示解锁。
+   * 早期版本对所有 reject 一律弹出全屏遮罩，导致中途加入的观众（会走进 seek 分支）
+   * 明明视频能播，却被 0.7 不透明的遮罩整片糊住，表现为「黑屏且无提示」。
+   */
   const playViewerVideo = (el: HTMLVideoElement | null) => {
     if (!el) return;
-    el.play().catch(() => {
+    const p: any = el.play();
+    if (!p || typeof p.catch !== 'function') return;
+    p.catch((err: any) => {
+      if (err?.name !== 'NotAllowedError') return;
       el.muted = true;
-      el.play().catch(() => {});
-      setNeedUnmute(true);
+      const p2: any = el.play();
+      if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
+      // 静音播放一般下一帧就能起播，这里延迟复核：确认画面真的在播了才提示解锁声音。
+      // 否则视频因其他原因（源失效/网络错误）根本没起来时也会弹提示，误导用户。
+      window.setTimeout(() => {
+        const cur = remoteVideoRef.current;
+        if (!cur) return;
+        // 注意两种片源要一起判断：网络直链走 src（HLS 为 blob:），
+        // 而本地文件的 WebRTC 流挂在 srcObject 上，此时 src 是空的。
+        const hasSource = !!(cur.src || cur.srcObject);
+        if (hasSource && !cur.paused && cur.readyState >= 2) {
+          setNeedUnmute(true);
+        }
+      }, 600);
     });
   };
 
@@ -1687,20 +1719,27 @@ export default function RoomView() {
    */
   function looksLikeHls(url: string): boolean {
     if (/\.m3u8(\?|#|$)/i.test(url)) return true;
-    // 去参数、去 hash 后的路径
+    // 只取路径部分（去掉 query 与 hash）
     let pathPart = '';
     try {
-      const u = new URL(url);
-      pathPart = `${u.pathname}${u.search}`;
+      pathPart = new URL(url).pathname;
     } catch {
       pathPart = url;
     }
-    // 【直链-2】结尾判定必须包含 `/`。旧正则只接受 ? & # 或字符串结尾，
-    // 导致 `https://cdn/hls/`、`https://cdn/live.m3u8/` 这类以斜杠收尾的真实 HLS 地址
-    // 被漏判为普通视频 → 把 m3u8 播放列表塞给 <video src> → 必然报「格式不支持」。
-    // 结尾允许 `/` 带来的旧误判代价极小（最多多走一次代理，仍能正常播放），
-    // 而漏判是致命的，因此这里偏向「宁可走代理也不能漏判 HLS」。
-    return /(\.m3u8|m3u8|hls|\.ts)(\?|&|#|\/|$)/i.test(pathPart);
+    // 【直链-2】只看「最后一个路径段」。
+    //
+    // 曾在结尾判定里加入 `/` 想兼容 `https://cdn/hls/` 这类以斜杠收尾的 HLS 地址，
+    // 但这是错的：斜杠在 URL 路径里无处不在，根本不能当「结尾」用。实测把
+    // `https://cdn/hls/movie.mp4`、`https://cdn/m3u8/movie.mp4` 这类真实 CDN 直链
+    // 全部误判成 HLS（路径里有 hls/、m3u8/ 目录名，文件其实是 mp4），
+    // hls.js 去解析一个 mp4 二进制必然失败 → 黑屏。误判率反而从 3/14 升到 5/14。
+    //
+    // 正确做法是先去掉末尾斜杠再取末段，两种场景同时覆盖：
+    //   /hls/           → 末段 hls        → HLS ✅
+    //   /hls/movie.mp4  → 末段 movie.mp4  → 非 HLS ✅
+    //   /live/a.m3u8/   → 末段 a.m3u8     → HLS ✅
+    const lastSeg = pathPart.replace(/\/+$/, '').split('/').pop() || '';
+    return /(\.m3u8|m3u8|hls|\.ts)$/i.test(lastSeg);
   }
 
   /**
@@ -1715,6 +1754,8 @@ export default function RoomView() {
       typeof seekTo === 'number' && seekTo > 0 ? { startPosition: seekTo } : {}
     );
     hlsRef.current = hls;
+    // 每次建立新实例都归零重试计数，否则换片/重连的历史次数会累积，把偶发抖动误判成致命错误
+    hlsRetryRef.current = 0;
     // 房主：HLS 实例持久化到 session.hls，房主切页后 hlsRef（组件级）随组件卸载丢失，
     // 但 session.hls 仍持有实例继续拉流播放；房主回来时 loadLocalUrl 会复用同一实例，
     // 避免在同一个 session.video 上叠加新旧两个 HLS 实例导致冲突（黑屏）。
@@ -1725,28 +1766,49 @@ export default function RoomView() {
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setVideoError('');
-      // 兜底：startPosition 已定位，若仍未到位则显式 seek 一次（房主切页回来重载时追进度）
-      if (typeof seekTo === 'number' && seekTo > 0) {
-        try { el.currentTime = seekTo; } catch {}
-      }
+      // manifest 成功解析说明链路已恢复，归零网络重试计数，
+      // 避免后续偶发抖动累加到上限后被误报成「直链失效」
+      hlsRetryRef.current = 0;
       // 【C3】观众端播放失败需静音兜底 + 提示解锁声音；房主端保留点击播放兜底。
+      //
+      // 顺序要紧：必须先 play 再 seek。startPosition 已完成定位，下面这次 currentTime
+      // 赋值只是兜底。若把它放在 play() 之前，seek 会打断刚发起的播放请求并让 play()
+      // 抛 AbortError —— 而这只有「中途加入（seekTo > 0）」的观众才会走到，
+      // 于是表现成「放映途中加入的人被弹遮罩黑屏，房主本人却完全正常」。
       if (el === remoteVideoRef.current) {
         playViewerVideo(el);
       } else {
         el.play().catch(() => setNeedClickPlay(true));
       }
+      // 兜底 seek：仅当位置确实偏了才纠正，避免无谓的 seek 打扰刚发起的播放
+      if (typeof seekTo === 'number' && seekTo > 0 && Math.abs(el.currentTime - seekTo) > 1) {
+        try { el.currentTime = seekTo; } catch {}
+      }
     });
     hls.on(Hls.Events.ERROR, (_e: any, data: any) => {
       if (!data?.fatal) return;
       console.error('HLS 播放错误：', data);
-      // 网络错误时可尝试一次自动恢复，避免临时抖动直接判死
+      // 网络错误时先尝试自动恢复，避免临时抖动直接判死。
+      // 但必须设上限：直链失效/过期时 ERROR 会反复触发，无限重试意味着
+      // 既播不出画面、又永远不给提示，用户只能对着黑屏干等。
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        hls.startLoad();
+        hlsRetryRef.current += 1;
+        if (hlsRetryRef.current <= 3) {
+          hls.startLoad();
+          return;
+        }
+        setVideoError(
+          '视频加载失败：网络错误，直链可能已失效或无法访问。' +
+          '请确认直链有效且未过期（多数站点直链有时效），重试或更换链接。'
+        );
         return;
       }
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-        hls.recoverMediaError();
-        return;
+        hlsRetryRef.current += 1;
+        if (hlsRetryRef.current <= 3) {
+          hls.recoverMediaError();
+          return;
+        }
       }
       setVideoError('视频加载失败：HLS 流解析出错。请确认直链有效且未过期（多数站点直链有时效），重试或更换链接。');
       // 观众端不显示点击播放按钮
@@ -2424,12 +2486,10 @@ export default function RoomView() {
               {/* 【C3】观众端：自动播放被浏览器拦截时，视频已处于静音播放状态，这里提示解锁声音。
                   注意不能用上面的 needClickPlay —— 它的渲染条件带 isHost，观众侧永远不会显示。 */}
               {(!isHost && needUnmute) && (
-                <div className="video-overlay">
-                  <p style={{ marginBottom: 12, maxWidth: 320 }}>
-                    🔇 浏览器拦截了自动播放，当前为静音播放
-                  </p>
+                <div className="viewer-audio-tip">
+                  <span>🔇 浏览器拦截了自动播放，当前静音播放中</span>
                   <button
-                    className="btn btn-primary"
+                    className="btn btn-primary btn-sm"
                     onClick={unlockViewerAudio}
                   >
                     🔊 点击开启声音

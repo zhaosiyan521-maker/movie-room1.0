@@ -252,6 +252,28 @@
   font-size: 18px;
 }
 
+/* 【C3】观众端「点击开启声音」提示条。
+   刻意不复用 .video-overlay —— 后者是 0.7 不透明的全屏遮罩，一旦弹出就把画面
+   整片糊住，会被当成「黑屏」。这里改为悬浮在视频底部的小胶囊，不遮挡画面。 */
+.viewer-audio-tip {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: calc(100% - 32px);
+  padding: 10px 16px;
+  border-radius: 999px;
+  background-color: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 14px;
+  line-height: 1.4;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  z-index: 5;
+}
+
 /* 语音控制条 */
 .voice-controls {
   display: flex;
