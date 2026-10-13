@@ -7,6 +7,43 @@ import { io, Socket } from 'socket.io-client';
 import Hls from 'hls.js';
 import './RoomView.css';
 
+/**
+ * 【HLS 直连优先】记录「哪些直链已确认无法直连、必须走服务端代理」。
+ *
+ * 背景：HLS（.m3u8）此前一律改写成 /api/video-proxy 再交给 hls.js。代理确实是解决
+ * 两类问题的必要手段：
+ *   ① 跨域——hls.js 用 XHR 拉清单/分片，源站未返回 Access-Control-Allow-Origin 即被浏览器拦截；
+ *   ② 防盗链——页面发起请求会带跨站 Referer/Origin，多数 CDN 据此 403。
+ * 但代价是服务器要为每一位观众转发每一片 .ts：出网带宽 = 观众数 × 码率，且所有观众
+ * 都从同一个出口 IP 并发拉流，容易触发源站限流甚至封 IP。
+ *
+ * 而对「已开 CORS、不校验 Referer」的公开流（测试流、部分公开 CDN），浏览器直连完全可行。
+ * 因此改为「先直连，失败再降级代理」。
+ *
+ * 本集合刻意放在模块级（而非组件 useRef）：房主切页回来会重新调用 loadLocalUrl，
+ * 若无记忆就会把已确认失败的直连再踩一次（平白多约 1 秒黑屏）。模块级可跨组件卸载保留
+ * 判定结果。仅存于内存，刷新页面即清空。
+ */
+const HLS_PROXY_FALLBACK_URLS = new Set<string>();
+/** 兜底上限：避免长时间连续换源导致集合无限增长（超出后整体清空重建） */
+const HLS_PROXY_FALLBACK_MAX = 50;
+
+/** 标记某条直链「直连已失败，本次会话后续一律走代理」 */
+function markHlsNeedsProxy(raw: string): void {
+  if (!/^https?:\/\//i.test(raw)) return;
+  if (HLS_PROXY_FALLBACK_URLS.size >= HLS_PROXY_FALLBACK_MAX) HLS_PROXY_FALLBACK_URLS.clear();
+  HLS_PROXY_FALLBACK_URLS.add(raw);
+}
+
+/**
+ * 解析 HLS 最终应交给 hls.js 的地址。
+ * - 未标记失败 → 原始直连（走源站 CDN，省服务器出网带宽）
+ * - 已标记失败 / forceProxy → 走同源 /api/video-proxy（补 CORS + 伪造同源 Referer + 重写分片地址）
+ */
+function hlsTargetFor(raw: string, forceProxy = false): string {
+  return forceProxy || HLS_PROXY_FALLBACK_URLS.has(raw) ? toProxiedUrl(raw) : raw;
+}
+
 interface RoomMemberInfo {
   userId: string;
   nickname: string;
@@ -1106,12 +1143,17 @@ export default function RoomView() {
    */
   const retryDirectViaProxy = (el: HTMLVideoElement | null): boolean => {
     if (!el) return false;
-    // HLS 本身就走代理，且 hls.js 用的是 blob: MediaSource 源，不能做二次降级
-    if (directIsHlsRef.current) return false;
+    // 由 hls.js 驱动的 HLS 不能用「改 <video> src」的方式降级：此时 el.src 是
+    // blob: MediaSource 地址，直接赋值会打断 MSE。这类降级由 attachHls 内部重建
+    // HLS 实例完成（见 attachHls 里的 dropToProxy）。
+    if (hlsRef.current) return false;
     const raw = directUrlRef.current;
     if (!raw || !/^https?:\/\//i.test(raw)) return false;
     // 当前 src 已经是代理地址 → 说明已经重试过且仍然失败，放弃避免来回震荡
     if (el.src.includes('/api/video-proxy')) return false;
+    // Safari/iOS 走原生 HLS（<video src> 未被 CORS 约束），失败同样降级代理，
+    // 并记住该链接，避免后续每次加载都再踩一次直连。
+    if (directIsHlsRef.current) markHlsNeedsProxy(raw);
     setVideoError('');
     el.src = toProxiedUrl(raw);
     return true;
@@ -1527,8 +1569,15 @@ export default function RoomView() {
    * 用 hls.js 加载 HLS 流。
    * 关键点：必须在 manifest 解析完成（MANIFEST_PARSED）之后才调用 play()，
    * 否则在 attachMedia 之后立即 play() 会因媒体尚未就绪而静默失败。
+   *
+   * 【HLS 直连优先】这里传「原始直链」rawUrl，由本函数决定走直连还是代理：
+   *   - 未标记失败 → 直连源站（省服务器出网带宽、避免同 IP 并发被源站限流）
+   *   - 直连失败   → 内部自动重建实例改走 /api/video-proxy 重试一次，并记住该链接
    */
-  const attachHls = (el: HTMLVideoElement, url: string, seekTo?: number) => {
+  const attachHls = (el: HTMLVideoElement, rawUrl: string, seekTo?: number, forceProxy = false) => {
+    const target = hlsTargetFor(rawUrl, forceProxy);
+    // 本次加载是否已在代理模式：决定致命网络错误该「降级」还是「重试 / 报错」
+    const usingProxy = target.includes('/api/video-proxy');
     // 关键优化：通过 config.startPosition 让 hls.js 加载时直接从目标位置定位、只拉该位置
     // 附近的分片，跳过「从 0 缓冲一遍再 seek 到目标」的双重缓冲，观众中途进入可秒开。
     const hls = new Hls(
@@ -1543,7 +1592,24 @@ export default function RoomView() {
     if (isHostRef.current && hostSessionRef.current) {
       hostSessionRef.current.hls = hls;
     }
-    hls.loadSource(url);
+
+    /**
+     * 【HLS 直连优先】直连失败后就地降级：记住该链接 + 重建 HLS 实例改走服务端代理。
+     * 不销毁 <video> 元素（保持音量、全屏状态），只换 HLS 实例。
+     * 返回 false 表示已处于代理模式（或链接不可代理），调用方应继续原有重试 / 报错流程。
+     */
+    const dropToProxy = (): boolean => {
+      if (usingProxy) return false;
+      const proxied = toProxiedUrl(rawUrl);
+      if (!proxied || proxied === rawUrl) return false;
+      markHlsNeedsProxy(rawUrl);
+      console.warn('[HLS] 直连失败，已自动降级走服务端代理重试：', rawUrl);
+      destroyHls(); // 销毁旧实例（同时清空 hlsRef / session.hls，避免复用僵尸实例）
+      attachHls(el, rawUrl, seekTo, true);
+      return true;
+    };
+
+    hls.loadSource(target);
     hls.attachMedia(el);
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setVideoError('');
@@ -1573,6 +1639,14 @@ export default function RoomView() {
       // 但必须设上限：直链失效/过期时 ERROR 会反复触发，无限重试意味着
       // 既播不出画面、又永远不给提示，用户只能对着黑屏干等。
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        // 【HLS 直连优先】直连模式下的致命网络错误 → 先降级走代理重试一次，不报错。
+        // 只降级一次：降级后 usingProxy 为 true，再失败就走下面的重试 / 报错流程，
+        // 不会在「直连 ↔ 代理」之间来回震荡。
+        // 说明：hls.js 内部已对清单/分片做过多次静默重试（manifestLoadingMaxRetry /
+        // fragLoadingMaxRetry），走到 fatal 说明确实不可达或被拒，此时直接换代理最快。
+        // 跨域拦截与防盗链 403 在 hls.js 里都归为 NETWORK_ERROR（含 MANIFEST_PARSING_ERROR）。
+        if (dropToProxy()) return;
+
         hlsRetryRef.current += 1;
         if (hlsRetryRef.current <= 3) {
           hls.startLoad();
@@ -1627,12 +1701,13 @@ export default function RoomView() {
     destroyHls();
     // 增强 HLS 识别：显式标记 或 启发式判断
     const useHls = isHls || looksLikeHls(url);
-    // 【直链-1】HLS 本身已走代理，失败时不需要也不能再做「直连 → 代理」降级
+    // 【直链-1】HLS 的降级在 attachHls 内部完成（重建 HLS 实例），不走元素级 src 改写
     directIsHlsRef.current = useHls;
-    // 带宽优化：非 HLS 直链先由 <video src> 直连源站，充分利用 CDN 带宽、降低中转压力；
-    // HLS 必须走代理（hls.js 用 XHR 拉分片受跨域限制）。
-    // 直连若被防盗链拒绝，会由 onError → retryDirectViaProxy 自动降级走代理重试一次。
-    const target = useHls ? toProxiedUrl(url) : url;
+    // 带宽优化：非 HLS 直链先由 <video src> 直连源站，充分利用 CDN 带宽、降低中转压力。
+    // 【HLS 直连优先】HLS 同样先尝试直连；失败由 attachHls 内部自动降级走 /api/video-proxy
+    // （hls.js 用 XHR 拉清单/分片受跨域限制，防盗链源站也会 403，代理负责补 CORS 与同源 Referer）。
+    // 非 HLS 直连若被防盗链拒绝，会由 onError → retryDirectViaProxy 自动降级走代理重试一次。
+    const target = useHls ? hlsTargetFor(url) : url;
     const applySeekAndPlay = (e: HTMLVideoElement) => {
       if (typeof seekTo === 'number' && seekTo > 0) {
         if (e.readyState >= 1) {
@@ -1649,7 +1724,8 @@ export default function RoomView() {
       }
     };
     if (useHls && Hls.isSupported()) {
-      attachHls(el, target, seekTo);
+      // 传「原始直链」：由 attachHls 自行决定直连 / 代理，并在直连失败时自动降级重试
+      attachHls(el, url, seekTo);
     } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
       // 原生 HLS 支持（Safari）：直接交给 <video>
       el.src = target;
@@ -1671,9 +1747,11 @@ export default function RoomView() {
     directUrlRef.current = url;
     directIsHlsRef.current = useHls;
     // 带宽优化：非 HLS 直链（mp4/webm 等）先由 <video src> 直连源站播放，不经过服务器代理，
-    // 充分利用 CDN 带宽、降低服务器中转压力；HLS 必须走代理（hls.js 用 XHR 拉分片受跨域限制）。
-    // 直连失败时由 v.onerror → retryDirectViaProxy 自动降级走代理重试一次。
-    const target = useHls ? toProxiedUrl(url) : url;
+    // 充分利用 CDN 带宽、降低服务器中转压力。
+    // 【HLS 直连优先】HLS 同样先尝试直连（同样省带宽、避开同 IP 并发被源站限流），
+    // 直连失败由 attachHls 内部自动降级走 /api/video-proxy 重试一次。
+    // 非 HLS 直连失败时由 v.onerror → retryDirectViaProxy 自动降级走代理重试一次。
+    const target = useHls ? hlsTargetFor(url) : url;
 
     // 房主切页回来：若 session.hls 仍存活、attach 在同一个 video 上、且加载的还是同一
     // 条直链（url 一致），说明切页期间 HLS 一直在后台播放、进度持续推进。此时直接复用，
@@ -1681,6 +1759,8 @@ export default function RoomView() {
     // 两个 HLS 实例导致冲突（黑屏）。
     // 注意必须校验 url：若房主主动切换了新的直链，existingHls.url 与 target 不同，不能复用
     // 旧 HLS（否则会继续放旧片源），应走下方 destroyHls + 重新加载新直链的正常流程。
+    // 用 target（而非裸 url）比较：直连失败降级后实例记录的是代理地址，若再拿裸 url 比较
+    // 会永远不相等 → 每次切页回来都重建实例，白白重新缓冲。
     const existingHls = hostSessionRef.current?.hls;
     if (existingHls && existingHls.media === el && existingHls.url === target) {
       hlsRef.current = existingHls;
@@ -1703,7 +1783,8 @@ export default function RoomView() {
       }
     };
     if (useHls && Hls.isSupported()) {
-      attachHls(el, target, seekTo);
+      // 传「原始直链」：由 attachHls 自行决定直连 / 代理，并在直连失败时自动降级重试
+      attachHls(el, url, seekTo);
     } else if (useHls && el.canPlayType('application/vnd.apple.mpegurl')) {
       el.src = target;
       resumeAt(el);
