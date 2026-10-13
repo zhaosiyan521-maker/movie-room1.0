@@ -1,0 +1,58 @@
+/* ===== 【需求4A】管理员广播（房间页 / 大厅等页面顶部的循环滚动条） ===== */
+/* 样式集中在此，房间页与大厅（Layout 内所有页面）共用同一组件与同一套样式。 */
+.broadcast-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 14px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.broadcast-label {
+  flex: 0 0 auto;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.broadcast-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.broadcast-text {
+  display: inline-block;
+  white-space: nowrap;
+  /* 起点位于容器右侧之外：padding 百分比相对容器宽度计算，
+     配合 translateX(-100%)（相对自身宽度）即可完整滚出左侧。 */
+  padding-left: 100%;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.5;
+  animation-name: broadcast-scroll;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+@keyframes broadcast-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+
+/* 移动端：压缩内边距，避免占用过多首屏高度 */
+@media (max-width: 640px) {
+  .broadcast-bar {
+    padding: 6px 10px;
+    gap: 8px;
+  }
+
+  .broadcast-text {
+    font-size: 14px;
+  }
+}

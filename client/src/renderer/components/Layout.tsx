@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Outlet, Link } from 'react-router-dom';
 import { useAuthStore, api } from '../store/authStore';
+import BroadcastBar from './BroadcastBar';
+import { useBroadcast } from '../hooks/useBroadcast';
 // 走 import 让 Vite 处理资源路径，避免打包后资源路径失效 404
 import tipQrWechat from '/tip-qr-wechat.png';
 import tipQrAlipay from '/tip-qr-alipay.png';
@@ -20,6 +22,9 @@ interface Announcement {
 
 export default function Layout() {
   const { user } = useAuthStore();
+  // 【需求4A】管理员广播：全应用订阅同一个通道（一条 socket），
+  // 大厅、房间页、个人中心等所有登录后页面统一在顶部显示滚动广播条。
+  const broadcast = useBroadcast();
   const [showTip, setShowTip] = useState(false);
   // 每 7 天自动弹出一次的支持弹窗
   const [showSupportPopup, setShowSupportPopup] = useState(false);
@@ -140,6 +145,8 @@ export default function Layout() {
       </header>
 
       <main className="main-content">
+        {/* 【需求4A】管理员广播条：无广播时组件自身返回 null，不占位 */}
+        <BroadcastBar broadcast={broadcast} />
         <Outlet />
       </main>
 

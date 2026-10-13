@@ -1039,48 +1039,5 @@
   }
 }
 
-/* ===== 【需求4A】管理员广播（房间页顶部的循环滚动条） ===== */
-.broadcast-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-  padding: 8px 14px;
-  background-color: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.broadcast-label {
-  flex: 0 0 auto;
-  font-size: 16px;
-  line-height: 1;
-}
-
-.broadcast-track {
-  position: relative;
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-}
-
-.broadcast-text {
-  display: inline-block;
-  white-space: nowrap;
-  /* 起点位于容器右侧之外：padding 百分比相对容器宽度计算，
-     配合 translateX(-100%)（相对自身宽度）即可完整滚出左侧。 */
-  padding-left: 100%;
-  font-size: 16px;
-  font-weight: 600;
-  line-height: 1.5;
-  animation-name: broadcast-scroll;
-  animation-timing-function: linear;
-  animation-iteration-count: infinite;
-  will-change: transform;
-}
-
-@keyframes broadcast-scroll {
-  from { transform: translateX(0); }
-  to   { transform: translateX(-100%); }
-}
+/* ===== 【需求4A】管理员广播：样式已迁至 components/BroadcastBar.css =====
+   （广播条现在由 Layout 统一渲染，房间页与大厅共用同一个组件） */

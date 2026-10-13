@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { api, useAuthStore } from '../store/authStore';
 import { getAbsoluteApiBase, toProxiedUrl } from '../store/apiBase';
 import { getOrCreateHostSession, getHostSession, destroyHostSession, HostSession } from '../store/hostStreaming';
+import { speedToScrollDuration } from '../utils/danmakuSpeed';
 import { io, Socket } from 'socket.io-client';
 import Hls from 'hls.js';
 import './RoomView.css';
@@ -69,33 +70,6 @@ interface DanmakuItem {
   text: string;
   top: number;      // 垂直轨道位置（百分比 0~85）
   duration: number; // 滚动动画时长（秒）
-}
-
-/**
- * 【需求4A】管理员广播：一条循环滚动的文字，只在本房间页显示。
- * 由服务端经 room-joined（进房时）与 broadcast-update（管理员发布/停播时实时推送）下发，
- * 不需要轮询。永久有效，直到管理员手动停播。
- */
-interface BroadcastInfo {
-  id: string;
-  content: string;
-  color: string;
-  speed: number; // 1~5 档，与视频弹幕同口径
-}
-
-/**
- * 把 1~5 档「速度档」换算为滚动动画时长（秒）。弹幕与管理员广播共用同一口径。
- *
- * 【需求2】最高档放慢一倍：把档位速度区间由 1~5 线性压缩为 1~2.5 ——
- * 最低档（8 秒）保持不变，最高档由 1.6 秒放慢到 3.2 秒，中间档均匀过渡。
- * 之所以整体压缩而不是只改第 5 档：只改第 5 档会让它比第 4 档（2 秒）还慢，
- * 出现「档位越高反而越慢」的倒挂。
- * 各档结果：1→8.00s，2→5.82s，3→4.57s，4→3.76s，5→3.20s。
- */
-function speedToScrollDuration(level: number): number {
-  const lv = Math.max(1, Math.min(5, level));
-  const effSpeed = 1 + (lv - 1) * 0.375; // 1, 1.375, 1.75, 2.125, 2.5
-  return Math.max(1.5, 8 / effSpeed);
 }
 
 const RTC_CONFIG = {
@@ -243,10 +217,8 @@ export default function RoomView() {
   const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
   const danmakuSeqRef = useRef(0);
 
-  // ===== 【需求4A】管理员广播 =====
-  // 只在房间页显示；由服务端在「进房时」（room-joined）与「管理员发布/停播时」
-  // （broadcast-update）下发，无需轮询。
-  const [broadcast, setBroadcast] = useState<BroadcastInfo | null>(null);
+  // 注意：【需求4A】管理员广播条不在本组件渲染 —— 它由 Layout 统一渲染（房间页 + 大厅共用），
+  // 数据订阅见 hooks/useBroadcast（全应用共用一条 socket）。此处不再维护独立的广播状态。
 
   // 语音音量等级（0~1），用于头像按音量着色
   const [levelByUser, setLevelByUser] = useState<Record<string, number>>({});
@@ -652,15 +624,10 @@ export default function RoomView() {
       }
     });
 
-    // 【需求4A】管理员发布 / 停播广播时由服务端实时推送，房间内所有用户立即刷新广播条。
-    // data 为 null 表示当前没有广播（已停播），此时隐藏广播条。
-    socket.on('broadcast-update', (data: BroadcastInfo | null) => {
-      setBroadcast(data || null);
-    });
+    // 注意：【需求4A】广播的实时订阅已收敛到 Layout（hooks/useBroadcast，全应用共用一条
+    // socket），本组件不再重复监听 broadcast-update，否则会与 Layout 重复渲染广播条。
 
     socket.on('room-joined', async (data: any) => {
-      // 【需求4A】进房时服务端一并下发当前生效的广播（null 表示当前没有广播）
-      setBroadcast(data.broadcast || null);
       setOnlineUserIds(prev => {
         const next = new Set(prev);
         data.users.forEach((u: any) => u.userId && next.add(u.userId));
@@ -1969,26 +1936,7 @@ export default function RoomView() {
 
   return (
     <div className="room-view-page fade-in">
-      {/* 【需求4A】管理员广播：房间页顶部的循环滚动条。
-          仅在房间页显示；由服务端下发，永久循环滚动直到管理员手动停播。
-          速度档与视频弹幕同口径（1~5 档），颜色由管理员设置。 */}
-      {broadcast && (
-        <div className="broadcast-bar" role="marquee" aria-label="管理员广播">
-          <span className="broadcast-label">📢</span>
-          <div className="broadcast-track">
-            <div
-              key={broadcast.id}
-              className="broadcast-text"
-              style={{
-                color: broadcast.color,
-                animationDuration: `${speedToScrollDuration(broadcast.speed)}s`
-              }}
-            >
-              {broadcast.content}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 【需求4A】管理员广播条由 Layout 统一渲染（房间页 + 大厅共用），此处不再重复渲染 */}
 
       {/* 未加入状态 */}
       {!joined ? (

@@ -212,6 +212,15 @@ export function setupSocketHandlers(io: Server) {
   io.on('connection', (socket: AuthenticatedSocket) => {
     dbg(`用户连接: ${socket.username} (${socket.id})`);
 
+    // 【需求4A】连接建立时立即下发一次当前生效的广播。
+    // 大厅（房间列表）等页面只订阅、不加入房间，无法依赖 room-joined 携带广播；
+    // 有了这一条，任何页面（含房间页）刷新后无需额外请求或轮询即可显示广播条。
+    getActiveBroadcast()
+      .then((b) => socket.emit('broadcast-update', b))
+      .catch(() => {
+        /* 广播不是关键路径，读取失败静默 */
+      });
+
     // 加入房间
     socket.on('join-room', async (roomId: unknown) => {
       try {

@@ -10,6 +10,7 @@ import { roomRouter } from './routes/room';
 import { userRouter } from './routes/user';
 import { adminRouter } from './routes/admin';
 import { announcementsRouter } from './routes/announcements';
+import { broadcastRouter } from './routes/broadcast';
 import { proxyRouter } from './routes/proxy';
 import { setupSocketHandlers } from './services/signaling';
 import { ensureSeedAdmin } from './services/seedAdmin';
@@ -77,6 +78,8 @@ app.use('/api/users', userRouter);
 app.use('/api/admin', adminRouter);
 // 公告（面向登录用户）：首屏弹窗 + 按用户维度「仅显示一次」的已读记录
 app.use('/api/announcements', announcementsRouter);
+// 广播（面向所有访客）：大厅 / 房间页顶部滚动条的数据兜底读取接口（无需登录）
+app.use('/api/broadcast', broadcastRouter);
 // 网络视频直链代理（绕过跨域/防盗链）：必须在带鉴权的路由之外，因 <video> 无法附带 Bearer 令牌
 app.use('/api', proxyRouter);
 

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import axios from 'axios';
+import { resetBroadcastSocket } from './broadcastSocket';
 
 const API_BASE = '/api';
 
@@ -89,6 +90,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   logout: () => {
     localStorage.removeItem('token');
+    // 断开广播订阅连接，避免登出后仍以旧令牌维持一条长连接
+    resetBroadcastSocket();
     set({ token: null, user: null });
   },
 
