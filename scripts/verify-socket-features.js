@@ -61,7 +61,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   function watch(sock, who) {
     ['user-joined','room-joined','chat-message','voice-state','user-speaking',
      'playback-start','playback-pause','playback-stop','user-left','kicked',
-     'host-disconnected','kick-vote-request','playback-vote-request'].forEach(ev => {
+     'host-disconnected','kick-result','playback-vote-request'].forEach(ev => {
       events[who][ev] = [];
       sock.on(ev, (d) => events[who][ev].push(d));
     });
@@ -142,13 +142,11 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   check('投票通过后 B 收到暂停指令', events.B['playback-pause'].length >= 1,
     `count=${events.B['playback-pause'].length}`);
 
-  // ==================== 6. 踢人投票 ====================
-  console.log('\n[6] 踢人投票');
-  sockA.emit('kick-request', { roomId: room.id, targetUserId: userB.id });
-  await sleep(500);
-  check('B 收到被踢投票请求', events.B['kick-vote-request'].some(d => d.targetUserId === userB.id));
-  // 2 人房阈值 1，A 同意即踢出
+  // ==================== 6. 房主踢人（直接踢出） ====================
+  console.log('\n[6] 房主踢人');
+  sockA.emit('kick-user', { roomId: room.id, targetUserId: userB.id });
   await sleep(700);
+  check('全体收到踢出结果广播', events.A['kick-result'].some(d => d.targetUserId === userB.id));
   check('B 收到被踢通知', events.B['kicked'].length >= 1, `count=${events.B['kicked'].length}`);
   check('A 收到 B 离开通知', events.A['user-left'].some(d => d.userId === userB.id));
   const banned = await prisma.roomBan.findUnique({ where: { roomId_userId: { roomId: room.id, userId: userB.id } } });

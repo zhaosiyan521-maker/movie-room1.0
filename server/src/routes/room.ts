@@ -451,7 +451,7 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
       const leftMin = Math.ceil(
         (KICK_BAN_DURATION_MS - (Date.now() - new Date(ban.createdAt).getTime())) / 60000
       );
-      return res.status(403).json({ error: `你已被投票踢出该房间，还需 ${leftMin} 分钟才能再次进入` });
+      return res.status(403).json({ error: `你已被房主踢出该房间，还需 ${leftMin} 分钟才能再次进入` });
     }
 
     // 统计当前房间总人数（房主也占一个名额）

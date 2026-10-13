@@ -81,18 +81,18 @@ function check(name, cond, extra = '') {
   check('B 未入房却能伪造语音状态（应为 false）', aGotVoice === false, '语音状态被注入了！');
   check('B 未入房却能伪造说话状态（应为 false）', aGotSpeaking === false, '说话状态被注入了！');
 
-  // B 尝试操纵该房间的放映投票
+  // B 尝试操纵该房间的放映切换 / 冒充房主踢人
   let voteErr = null;
   sockB.on('error', (e) => { voteErr = e; });
   sockB.emit('playback-vote-request', { roomId: room.id, action: 'pause' });
-  sockB.emit('kick-vote', { roomId: room.id, targetUserId: userA.id, agree: true });
+  sockB.emit('kick-user', { roomId: room.id, targetUserId: userA.id });
   await new Promise(r => setTimeout(r, 800));
   const roomAfter = await prisma.room.findUnique({ where: { id: room.id }, select: { status: true } });
   const banExists = await prisma.roomBan.findUnique({
     where: { roomId_userId: { roomId: room.id, userId: userA.id } },
   });
   check('B 场外操纵放映投票无效（房间仍为 WAITING）', roomAfter.status === 'WAITING', `status=${roomAfter.status}`);
-  check('B 场外操纵踢出投票无效（未产生黑名单）', banExists === null, 'A 被场外投票踢出了！');
+  check('B 场外操纵踢人无效（未产生黑名单）', banExists === null, 'A 被场外用户踢出了！');
 
   // 合法用户 A 的消息应能正常送达
   sockA.emit('chat-message', { roomId: room.id, message: '房主消息' });

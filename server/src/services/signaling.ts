@@ -13,10 +13,7 @@ const voiceStates = new Map<string, boolean>();
 const lastChatTime = new Map<string, number>();
 // speaking 上报限流：socketId -> 上次上报时间
 const lastSpeakingAt = new Map<string, number>();
-// 踢出投票：roomId -> targetUserId -> { agrees, declines, targetName }
-const kickVotes = new Map<string, Map<string, { agrees: Set<string>; declines: Set<string>; targetName: string }>>();
-
-// 【需求4】被投票踢出后禁止再次进入该房间的时长：5 小时。
+// 【需求4】被房主踢出后禁止再次进入该房间的时长：5 小时。
 // room.ts 的「加入房间」校验复用同一常量，故导出，避免两处各写一份导致口径漂移。
 export const KICK_BAN_DURATION_MS = 5 * 60 * 60 * 1000;
 
@@ -108,25 +105,6 @@ export function disconnectUser(io: Server, userId: string, reason: string): void
   }
 }
 
-// 统计房间内「去重后的真实用户数」（按 userId 去重），避免同一用户多开标签刷高投票阈值
-function distinctUserCount(io: Server, roomId: string): number {
-  const set = roomUsers.get(roomId);
-  if (!set) return 0;
-  const users = new Set<string>();
-  for (const sid of set) {
-    const s = io.sockets.sockets.get(sid) as AuthenticatedSocket | undefined;
-    if (s?.userId) users.add(s.userId);
-  }
-  return users.size;
-}
-
-// 踢人 / 放映投票阈值：不足 5 人时 1 票即可，否则向上取整为 1/3
-function voteThreshold(total: number): number {
-  if (total <= 0) return Number.MAX_SAFE_INTEGER; // 空房间不应通过任何投票
-  if (total < 5) return 1;
-  return Math.max(1, Math.ceil(total / 3));
-}
-
 const CHAT_COOLDOWN_MS = 3000; // 每 3 秒一条
 const CHAT_MAX_LENGTH = 50;    // 每条最多 50 字
 const SPEAKING_MIN_INTERVAL_MS = 300; // speaking 上报最小间隔
@@ -189,9 +167,9 @@ export function setupSocketHandlers(io: Server) {
 
   /**
    * 校验某 socket 是否确实已加入该房间。
-   * 用于所有需要「房间成员身份」的事件：聊天、语音、投票、WebRTC 信令。
+   * 用于所有需要「房间成员身份」的事件：聊天、语音、WebRTC 信令。
    * 缺少这一步会让任意登录用户向任意房间注入事件（跨房间刷屏、伪造他人状态、
-   * 场外操纵踢出/放映投票、向他人注入 SDP/ICE 干扰其连接）。
+   * 场外操纵房主踢人、向他人注入 SDP/ICE 干扰其连接）。
    */
   function requireInRoom(socket: AuthenticatedSocket, roomId: unknown): roomId is string {
     if (typeof roomId !== 'string' || !roomId) return false;
@@ -259,7 +237,7 @@ export function setupSocketHandlers(io: Server) {
             const leftMin = Math.ceil((KICK_BAN_DURATION_MS - elapsed) / 60000);
             socket.emit('kicked', {
               roomId: roomIdStr,
-              reason: `你已被投票踢出该房间，还需 ${leftMin} 分钟才能再次进入`
+              reason: `你已被房主踢出该房间，还需 ${leftMin} 分钟才能再次进入`
             });
             return;
           }
@@ -590,10 +568,10 @@ export function setupSocketHandlers(io: Server) {
       });
     });
 
-    // ===== 房主发起踢出（房间内 1/3 的人同意即踢出） =====
+    // ===== 房主踢人（房主直接踢出，无需投票） =====
 
-    // 房主发起踢出投票
-    socket.on('kick-request', async (data: { roomId: string; targetUserId: string }) => {
+    // 房主直接踢出指定成员：立即写入 5 小时黑名单并强制其离开房间
+    socket.on('kick-user', async (data: { roomId: string; targetUserId: string }) => {
       try {
         if (!requireInRoom(socket, data?.roomId)) return;
         const { roomId, targetUserId } = data;
@@ -606,7 +584,7 @@ export function setupSocketHandlers(io: Server) {
           select: { id: true, hostId: true }
         });
         if (!room || room.hostId !== socket.userId) {
-          socket.emit('error', { message: '只有房主可以发起踢出' });
+          socket.emit('error', { message: '只有房主可以踢出成员' });
           return;
         }
 
@@ -620,14 +598,6 @@ export function setupSocketHandlers(io: Server) {
         // 保留作为防御性校验，避免日后权限再次放宽时出现漏洞。
         if (room.hostId === targetUserId) {
           socket.emit('error', { message: '房主不可被踢出' });
-          return;
-        }
-
-        // 【需求4】同一目标已有进行中的投票时禁止重复发起。
-        // 旧实现是无条件 set()：重复发起会直接覆盖并清零已有表决记录，
-        // 等于任何人都能一键重置正在进行的表决。发起被拒不扣配额。
-        if (kickVotes.get(roomId)?.has(targetUserId)) {
-          socket.emit('error', { message: '该用户的踢出投票正在进行中，请勿重复发起' });
           return;
         }
 
@@ -661,61 +631,13 @@ export function setupSocketHandlers(io: Server) {
         if (!targetUser) return;
         const targetName = targetUser.nickname || targetUser.username;
 
-        if (!kickVotes.has(roomId)) {
-          kickVotes.set(roomId, new Map());
-        }
-        kickVotes.get(roomId)!.set(targetUserId, {
-          agrees: new Set([socket.userId!]), // 房主发起即视为同意
-          declines: new Set(),
-          targetName
-        });
-        // 走到这里才算真正发起了投票，此时才扣配额（前面各种被拒的情形一律不扣）
+        // 真正执行踢出，此时才扣配额（前面各种被拒的情形一律不扣）
         quotaMap.set(socket.userId!, used + 1);
 
-        const total = distinctUserCount(io, roomId);
-        const needed = voteThreshold(total);
-        if (needed === Number.MAX_SAFE_INTEGER) return;
-
-        // 向房间内其他人（除房主和目标）发起确认弹窗
-        socket.to(roomId).emit('kick-vote-request', {
-          targetUserId,
-          targetName,
-          needed,
-          total
-        });
-
-        // 检查是否直接满足条件（比如房间只有房主和目标两人）
-        await checkKickVotes(io, roomId, targetUserId);
+        await applyKick(io, roomId, targetUserId, targetName, '房主踢出');
       } catch (error) {
-        console.error('Kick request error:', error);
-        socket.emit('error', { message: '发起踢出失败' });
-      }
-    });
-
-    // 观众回应踢出投票（是/否）
-    socket.on('kick-vote', async (data: { roomId: string; targetUserId: string; agree: boolean }) => {
-      try {
-        // 成员校验：防止场外用户操纵任意房间的踢出投票
-        if (!requireInRoom(socket, data?.roomId)) return;
-        const { roomId, targetUserId, agree } = data;
-        if (typeof targetUserId !== 'string') return;
-
-        const vote = kickVotes.get(roomId)?.get(targetUserId);
-        if (!vote) return;
-
-        // 目标本人不参与投票
-        if (socket.userId === targetUserId) return;
-
-        // 同一用户改票时从另一侧移除，避免同时计入 agrees 与 declines
-        const userId = socket.userId!;
-        vote.agrees.delete(userId);
-        vote.declines.delete(userId);
-        if (agree) vote.agrees.add(userId);
-        else vote.declines.add(userId);
-
-        await checkKickVotes(io, roomId, targetUserId);
-      } catch (error) {
-        console.error('Kick vote error:', error);
+        console.error('Kick user error:', error);
+        socket.emit('error', { message: '踢出失败' });
       }
     });
 
@@ -732,57 +654,52 @@ export function setupSocketHandlers(io: Server) {
   });
 }
 
-// 检查踢出投票是否达到 1/3 同意
-async function checkKickVotes(io: Server, roomId: string, targetUserId: string) {
-  const vote = kickVotes.get(roomId)?.get(targetUserId);
-  if (!vote) return;
+/**
+ * 执行踢出：写入 / 刷新 5 小时黑名单 → 移出房间成员 → 强制断开目标的所有连接 → 通知房间。
+ * 由房主直接踢人（kick-user）调用。
+ */
+async function applyKick(
+  io: Server,
+  roomId: string,
+  targetUserId: string,
+  targetName: string,
+  reason: string
+) {
+  // 【需求4】写入 / 刷新踢出记录。禁入有效期 KICK_BAN_DURATION_MS（5 小时）。
+  // 关键：update 必须刷新 createdAt —— 旧实现的 update 是空的 {}，
+  // 同一用户第二次被踢时 createdAt 不更新，5 小时会从上一次被踢起算，
+  // 实际禁入时长远短于预期（甚至早已过期，等于完全没有惩罚）。
+  await prisma.roomBan.upsert({
+    where: { roomId_userId: { roomId, userId: targetUserId } },
+    create: { roomId, userId: targetUserId, reason },
+    update: { createdAt: new Date(), reason }
+  });
+  await prisma.roomMember.deleteMany({
+    where: { roomId, userId: targetUserId }
+  });
 
-  const total = distinctUserCount(io, roomId);
-  const needed = voteThreshold(total);
-
-  if (needed !== Number.MAX_SAFE_INTEGER && vote.agrees.size >= needed) {
-    const targetName = vote.targetName;
-    kickVotes.get(roomId)?.delete(targetUserId);
-
-    // 【需求4】写入 / 刷新踢出记录。禁入有效期 KICK_BAN_DURATION_MS（5 小时）。
-    // 关键：update 必须刷新 createdAt —— 旧实现的 update 是空的 {}，
-    // 同一用户第二次被踢时 createdAt 不更新，5 小时会从上一次被踢起算，
-    // 实际禁入时长远短于预期（甚至早已过期，等于完全没有惩罚）。
-    await prisma.roomBan.upsert({
-      where: { roomId_userId: { roomId, userId: targetUserId } },
-      create: { roomId, userId: targetUserId, reason: '投票踢出' },
-      update: { createdAt: new Date() }
+  // 强制目标用户的所有 socket 离开房间
+  const targetSockets = Array.from(roomUsers.get(roomId) || [])
+    .filter(sid => {
+      const s = io.sockets.sockets.get(sid) as AuthenticatedSocket | undefined;
+      return s?.userId === targetUserId;
     });
-    await prisma.roomMember.deleteMany({
-      where: { roomId, userId: targetUserId }
-    });
 
-    // 强制目标用户的所有 socket 离开房间
-    const targetSockets = Array.from(roomUsers.get(roomId) || [])
-      .filter(sid => {
-        const s = io.sockets.sockets.get(sid) as AuthenticatedSocket | undefined;
-        return s?.userId === targetUserId;
-      });
-
-    for (const sid of targetSockets) {
-      const s = io.sockets.sockets.get(sid);
-      if (s) {
-        s.emit('kicked', { roomId, reason: '你已被投票踢出该房间，5 小时内无法再次进入' });
-        await leaveRoom(s as AuthenticatedSocket, roomId, io);
-      }
+  for (const sid of targetSockets) {
+    const s = io.sockets.sockets.get(sid);
+    if (s) {
+      s.emit('kicked', { roomId, reason: '你已被房主踢出该房间，5 小时内无法再次进入' });
+      await leaveRoom(s as AuthenticatedSocket, roomId, io);
     }
-
-    io.to(roomId).emit('kick-vote-result', {
-      targetUserId,
-      targetName,
-      kicked: true,
-      agrees: vote.agrees.size,
-      needed,
-      total
-    });
-
-    dbg(`用户 ${targetName} 在房间 ${roomId} 被投票踢出（同意 ${vote.agrees.size}/${total}）`);
   }
+
+  io.to(roomId).emit('kick-result', {
+    targetUserId,
+    targetName,
+    kicked: true
+  });
+
+  dbg(`用户 ${targetName} 在房间 ${roomId} 被房主踢出`);
 }
 
 async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server, voluntary = false) {
@@ -821,7 +738,6 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
     roomUsers.get(roomId)!.delete(socket.id);
     if (roomUsers.get(roomId)!.size === 0) {
       roomUsers.delete(roomId);
-      kickVotes.delete(roomId);
       roomPlaybackStates.delete(roomId);
     }
   }
@@ -847,7 +763,7 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
 
 /**
  * 房间解散后清理其在内存中的全部信令状态：
- * roomUsers/userRooms/kickVotes/播放状态缓存/语音与限流记录，以及挂起的房主宽限计时器。
+ * roomUsers/userRooms/播放状态缓存/语音与限流记录，以及挂起的房主宽限计时器。
  * dissolveRoom 只做了 socketsLeave（适配器层），不经过 leaveRoom，内存状态会残留，需显式清理。
  */
 export function purgeRoomSignalingState(roomId: string): void {
@@ -861,7 +777,6 @@ export function purgeRoomSignalingState(roomId: string): void {
     }
   }
   roomUsers.delete(roomId);
-  kickVotes.delete(roomId);
   kickQuotaUsed.delete(roomId);
   roomPlaybackStates.delete(roomId);
   for (const action of ['dissolve', 'abrupt'] as const) {

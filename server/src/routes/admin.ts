@@ -213,7 +213,7 @@ adminRouter.post('/users/:id/ban', async (req: AuthRequest, res: Response) => {
 
     // 【S6】先按「房主正常退出」的语义彻底解散其活跃房间。
     // 旧实现只做 updateMany(status: ENDED) + deleteMany(members)：既不广播 room-dissolved，
-    // 也不清理信令内存（roomUsers / roomPlaybackStates / kickVotes）。在线观众会滞留在一个
+    // 也不清理信令内存（roomUsers / roomPlaybackStates）。在线观众会滞留在一个
     // 没有房主的幽灵房间里，画面冻结且收不到任何提示。
     // 这里改为直接复用 dissolveRoom(io)：房间记录、成员、黑名单、图片一并删除，
     // 并向房间内所有在线用户广播 room-dissolved 后将其请出信令房间。

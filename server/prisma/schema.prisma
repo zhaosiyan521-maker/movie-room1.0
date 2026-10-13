@@ -88,7 +88,7 @@ model RoomMember {
   @@map("room_members")
 }
 
-// 房间黑名单（被投票踢出的用户，本场电影禁止再次进入；房间解散时清除）
+// 房间黑名单（被房主踢出的用户，5 小时内禁止再次进入；房间解散时清除）
 model RoomBan {
   id          String    @id @default(uuid())
   roomId      String
