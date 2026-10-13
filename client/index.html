@@ -9,10 +9,22 @@
       内容安全策略：限制脚本与资源来源，降低注入类漏洞的利用面。
       connect-src 需包含 ws: 以便 WebRTC 信令（socket.io）在开发/生产环境连接。
       media-src blob: 用于播放本地视频与 HLS 分片。
+
+      【重要修复】connect-src / media-src 必须放开 http: 与 https:。
+      本产品的核心功能是「用户粘贴任意网络视频直链，在各自本地直连播放」，源站
+      由用户决定、无法预先枚举。而原策略：
+        connect-src 'self' ws: wss: http://localhost:3001 http://127.0.0.1:3001
+      没有 http:/https:，导致 hls.js 用 XHR 直连第三方 .m3u8 时被浏览器直接阻断
+      （报 "violates ... connect-src ... The action has been blocked"），hls.js 随即
+      抛 fatal error → 观众端永久黑屏。同理 media-src 缺少 http:/https: 会阻断
+      <video src> 直连第三方 mp4/webm，迫使其静默降级走 /api/video-proxy
+      （即「直连省带宽」从未真正生效）。
+      说明：script-src 'self' 仍然拦截注入脚本，故放开 connect/media 的跨域是
+      可控的取舍；换来的才是「不占服务器带宽」这一设计目标。
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' ws: wss: http://localhost:3001 http://127.0.0.1:3001; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob: http: https:; connect-src 'self' ws: wss: http: https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     />
   </head>
   <body>
