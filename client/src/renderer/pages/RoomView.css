@@ -715,6 +715,13 @@
   width: 100%;
 }
 
+/* 【播放源持久化】「设为播放源」成功写入房间记录后的短提示 */
+.source-saved-tip {
+  color: var(--success-color);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 /* 静音 / 踢出 固定菜单（顶层，不被头像栏裁剪） */
 .menu-backdrop {
   position: fixed;

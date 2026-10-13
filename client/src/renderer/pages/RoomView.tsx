@@ -241,6 +241,10 @@ export default function RoomView() {
   const [urlInput, setUrlInput] = useState('');
   // 视频加载错误提示：网络直链可能因跨域/失效而失败，需要明确反馈而非"点了没反应"
   const [videoError, setVideoError] = useState('');
+  // 【播放源持久化】点「设为播放源」后服务端回执"已保存到房间"的短提示。
+  // 该直链保存在房间记录里，暂停/结束放映/刷新/切页都不会丢，只有解散房间才消失。
+  const [sourceSavedTip, setSourceSavedTip] = useState(false);
+  const sourceSavedTimerRef = useRef<number | null>(null);
 
   // 电影播放完毕：房主弹窗「是否解散该房间」
   const [endedPrompt, setEndedPrompt] = useState(false);
@@ -628,6 +632,21 @@ export default function RoomView() {
     // socket），本组件不再重复监听 broadcast-update，否则会与 Layout 重复渲染广播条。
 
     socket.on('room-joined', async (data: any) => {
+      // 【播放源持久化】先把服务端保存的播放源回填到本地状态 / 输入框。
+      // 关键：这一步与「房主是否正在放映」**无关**。旧实现只在 playbackState.playing
+      // 为 true 时才回填直链，而房主一暂停服务端就会把内存里的 playing 置为 false，
+      // 于是房主暂停后刷新页面 / 切页回来时，输入框回落到「尚未设置播放源」——
+      // 看起来就像"一暂停播放源就被清除了"。播放源落库在 rooms.sourceUrl，
+      // 只在房间被解散时才消失，这里无条件恢复。
+      if (typeof data.savedSource?.videoUrl === 'string' && data.savedSource.videoUrl) {
+        const savedUrl = data.savedSource.videoUrl;
+        setRemotePlayUrl(savedUrl);
+        // 输入框仅在为空时预填，避免覆盖用户正在编辑的内容
+        setUrlInput(prev => prev || savedUrl);
+        setUsingRemoteUrl(true);
+        usingRemoteUrlRef.current = true;
+      }
+
       setOnlineUserIds(prev => {
         const next = new Set(prev);
         data.users.forEach((u: any) => u.userId && next.add(u.userId));
@@ -692,10 +711,10 @@ export default function RoomView() {
               // 传入当前进度，重载后追回，避免从 0 重新播放导致与观众进度脱节
               loadLocalUrl(ps.videoUrl, !!ps.isHls, typeof ps.currentTime === 'number' ? ps.currentTime : 0);
             } else {
-              // 本地文件模式：session.video 的 src 仍在（切页未 revoke），只需恢复播放
-              usingRemoteUrlRef.current = false;
-              setUsingRemoteUrl(false);
-              setRemotePlayUrl('');
+              // 历史遗留的「本地文件模式」分支（当前产品只支持网络直链，正常不会走到这里）：
+              // session.video 的 src 仍在（切页未 revoke），只需恢复播放。
+              // 注意**不清空 remotePlayUrl** —— 播放源是房主设定的持久数据，
+              // 不因走了哪条分支而丢失。
               if (lv.src || lv.currentSrc) {
                 lv.play().catch(() => setNeedClickPlay(true));
               }
@@ -852,6 +871,19 @@ export default function RoomView() {
       isPlayingRef.current = false;
       remoteVideoRef.current?.pause();
       localVideoRef.current?.pause();
+    });
+
+    // 【播放源持久化】服务端确认「播放源已写入房间记录」，给房主一个明确的成功反馈。
+    // 服务端校验失败（非法协议/超长）时会走 error 事件，这里只处理成功回执。
+    socket.on('source-saved', (data: any) => {
+      if (typeof data?.videoUrl === 'string' && data.videoUrl) {
+        setRemotePlayUrl(data.videoUrl);
+        setUsingRemoteUrl(true);
+        usingRemoteUrlRef.current = true;
+      }
+      setSourceSavedTip(true);
+      if (sourceSavedTimerRef.current) clearTimeout(sourceSavedTimerRef.current);
+      sourceSavedTimerRef.current = window.setTimeout(() => setSourceSavedTip(false), 3000);
     });
 
     // 房主拖动进度条 seek 后，观众跟随 seek（进度差拉大的主因修复）。
@@ -2296,9 +2328,31 @@ export default function RoomView() {
                     value={urlInput}
                     onChange={(e) => setUrlInput(e.target.value)}
                   />
-                  <button className="btn btn-secondary btn-sm" onClick={() => setRemotePlayUrl(urlInput.trim())}>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => {
+                      const url = urlInput.trim();
+                      if (!url) { alert('请先粘贴视频直链'); return; }
+                      // 本地立即生效：输入框/播放按钮的可用状态
+                      setRemotePlayUrl(url);
+                      setUsingRemoteUrl(true);
+                      usingRemoteUrlRef.current = true;
+                      // 【播放源持久化】同时写入该房间的数据库记录：
+                      // 此后暂停、结束放映、刷新页面、切页、服务重启都不会丢，
+                      // 只有房间被解散时播放源才会随之消失。
+                      socketRef.current?.emit('host-set-source', {
+                        roomId: id,
+                        videoUrl: url,
+                        isHls: looksLikeHls(url),
+                        resolution: getResolution()
+                      });
+                    }}
+                  >
                     设为播放源
                   </button>
+                  {sourceSavedTip && (
+                    <span className="source-saved-tip">✅ 已保存到房间</span>
+                  )}
                 </div>
 
                 {!isPlaying ? (

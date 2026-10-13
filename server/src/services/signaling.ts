@@ -307,21 +307,29 @@ export function setupSocketHandlers(io: Server) {
             };
           });
 
+        // 【播放源持久化】这里**始终**查一次房间的播放源字段，无论内存缓存是否命中。
+        // 原因：内存里的 playbackState 只表示「此刻是否正在放映」，房主一暂停它就把
+        // playing 置为 false；若只在「内存未命中」时才查库，房主暂停后刷新/切页回来
+        // 就再也拿不到自己刚设好的直链，界面回落到「尚未设置播放源」——
+        // 这正是「房主一暂停播放源就没了」的根因。
+        // 播放源存在 rooms.sourceUrl 列（房主「设为播放源」时即落库），
+        // 只有房间被解散（记录删除）时才会随之消失。
+        const dbRoom = await prisma.room.findUnique({
+          where: { id: roomIdStr },
+          select: {
+            status: true,
+            sourceUrl: true,
+            sourceIsHls: true,
+            sourceResolution: true,
+            lastPositionMs: true
+          }
+        });
+
         // 若房间正在放映，把当前播放状态一并下发，让新观众立即续播而非「等待房主开始播放」。
         // 【需求1】内存未命中时回落到数据库：内存缓存会因服务重启、房主刷新页面
         // （房间瞬间无人）等原因丢失，但播放源已落库，新观众仍应拿到直链续播。
         let playbackState: RoomPlaybackState | null = roomPlaybackStates.get(roomIdStr) || null;
         if (!playbackState) {
-          const dbRoom = await prisma.room.findUnique({
-            where: { id: roomIdStr },
-            select: {
-              status: true,
-              sourceUrl: true,
-              sourceIsHls: true,
-              sourceResolution: true,
-              lastPositionMs: true
-            }
-          });
           // 只有「房间确实处于放映中」且「库中留有播放源」时才回落。
           // 否则会把房主已「结束放映」的房间错误地恢复成正在播放。
           if (dbRoom && dbRoom.status === 'PLAYING' && dbRoom.sourceUrl) {
@@ -338,6 +346,17 @@ export function setupSocketHandlers(io: Server) {
           }
         }
 
+        // 【播放源持久化】与「是否正在放映」无关，单独下发房主已保存的播放源。
+        // 前端据此回填「设为播放源」输入框 —— 房主暂停、刷新、切页、重进房间后，
+        // 直链依然在，不需要重新粘贴。房间解散后记录被删除，这里自然是 null。
+        const savedSource = dbRoom?.sourceUrl
+          ? {
+              videoUrl: dbRoom.sourceUrl,
+              isHls: dbRoom.sourceIsHls,
+              resolution: dbRoom.sourceResolution
+            }
+          : null;
+
         // 【需求4A】随 room-joined 一并下发当前生效的广播：
         // 新进房用户无需额外请求或轮询即可看到广播条。
         const broadcast = await getActiveBroadcast();
@@ -348,6 +367,7 @@ export function setupSocketHandlers(io: Server) {
           userCount: roomUsers.get(roomIdStr)?.size || 0,
           selfSocketId: socket.id,
           playbackState,
+          savedSource,
           broadcast
         });
 
@@ -463,6 +483,56 @@ export function setupSocketHandlers(io: Server) {
       lastPositionPersistAt.set(room.id, Date.now());
     });
 
+    // 【播放源持久化】房主「设为播放源」：直链一经设定就立即写进房间记录，
+    // 不依赖是否已经开始播放。
+    // 用户需求：播放源保存在该房间，之后暂停、结束放映、刷新页面、切页、
+    // 服务重启都不会丢；只有房间被解散（记录删除）时才随之消失。
+    // 与 host-start-play 的区别：本事件**不改变房间状态**（房间可以仍是等待中），
+    // 也不向观众下发播放指令，只做「把源存下来」这一件事。
+    socket.on('host-set-source', async (data: { roomId: string; videoUrl: string; isHls?: boolean; resolution?: string }) => {
+      const room = await requireHost(socket, data?.roomId);
+      if (!room) return;
+
+      const url = typeof data?.videoUrl === 'string' ? data.videoUrl.trim() : '';
+      // 与 host-start-play 同一套校验口径：非法协议、超长地址一律拒绝，
+      // 避免把注定播放不了的地址写进库里、让观众一起失败。
+      if (!/^https?:\/\//i.test(url)) {
+        socket.emit('error', { message: '视频地址格式无效（仅支持 http/https）' });
+        return;
+      }
+      if (url.length > 8000) {
+        socket.emit('error', { message: '视频直链过长（超过 8000 字符），无法保存' });
+        return;
+      }
+
+      const isHls = !!data.isHls;
+      const resolution = typeof data.resolution === 'string' ? data.resolution.slice(0, 20) : null;
+
+      await prisma.room.update({
+        where: { id: room.id },
+        data: {
+          sourceUrl: url,
+          sourceIsHls: isHls,
+          sourceResolution: resolution,
+          sourceUpdatedAt: new Date()
+        }
+      }).catch((e) => console.error('保存播放源失败:', e));
+
+      // 房间此刻若正在放映，同步内存缓存里的直链（换源不换房的场景），
+      // 保证新加入的观众拿到的是房主最新设定的源。
+      const st = roomPlaybackStates.get(room.id);
+      if (st) {
+        st.videoUrl = url;
+        st.isHls = isHls;
+        st.resolution = resolution;
+      }
+
+      // 回执：前端据此给出「已保存到房间」的明确反馈，
+      // 避免房主以为点了没生效、反复点。
+      socket.emit('source-saved', { roomId: room.id, videoUrl: url, isHls, resolution });
+      dbg(`房主为房间 ${room.id} 保存了播放源`);
+    });
+
     // 房主恢复播放（暂停后由房主恢复，无需投票）
     socket.on('host-resume', async (data: { roomId: string }) => {
       const room = await requireHost(socket, data?.roomId);
@@ -494,22 +564,19 @@ export function setupSocketHandlers(io: Server) {
       const room = await requireHost(socket, data?.roomId);
       if (!room) return;
 
-      // 清空播放状态缓存，房间回到等待状态
+      // 清空内存中的「正在放映」状态缓存，房间回到等待状态
       roomPlaybackStates.delete(room.id);
-      // 【需求1】房主主动「结束放映」是预期行为，此时连同数据库中的播放源一并清除，
-      // 保持「结束放映 = 本场放映源作废」的语义一致（与房间解散时的清理口径相同）。
       lastPositionPersistAt.delete(room.id);
 
+      // 【播放源持久化】「结束放映」只结束本场放映，**不清除播放源**。
+      // 播放源一旦被房主「设为播放源」就保存在 rooms.sourceUrl，
+      // 只有房间被解散（记录删除）时才会消失 —— 这是用户明确要求的语义。
+      // 若在这里清库，房主结束一场后再想放同一部片就得重新粘贴直链。
+      // 注意：status 改回 WAITING 后，join-room 的 DB 回落条件
+      // （status==='PLAYING' && sourceUrl）不再成立，新观众不会被误拉进放映。
       await prisma.room.update({
         where: { id: room.id },
-        data: {
-          status: 'WAITING',
-          sourceUrl: null,
-          sourceIsHls: false,
-          sourceResolution: null,
-          sourceUpdatedAt: null,
-          lastPositionMs: 0
-        }
+        data: { status: 'WAITING' }
       }).catch(() => {});
 
       // 广播给观众（含房主自己，房主端也会收到 playback-stop 同步 isPlaying）
