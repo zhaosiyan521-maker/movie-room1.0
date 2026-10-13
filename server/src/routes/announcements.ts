@@ -53,11 +53,13 @@ announcementsRouter.post('/:id/read', async (req: AuthRequest, res: Response) =>
       return res.status(404).json({ error: '公告不存在' });
     }
 
-    await prisma.announcementRead.upsert({
-      where: { announcementId_userId: { announcementId: id, userId } },
-      create: { announcementId: id, userId },
-      update: {}
-    });
+    // 直接 create，重复点击时由 (announcementId, userId) 唯一约束兜底。
+    // 不用 upsert 的 `update: {}`：空 update 在部分 Prisma 版本会报
+    // "Argument `update` needs at least one field"；而用带字段的 update 又会刷新
+    // 首次已读时间。这里 catch 掉唯一约束冲突，语义正好是「已读过则保持原记录」。
+    await prisma.announcementRead.create({
+      data: { announcementId: id, userId }
+    }).catch(() => { /* 已读过（P2002 唯一约束冲突）→ 幂等忽略 */ });
 
     res.json({ ok: true });
   } catch (error) {
