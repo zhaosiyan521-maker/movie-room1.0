@@ -295,3 +295,230 @@
 .admin-room-dissolve {
   flex-shrink: 0;
 }
+
+/* ===== 【需求3】后台功能折叠面板 ===== */
+.admin-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.admin-tools-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  color: var(--text-primary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.admin-tools-toggle:hover {
+  border-color: var(--primary-color);
+}
+
+.admin-tools-title {
+  font-weight: 600;
+}
+
+/* 折叠状态下依旧显示当前功能，用户不必展开就能确认自己在看哪一项 */
+.admin-tools-current {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.admin-tools-chev {
+  font-size: 12px;
+  color: var(--text-secondary);
+  transition: transform 0.2s ease;
+}
+
+.admin-tools-chev.open {
+  transform: rotate(180deg);
+}
+
+.admin-tools-panel {
+  flex-wrap: wrap;
+}
+
+/* ===== 【需求4A/4B】广播 / 公告面板 ===== */
+.admin-broadcast-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.publish-mode-bar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.admin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-form h3 {
+  margin-bottom: 2px;
+}
+
+.admin-form-hint {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+  margin-bottom: 8px;
+}
+
+.admin-textarea {
+  resize: vertical;
+  min-height: 72px;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.admin-form-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+/* 颜色选择：预设色块 + 系统取色器 */
+.color-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.color-swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid var(--border-color);
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.color-swatch:hover {
+  transform: scale(1.1);
+}
+
+.color-swatch.active {
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 2px rgba(124, 77, 255, 0.3);
+}
+
+.color-input {
+  width: 40px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.color-value {
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.speed-range {
+  width: 100%;
+  max-width: 320px;
+  accent-color: var(--primary-color);
+}
+
+/* 当前广播的回显 */
+.current-broadcast {
+  margin-top: 16px;
+  padding: 14px 16px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+}
+
+.current-broadcast-title {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.current-broadcast-text {
+  font-size: 16px;
+  font-weight: 600;
+  word-break: break-word;
+  line-height: 1.6;
+}
+
+.current-broadcast-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.current-broadcast-empty {
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* 历史公告列表 */
+.announcement-history {
+  margin-top: 20px;
+  border-top: 1px solid var(--border-color);
+  padding-top: 16px;
+}
+
+.announcement-history-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.announcement-history-item {
+  padding: 12px 14px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+
+.announcement-history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.announcement-history-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.announcement-history-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.announcement-history-content {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}

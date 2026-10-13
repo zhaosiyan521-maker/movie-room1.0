@@ -35,6 +35,11 @@ interface RoomPlaybackState {
 }
 const roomPlaybackStates = new Map<string, RoomPlaybackState>();
 
+// 【需求1】播放位置落库节流：sync-progress 每 2 秒触发一次，若每次都写库会造成
+// 无谓的磁盘写入。这里最多每 30 秒把当前进度写一次（拖动进度条时立即写，见 host-seek）。
+const POSITION_PERSIST_INTERVAL_MS = 30_000;
+const lastPositionPersistAt = new Map<string, number>();
+
 // 房主断线宽限期：刷新页面/网络抖动时旧 socket 断开，但房主很快会重连。
 // 宽限期内房主重新上线则取消解散/放映中断处理，避免「刷新页面房间就消失」。
 const HOST_GRACE_MS = 20_000;
@@ -293,15 +298,48 @@ export function setupSocketHandlers(io: Server) {
             };
           });
 
-        // 若房间正在放映，把当前播放状态一并下发，让新观众立即续播而非「等待房主开始播放」
-        const playbackState = roomPlaybackStates.get(roomIdStr) || null;
+        // 若房间正在放映，把当前播放状态一并下发，让新观众立即续播而非「等待房主开始播放」。
+        // 【需求1】内存未命中时回落到数据库：内存缓存会因服务重启、房主刷新页面
+        // （房间瞬间无人）等原因丢失，但播放源已落库，新观众仍应拿到直链续播。
+        let playbackState: RoomPlaybackState | null = roomPlaybackStates.get(roomIdStr) || null;
+        if (!playbackState) {
+          const dbRoom = await prisma.room.findUnique({
+            where: { id: roomIdStr },
+            select: {
+              status: true,
+              sourceUrl: true,
+              sourceIsHls: true,
+              sourceResolution: true,
+              lastPositionMs: true
+            }
+          });
+          // 只有「房间确实处于放映中」且「库中留有播放源」时才回落。
+          // 否则会把房主已「结束放映」的房间错误地恢复成正在播放。
+          if (dbRoom && dbRoom.status === 'PLAYING' && dbRoom.sourceUrl) {
+            playbackState = {
+              playing: true,
+              videoUrl: dbRoom.sourceUrl,
+              isHls: dbRoom.sourceIsHls,
+              resolution: dbRoom.sourceResolution,
+              currentTime: Math.max(0, (dbRoom.lastPositionMs || 0) / 1000),
+              duration: 0
+            };
+            // 回填内存缓存，后续同一房间的加入不再重复查库
+            roomPlaybackStates.set(roomIdStr, playbackState);
+          }
+        }
+
+        // 【需求4A】随 room-joined 一并下发当前生效的广播：
+        // 新进房用户无需额外请求或轮询即可看到广播条。
+        const broadcast = await getActiveBroadcast();
 
         socket.emit('room-joined', {
           roomId: roomIdStr,
           users: usersInRoom,
           userCount: roomUsers.get(roomIdStr)?.size || 0,
           selfSocketId: socket.id,
-          playbackState
+          playbackState,
+          broadcast
         });
 
         dbg(`${socket.username} 加入了房间 ${roomIdStr}`);
@@ -400,9 +438,20 @@ export function setupSocketHandlers(io: Server) {
           // 200 字符校验不一致。网络直链模式下 movieName 传的是整条 URL（可能很长），
           // 未截断会直接把超长字符串写进 currentMovie 字段并展示在房间列表上。
           currentMovie:
-            typeof data.movieName === 'string' ? data.movieName.slice(0, 200) : null
+            typeof data.movieName === 'string' ? data.movieName.slice(0, 200) : null,
+          // 【需求1】播放源落库：使直链不再只活在内存里。
+          // 服务重启（内存清空）、房主刷新页面（房间瞬间无人触发缓存清理）之后，
+          // 新观众加入仍能从数据库回落到这条直链并续播。
+          sourceUrl: typeof data.videoUrl === 'string' ? data.videoUrl : null,
+          sourceIsHls: !!data.isHls,
+          sourceResolution: typeof data.resolution === 'string' ? data.resolution.slice(0, 20) : null,
+          sourceUpdatedAt: new Date(),
+          lastPositionMs: 0
         }
       }).catch(console.error);
+
+      // 换片后位置从 0 开始，节流计时同步重置
+      lastPositionPersistAt.set(room.id, Date.now());
     });
 
     // 房主恢复播放（暂停后由房主恢复，无需投票）
@@ -438,10 +487,20 @@ export function setupSocketHandlers(io: Server) {
 
       // 清空播放状态缓存，房间回到等待状态
       roomPlaybackStates.delete(room.id);
+      // 【需求1】房主主动「结束放映」是预期行为，此时连同数据库中的播放源一并清除，
+      // 保持「结束放映 = 本场放映源作废」的语义一致（与房间解散时的清理口径相同）。
+      lastPositionPersistAt.delete(room.id);
 
       await prisma.room.update({
         where: { id: room.id },
-        data: { status: 'WAITING' }
+        data: {
+          status: 'WAITING',
+          sourceUrl: null,
+          sourceIsHls: false,
+          sourceResolution: null,
+          sourceUpdatedAt: null,
+          lastPositionMs: 0
+        }
       }).catch(() => {});
 
       // 广播给观众（含房主自己，房主端也会收到 playback-stop 同步 isPlaying）
@@ -463,6 +522,18 @@ export function setupSocketHandlers(io: Server) {
       if (st) {
         st.currentTime = Math.max(0, currentTime);
         st.duration = Math.max(0, duration);
+      }
+
+      // 【需求1】进度落库（节流 30 秒）。sync-progress 每 2 秒一次，逐次写库没有必要；
+      // 节流后即使服务重启，新观众也能续播到接近的位置，而不是从 0 开始。
+      const nowMs = Date.now();
+      const lastPersist = lastPositionPersistAt.get(room.id) || 0;
+      if (nowMs - lastPersist >= POSITION_PERSIST_INTERVAL_MS) {
+        lastPositionPersistAt.set(room.id, nowMs);
+        prisma.room.update({
+          where: { id: room.id },
+          data: { lastPositionMs: Math.max(0, Math.round(currentTime * 1000)) }
+        }).catch(() => {});
       }
 
       // 温和的周期纠偏：广播给在线观众，但客户端只在进度差 > 2 秒时才 seek，
@@ -487,6 +558,14 @@ export function setupSocketHandlers(io: Server) {
       if (st) {
         st.currentTime = Math.max(0, currentTime);
       }
+
+      // 【需求1】拖动进度条属于低频且有意义的操作，立即落库（并重置节流计时），
+      // 避免服务重启后进度回退到上一次 30 秒节拍的位置。
+      lastPositionPersistAt.set(room.id, Date.now());
+      prisma.room.update({
+        where: { id: room.id },
+        data: { lastPositionMs: Math.max(0, Math.round(currentTime * 1000)) }
+      }).catch(() => {});
 
       // 广播给观众（不含房主本人，房主本地已经 seek 到位）
       socket.to(room.id).emit('playback-seek', {
@@ -738,7 +817,11 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
     roomUsers.get(roomId)!.delete(socket.id);
     if (roomUsers.get(roomId)!.size === 0) {
       roomUsers.delete(roomId);
-      roomPlaybackStates.delete(roomId);
+      // 【需求1】此处**不再**清空播放状态缓存。
+      // 旧实现在房间内人数归零时 delete，导致房主刷新页面的那一瞬间（房间只剩他一人）
+      // 播放源就被丢弃，新观众加入后拿不到直链。播放源只在房主「结束放映」
+      // 或房间被解散时才清除。
+      lastPositionPersistAt.delete(roomId);
     }
   }
 
@@ -779,6 +862,7 @@ export function purgeRoomSignalingState(roomId: string): void {
   roomUsers.delete(roomId);
   kickQuotaUsed.delete(roomId);
   roomPlaybackStates.delete(roomId);
+  lastPositionPersistAt.delete(roomId);
   for (const action of ['dissolve', 'abrupt'] as const) {
     const key = `${roomId}:${action}`;
     const t = pendingHostLeaves.get(key);
@@ -793,13 +877,17 @@ export function purgeRoomSignalingState(roomId: string): void {
 // 需求变更：允许房主随意中断放映，不再累计中断次数、不再封禁账号或 IP。
 async function handleHostAbruptLeave(io: Server, roomId: string, hostUserId: string) {
   try {
-    // 结束本场放映，房间回到等待状态
+    // 结束本场放映，房间回到等待状态。
+    // 【需求1】注意：这里**不清空数据库中的播放源**。房主只是断线（网络抖动、电脑休眠、
+    // 切后台超时），房间本身并未解散，直链应当保留下来，只是内存中的「正在放映」状态
+    // 被清掉（房主不在，放映确实已停止）。
     await prisma.room.update({
       where: { id: roomId },
       data: { status: 'WAITING' }
     }).catch(() => {});
 
-    roomPlaybackStates.delete(roomId); // 放映中断，清空播放状态
+    roomPlaybackStates.delete(roomId); // 放映中断，清空内存播放状态（数据库中播放源保留）
+    lastPositionPersistAt.delete(roomId);
 
     io.to(roomId).emit('host-disconnected', {
       message: '房主连接中断，放映已结束'
@@ -821,4 +909,42 @@ function handleDisconnect(socket: AuthenticatedSocket, io: Server) {
   lastSpeakingAt.delete(socket.id);
   voiceStates.delete(socket.id);
   dbg(`用户断开连接: ${socket.username} (${socket.id})`);
+}
+
+// ===== 【需求4A】广播下发 =====
+
+export interface BroadcastPayload {
+  id: string;
+  content: string;
+  color: string;
+  speed: number;
+  createdAt: Date;
+}
+
+/**
+ * 读取当前生效的广播（最新发布且 active 的一条），没有则返回 null。
+ * 广播沿用「弹幕」的产品语义：一条循环滚动的文字，永久有效直到管理员手动停播。
+ */
+export async function getActiveBroadcast(): Promise<BroadcastPayload | null> {
+  try {
+    return await prisma.broadcast.findFirst({
+      where: { active: true },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, content: true, color: true, speed: true, createdAt: true }
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把最新广播实时推送给所有在线连接。
+ * 由管理员发布 / 停播接口调用；客户端收到 `broadcast-update` 后立即刷新广播条，
+ * 因此不需要轮询。传 null 表示当前没有广播（客户端据此隐藏）。
+ */
+export async function pushBroadcastUpdate(): Promise<void> {
+  const io = ioRef;
+  if (!io) return;
+  const broadcast = await getActiveBroadcast();
+  io.emit('broadcast-update', broadcast);
 }

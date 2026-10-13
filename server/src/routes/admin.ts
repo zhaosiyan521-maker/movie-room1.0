@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { prisma } from '../config/database';
 import { authMiddleware, adminMiddleware, AuthRequest } from '../middleware/auth';
-import { getIO, disconnectUser } from '../services/signaling';
+import { getIO, disconnectUser, pushBroadcastUpdate } from '../services/signaling';
 import { dissolveRoom } from '../services/roomDissolve';
 
 export const adminRouter = Router();
@@ -415,5 +415,142 @@ adminRouter.delete('/banned-ips/:id', async (req: AuthRequest, res: Response) =>
   } catch (error) {
     console.error('Admin delete banned ip error:', error);
     res.status(500).json({ error: '解除 IP 封禁失败' });
+  }
+});
+
+// ============================================================
+// 【需求4A】广播
+//   一条循环滚动的弹幕，只出现在观影房间页。永久有效，直到管理员手动停播。
+//   下发不走轮询：房间页本身已有 socket 连接，发布后由服务端主动推送。
+// ============================================================
+
+// 广播内容与颜色/速度的合法范围（速度与视频弹幕同口径：1~5 档）
+const BROADCAST_MAX_LEN = 200;
+const BROADCAST_SPEED_MIN = 1;
+const BROADCAST_SPEED_MAX = 5;
+
+// 发布广播。同一时间只保留一条生效广播——发布新的会自动停用旧的。
+adminRouter.post('/broadcast', async (req: AuthRequest, res: Response) => {
+  try {
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) {
+      return res.status(400).json({ error: '广播内容不能为空' });
+    }
+    if (content.length > BROADCAST_MAX_LEN) {
+      return res.status(400).json({ error: `广播内容不能超过 ${BROADCAST_MAX_LEN} 字` });
+    }
+
+    // 颜色：仅接受 #RGB / #RRGGBB / #RRGGBBAA 形式的十六进制，非法值回退为白色
+    const rawColor = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
+    const color = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(rawColor)
+      ? rawColor
+      : '#ffffff';
+
+    // 速度档位：非整数 / 越界一律回退为默认 3 档，避免把非法值写进库
+    const speedRaw = Number(req.body?.speed);
+    const speed = Number.isInteger(speedRaw) && speedRaw >= BROADCAST_SPEED_MIN && speedRaw <= BROADCAST_SPEED_MAX
+      ? speedRaw
+      : 3;
+
+    await prisma.broadcast.updateMany({
+      where: { active: true },
+      data: { active: false, stoppedAt: new Date() }
+    });
+
+    const broadcast = await prisma.broadcast.create({
+      data: { content, color, speed, createdBy: req.user!.id }
+    });
+
+    // 实时推送给所有在线（房间页）用户，无需等下一次刷新
+    await pushBroadcastUpdate();
+
+    res.json({ message: '广播已发布', broadcast });
+  } catch (error) {
+    console.error('Admin create broadcast error:', error);
+    res.status(500).json({ error: '发布广播失败' });
+  }
+});
+
+// 停播广播（房间页的广播条随即消失并停止滚动）
+adminRouter.post('/broadcast/stop', async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await prisma.broadcast.updateMany({
+      where: { active: true },
+      data: { active: false, stoppedAt: new Date() }
+    });
+    await pushBroadcastUpdate();
+    res.json({ message: result.count > 0 ? '广播已停播' : '当前没有正在播放的广播' });
+  } catch (error) {
+    console.error('Admin stop broadcast error:', error);
+    res.status(500).json({ error: '停播广播失败' });
+  }
+});
+
+// 查询当前生效的广播（后台展示状态用）
+adminRouter.get('/broadcast', async (_req: AuthRequest, res: Response) => {
+  try {
+    const broadcast = await prisma.broadcast.findFirst({
+      where: { active: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json({ broadcast });
+  } catch (error) {
+    console.error('Admin get broadcast error:', error);
+    res.status(500).json({ error: '获取广播失败' });
+  }
+});
+
+// ============================================================
+// 【需求4B】公告
+//   首屏弹窗形式下发，每名登录用户对同一条公告只显示一次。
+// ============================================================
+
+const ANNOUNCEMENT_MAX_LEN = 2000;
+
+// 发布公告
+adminRouter.post('/announcements', async (req: AuthRequest, res: Response) => {
+  try {
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 100) : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) {
+      return res.status(400).json({ error: '公告内容不能为空' });
+    }
+    if (content.length > ANNOUNCEMENT_MAX_LEN) {
+      return res.status(400).json({ error: `公告内容不能超过 ${ANNOUNCEMENT_MAX_LEN} 字` });
+    }
+
+    const announcement = await prisma.announcement.create({
+      data: {
+        title: title || null,
+        content,
+        createdBy: req.user!.id
+      }
+    });
+
+    res.json({ message: '公告已发布，用户下次访问时可见', announcement });
+  } catch (error) {
+    console.error('Admin create announcement error:', error);
+    res.status(500).json({ error: '发布公告失败' });
+  }
+});
+
+// 公告列表（含已读人数，便于管理员判断送达情况）
+adminRouter.get('/announcements', async (_req: AuthRequest, res: Response) => {
+  try {
+    const announcements = await prisma.announcement.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        title: true,
+        content: true,
+        createdAt: true,
+        _count: { select: { reads: true } }
+      }
+    });
+    res.json({ announcements });
+  } catch (error) {
+    console.error('Admin get announcements error:', error);
+    res.status(500).json({ error: '获取公告列表失败' });
   }
 });

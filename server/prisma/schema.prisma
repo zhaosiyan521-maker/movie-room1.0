@@ -65,6 +65,20 @@ model Room {
   status          String          @default("WAITING")
   currentMovie    String?         // 当前播放的电影名（仅作显示）
 
+  // ===== 【需求1】播放源持久化 =====
+  // 背景：播放源此前只活在服务器内存（roomPlaybackStates），因此服务重启、
+  // 房主刷新页面（房间内连接数瞬间归零）、房主短暂断线超过宽限期都会把直链弄丢，
+  // 表现为「房间还在、但新观众拿不到播放地址」。
+  // 这里把播放源落库，内存仅作缓存；内存未命中时回落到数据库。
+  // sourceUrl 为 null 表示当前房间没有播放源（未开始播放，或房主已「结束放映」）。
+  sourceUrl        String?
+  sourceIsHls      Boolean         @default(false)
+  sourceResolution String?
+  sourceUpdatedAt  DateTime?
+  // 最近一次同步的播放位置（毫秒）。由 sync-progress（节流）与 host-seek 写入，
+  // 用于服务重启 / 内存丢失后，新观众仍能续播到接近的位置，而不是从 0 开始。
+  lastPositionMs   Int             @default(0)
+
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
@@ -133,4 +147,48 @@ model EmailVerify {
 
   @@unique([email, purpose])
   @@map("email_verifies")
+}
+
+// ===== 【需求4A】管理员广播 =====
+// 一条循环滚动的弹幕，仅出现在观影房间页（导航栏下方的全宽横条）。
+// 生命周期为「永久」——发布后持续滚动，直到管理员在后台手动停播，不自动过期。
+// 同一时间只有最新发布且 active 的一条生效（发布新的即自动停用旧的）。
+model Broadcast {
+  id        String    @id @default(uuid())
+  content   String                // 广播内容（弹幕文字）
+  color     String    @default("#ffffff") // 文字颜色
+  speed     Int       @default(3) // 快慢档位 1~5，与视频弹幕同口径
+  active    Boolean   @default(true)
+  createdBy String?               // 发布管理员 userId
+  createdAt DateTime  @default(now())
+  stoppedAt DateTime?             // 停播时间
+
+  @@map("broadcasts")
+}
+
+// ===== 【需求4B】管理员公告 =====
+// 首屏弹窗形式下发，按登录用户维度「仅显示一次」（见 AnnouncementRead）。
+model Announcement {
+  id        String    @id @default(uuid())
+  title     String?
+  content   String
+  createdBy String?               // 发布管理员 userId
+  createdAt DateTime  @default(now())
+
+  reads     AnnouncementRead[]
+
+  @@map("announcements")
+}
+
+// 公告已读记录：每条公告 + 每个用户唯一。
+// 未写入即代表该用户尚未看过这条公告（下次访问时仍会弹出）。
+model AnnouncementRead {
+  id             String       @id @default(uuid())
+  announcementId String
+  announcement   Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  userId         String
+  readAt         DateTime     @default(now())
+
+  @@unique([announcementId, userId])
+  @@map("announcement_reads")
 }

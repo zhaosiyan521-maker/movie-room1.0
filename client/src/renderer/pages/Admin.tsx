@@ -41,6 +41,50 @@ interface AdminRoom {
   _count?: { members: number };
 }
 
+/** 【需求4A】当前生效的广播 */
+interface AdminBroadcast {
+  id: string;
+  content: string;
+  color: string;
+  speed: number;
+  active: boolean;
+  createdAt: string;
+}
+
+/** 【需求4B】公告（含已读人数） */
+interface AdminAnnouncement {
+  id: string;
+  title?: string | null;
+  content: string;
+  createdAt: string;
+  _count?: { reads: number };
+}
+
+/** 【需求3】后台功能项。以后所有新增的管理员功能都应加入这里，统一放进可折叠面板。 */
+type AdminTab = 'users' | 'ips' | 'rooms' | 'broadcast';
+
+const ADMIN_TAB_LABELS: Record<AdminTab, string> = {
+  users: '用户管理',
+  ips: '封禁 IP',
+  rooms: '房间列表',
+  broadcast: '广播/公告'
+};
+
+/** 广播速度档与弹幕同口径（1~5 档），此处仅用于在后台回显「大概几秒滚完」 */
+const BROADCAST_COLOR_PRESETS = [
+  { label: '白', value: '#ffffff' },
+  { label: '红', value: '#ff4d4f' },
+  { label: '黄', value: '#fadb14' },
+  { label: '蓝', value: '#40a9ff' },
+  { label: '绿', value: '#52c41a' }
+];
+
+function speedToDuration(level: number): string {
+  const lv = Math.max(1, Math.min(5, level));
+  const eff = 1 + (lv - 1) * 0.375; // 与客户端 speedToScrollDuration 完全一致
+  return (8 / eff).toFixed(1);
+}
+
 export default function Admin() {
   const navigate = useNavigate();
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -51,7 +95,20 @@ export default function Admin() {
   // 消息带类型：原先所有消息（含「封禁失败」）都用 success 绿色样式渲染，
   // 管理员会看到一片绿色的失败提示，误判操作已生效。
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [tab, setTab] = useState<'users' | 'ips' | 'rooms'>('users');
+  const [tab, setTab] = useState<AdminTab>('users');
+  // 【需求3】后台功能面板默认折叠；「以后所有新增管理员功能统统折叠」为长期规范
+  const [toolsOpen, setToolsOpen] = useState(false);
+
+  // 【需求4A/4B】广播与公告
+  const [broadcast, setBroadcast] = useState<AdminBroadcast | null>(null);
+  const [announcementList, setAnnouncementList] = useState<AdminAnnouncement[]>([]);
+  const [publishMode, setPublishMode] = useState<'broadcast' | 'announcement'>('broadcast');
+  const [broadcastContent, setBroadcastContent] = useState('');
+  const [broadcastColor, setBroadcastColor] = useState('#ff4d4f');
+  const [broadcastSpeed, setBroadcastSpeed] = useState(3);
+  const [announcementTitle, setAnnouncementTitle] = useState('');
+  const [announcementContent, setAnnouncementContent] = useState('');
+  const [publishing, setPublishing] = useState(false);
 
   // 请求序号：只采纳最新请求结果，防止旧响应覆盖新状态
   const reqIdRef = useRef(0);
@@ -60,6 +117,18 @@ export default function Admin() {
     const reqId = ++reqIdRef.current;
     setLoading(true);
     try {
+      // 【需求4A/4B】广播/公告面板：拉取当前广播与公告列表（含已读人数）
+      if (tab === 'broadcast') {
+        const [{ data: bData }, { data: aData }] = await Promise.all([
+          api.get('/admin/broadcast'),
+          api.get('/admin/announcements')
+        ]);
+        if (reqId !== reqIdRef.current) return;
+        setBroadcast(bData.broadcast || null);
+        setAnnouncementList(aData.announcements || []);
+        return;
+      }
+
       const params = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';
       // 搜索时无需拉取与搜索无关的封禁 IP 列表（原实现每次按键都会多打一个请求）
       if (tab === 'rooms') {
@@ -191,22 +260,113 @@ export default function Admin() {
     }
   };
 
+  // 【需求3】切换后台功能：切换后收起折叠面板。
+  // 只有「用户管理」使用搜索框，切到其它功能时清空搜索词 —— 否则残留的搜索词
+  // 会让 fetchAll 走错分支，出现「切过去列表没刷新 / 只拉到用户列表」的情况。
+  const selectTab = (next: AdminTab) => {
+    setTab(next);
+    setToolsOpen(false);
+    if (next !== 'users') setSearch('');
+  };
+
+  // 【需求4A】发布广播：循环滚动弹幕，仅房间页可见，永久有效直到手动停播
+  const publishBroadcast = async () => {
+    const content = broadcastContent.trim();
+    if (!content) {
+      setMessage({ type: 'error', text: '广播内容不能为空' });
+      return;
+    }
+    setPublishing(true);
+    try {
+      const { data } = await api.post('/admin/broadcast', {
+        content,
+        color: broadcastColor,
+        speed: broadcastSpeed
+      });
+      setMessage({ type: 'success', text: data.message || '广播已发布' });
+      setBroadcastContent('');
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '发布广播失败' });
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  // 【需求4A】停播广播：所有房间页的广播条立即消失
+  const stopBroadcast = async () => {
+    if (!confirm('确定停播当前广播吗？停播后所有房间页的广播条会立即消失。')) return;
+    try {
+      const { data } = await api.post('/admin/broadcast/stop');
+      setMessage({ type: 'success', text: data.message || '广播已停播' });
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '停播广播失败' });
+    }
+  };
+
+  // 【需求4B】发布公告：用户下次访问首屏弹窗，每人对同一条只显示一次
+  const publishAnnouncement = async () => {
+    const content = announcementContent.trim();
+    if (!content) {
+      setMessage({ type: 'error', text: '公告内容不能为空' });
+      return;
+    }
+    setPublishing(true);
+    try {
+      const { data } = await api.post('/admin/announcements', {
+        title: announcementTitle.trim(),
+        content
+      });
+      setMessage({ type: 'success', text: data.message || '公告已发布' });
+      setAnnouncementTitle('');
+      setAnnouncementContent('');
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '发布公告失败' });
+    } finally {
+      setPublishing(false);
+    }
+  };
+
   return (
     <div className="admin-page fade-in">
       <h1>🛡️ 管理员后台</h1>
 
+      {/* 【需求3】后台功能折叠面板：默认折叠，点标题展开/收起。
+          以后所有新增的管理员功能都加入这里（长期规范）。 */}
       <div className="admin-toolbar">
-        <div className="filter-bar">
-          <button className={`filter-btn ${tab === 'users' ? 'active' : ''}`} onClick={() => setTab('users')}>
-            👥 用户管理 ({users.length})
+        <div className="admin-tools">
+          <button
+            className="admin-tools-toggle"
+            onClick={() => setToolsOpen(o => !o)}
+            aria-expanded={toolsOpen}
+            aria-controls="admin-tools-panel"
+          >
+            <span className="admin-tools-title">🧰 后台功能</span>
+            {/* 折叠状态下仍显示当前功能名，避免用户必须展开才能确认自己在看哪一项 */}
+            <span className="admin-tools-current">当前：{ADMIN_TAB_LABELS[tab]}</span>
+            <span className={`admin-tools-chev ${toolsOpen ? 'open' : ''}`}>▾</span>
           </button>
-          <button className={`filter-btn ${tab === 'ips' ? 'active' : ''}`} onClick={() => setTab('ips')}>
-            🚫 封禁 IP ({bannedIps.length})
-          </button>
-          <button className={`filter-btn ${tab === 'rooms' ? 'active' : ''}`} onClick={() => { setTab('rooms'); setSearch(''); }}>
-            🏠 房间列表 ({rooms.length})
-          </button>
+
+          {toolsOpen && (
+            <div className="filter-bar admin-tools-panel" id="admin-tools-panel">
+              <button className={`filter-btn ${tab === 'users' ? 'active' : ''}`} onClick={() => selectTab('users')}>
+                👥 用户管理 ({users.length})
+              </button>
+              <button className={`filter-btn ${tab === 'ips' ? 'active' : ''}`} onClick={() => selectTab('ips')}>
+                🚫 封禁 IP ({bannedIps.length})
+              </button>
+              <button className={`filter-btn ${tab === 'rooms' ? 'active' : ''}`} onClick={() => selectTab('rooms')}>
+                🏠 房间列表 ({rooms.length})
+              </button>
+              <button className={`filter-btn ${tab === 'broadcast' ? 'active' : ''}`} onClick={() => selectTab('broadcast')}>
+                📢 广播/公告
+              </button>
+            </div>
+          )}
         </div>
+
         {tab === 'users' && (
           <input
             type="text"
@@ -231,6 +391,162 @@ export default function Admin() {
 
       {loading ? (
         <div className="loading">加载中...</div>
+      ) : tab === 'broadcast' ? (
+        /* 【需求4A/4B】广播 / 公告 */
+        <div className="admin-broadcast-panel">
+          <div className="publish-mode-bar">
+            <button
+              className={`filter-btn ${publishMode === 'broadcast' ? 'active' : ''}`}
+              onClick={() => setPublishMode('broadcast')}
+            >
+              📢 发布广播
+            </button>
+            <button
+              className={`filter-btn ${publishMode === 'announcement' ? 'active' : ''}`}
+              onClick={() => setPublishMode('announcement')}
+            >
+              📣 发布公告
+            </button>
+          </div>
+
+          {publishMode === 'broadcast' ? (
+            <div className="admin-form card">
+              <h3>📢 发布广播</h3>
+              <p className="admin-form-hint">
+                广播会以<b>循环滚动文字</b>的形式出现在每个观影房间页的顶部。
+                发布后立即对所有房间生效，永久滚动，直到你手动停播。
+              </p>
+
+              <label className="label">广播内容（最多 200 字）</label>
+              <textarea
+                className="input admin-textarea"
+                rows={3}
+                maxLength={200}
+                value={broadcastContent}
+                onChange={(e) => setBroadcastContent(e.target.value)}
+                placeholder="例如：今晚 22:00 例行维护，预计 10 分钟，敬请谅解。"
+              />
+
+              <label className="label">文字颜色</label>
+              <div className="color-picker-row">
+                {BROADCAST_COLOR_PRESETS.map(c => (
+                  <button
+                    key={c.value}
+                    type="button"
+                    className={`color-swatch ${broadcastColor.toLowerCase() === c.value ? 'active' : ''}`}
+                    style={{ backgroundColor: c.value }}
+                    title={c.label}
+                    aria-label={`颜色 ${c.label}`}
+                    onClick={() => setBroadcastColor(c.value)}
+                  />
+                ))}
+                <input
+                  type="color"
+                  className="color-input"
+                  value={broadcastColor}
+                  onChange={(e) => setBroadcastColor(e.target.value)}
+                  title="自定义颜色"
+                />
+                <span className="color-value">{broadcastColor}</span>
+              </div>
+
+              <label className="label">
+                快慢（与视频弹幕同口径）：第 {broadcastSpeed} 档 · 约 {speedToDuration(broadcastSpeed)} 秒滚完一轮
+              </label>
+              <input
+                type="range"
+                min={1}
+                max={5}
+                step={1}
+                value={broadcastSpeed}
+                onChange={(e) => setBroadcastSpeed(Number(e.target.value))}
+                className="speed-range"
+              />
+
+              <div className="admin-form-actions">
+                <button className="btn btn-primary" disabled={publishing} onClick={publishBroadcast}>
+                  {publishing ? '发布中...' : '发布广播'}
+                </button>
+                {broadcast && (
+                  <button className="btn btn-danger" onClick={stopBroadcast}>
+                    ⏹ 停播当前广播
+                  </button>
+                )}
+              </div>
+
+              <div className="current-broadcast">
+                {broadcast ? (
+                  <>
+                    <div className="current-broadcast-title">当前正在播放的广播</div>
+                    <div className="current-broadcast-text" style={{ color: broadcast.color }}>
+                      {broadcast.content}
+                    </div>
+                    <div className="current-broadcast-meta">
+                      发布：{new Date(broadcast.createdAt).toLocaleString('zh-CN')}
+                    </div>
+                  </>
+                ) : (
+                  <div className="current-broadcast-empty">当前没有正在播放的广播</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="admin-form card">
+              <h3>📣 发布公告</h3>
+              <p className="admin-form-hint">
+                公告会以<b>弹窗</b>形式出现在用户首屏，每名登录用户对同一条公告只看到一次。
+                若用户本次访问已弹出「打赏弹窗」，公告会顺延到下次访问再弹。
+              </p>
+
+              <label className="label">公告标题（可选，最多 100 字）</label>
+              <input
+                type="text"
+                className="input"
+                maxLength={100}
+                value={announcementTitle}
+                onChange={(e) => setAnnouncementTitle(e.target.value)}
+                placeholder="例如：v1.2 更新公告"
+              />
+
+              <label className="label">公告内容（最多 2000 字）</label>
+              <textarea
+                className="input admin-textarea"
+                rows={6}
+                maxLength={2000}
+                value={announcementContent}
+                onChange={(e) => setAnnouncementContent(e.target.value)}
+                placeholder="例如：本次更新修复了部分设备无法播放 HLS 直链的问题，并新增了管理员广播功能。"
+              />
+
+              <div className="admin-form-actions">
+                <button className="btn btn-primary" disabled={publishing} onClick={publishAnnouncement}>
+                  {publishing ? '发布中...' : '发布公告'}
+                </button>
+              </div>
+
+              <div className="announcement-history">
+                <div className="announcement-history-title">
+                  历史公告（共 {announcementList.length} 条）
+                </div>
+                {announcementList.length === 0 ? (
+                  <div className="current-broadcast-empty">还没有发布过公告</div>
+                ) : (
+                  announcementList.map(a => (
+                    <div key={a.id} className="announcement-history-item">
+                      <div className="announcement-history-head">
+                        <span className="announcement-history-name">{a.title || '（无标题）'}</span>
+                        <span className="announcement-history-meta">
+                          已读 {a._count?.reads || 0} 人 · {new Date(a.createdAt).toLocaleString('zh-CN')}
+                        </span>
+                      </div>
+                      <div className="announcement-history-content">{a.content}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       ) : tab === 'rooms' ? (
         <div className="admin-room-list card">
           {rooms.length === 0 ? (
