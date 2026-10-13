@@ -54,13 +54,6 @@ interface DanmakuItem {
   duration: number; // 滚动动画时长（秒）
 }
 
-interface KickVoteRequest {
-  targetUserId: string;
-  targetName: string;
-  needed: number;
-  total: number;
-}
-
 const RTC_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -146,7 +139,6 @@ export default function RoomView() {
   const makeOfferRef = useRef<Map<string, () => Promise<void>>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
-  const fileInputRef = useRef<HTMLInputElement>(null);
   // 全屏容器引用：全屏时气泡/聊天公屏需要渲染在该元素内部，否则不会显示
   const videoContainerRef = useRef<HTMLDivElement>(null);
   // 房主本地视频的挂载容器：session.video 是模块级单例元素（跨页面存活），
@@ -163,7 +155,6 @@ export default function RoomView() {
   // isPlaying 的同步镜像：setupWebSocket 里的 onpause/onplay 闭包会捕获旧 state，
   // 导致「房主暂停/继续」广播发不出去（同 isHostRef 一类的闭包时序 bug）。
   const isPlayingRef = useRef(false);
-  const [selectedFile, setSelectedFile] = useState<any>(null);
   const [needClickPlay, setNeedClickPlay] = useState(false);
   // 观众端「声音被浏览器自动播放策略拦截」提示：
   // 观众 <video> 属于远程流且通常在无用户手势时自动 play()，带声音的自动播放会被浏览器拒绝。
@@ -207,9 +198,6 @@ export default function RoomView() {
   const [danmakuColor, setDanmakuColor] = useState('#ff4d4f'); // 红/黄/蓝/绿（默认红）
   const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
   const danmakuSeqRef = useRef(0);
-
-  // 踢出投票（观众收到的确认弹窗）
-  const [kickVote, setKickVote] = useState<KickVoteRequest | null>(null);
 
   // 语音音量等级（0~1），用于头像按音量着色
   const [levelByUser, setLevelByUser] = useState<Record<string, number>>({});
@@ -259,8 +247,6 @@ export default function RoomView() {
   const hlsRef = useRef<any>(null);
   const setupDoneRef = useRef(false);
   const recentMsgSigRef = useRef<Set<string>>(new Set());
-  // 本地视频的 ObjectURL，用于切换/离开房间时 revoke，避免 Blob 泄漏
-  const localObjectUrlRef = useRef<string | null>(null);
   // 进度同步节流：记录上次广播时间戳
   const lastSyncProgressRef = useRef(0);
   // 观众端 seek 冷却：记录上次强制 seek 时间戳，避免 HLS 缓冲期间被反复 seek 打断
@@ -332,7 +318,7 @@ export default function RoomView() {
     // 关键修复：必须复位 setupDoneRef。
     // 否则 React Router 在 /room/A → /room/B 时复用同一组件实例，
     // setupWebSocket() 会命中 if (setupDoneRef.current) return 而直接早退，
-    // 导致切换房间后聊天/语音/视频/投票全部永久失效（直到刷新页面）。
+    // 导致切换房间后聊天/语音/视频/成员操作全部永久失效（直到刷新页面）。
     setupDoneRef.current = false;
 
     // 【直链-5】组件卸载时作废观众端的加载重试定时器，
@@ -404,14 +390,6 @@ export default function RoomView() {
       audioCtxRef.current = null;
     }
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
-
-    // 释放 ObjectURL，避免 Blob 泄漏（房主切页时不释放，视频仍要用）
-    if (localObjectUrlRef.current) {
-      if (!hasHostSession) {
-        URL.revokeObjectURL(localObjectUrlRef.current);
-        localObjectUrlRef.current = null;
-      }
-    }
 
     // 重置房间相关状态，避免上一个房间的聊天与 UI 状态串到新房间
     setDanmaku([]);
@@ -550,7 +528,7 @@ export default function RoomView() {
       setHostSessionReady(true);
       // 关键修复：socket 是模块级单例，房主切页后再回来时它已经处于 connected 状态，
       // 不会再触发 'connect' 事件，导致 join-room 永不重新 emit、服务端不下发 room-joined，
-      // 房主回来后 isPlaying 停在 false，UI 显示「请选择视频文件并开始放映」——看起来就像视频自动结束了。
+      // 房主回来后 isPlaying 停在 false，UI 显示「请粘贴视频直链并开始播放」——看起来就像视频自动结束了。
       // 因此：若 socket 已连接，直接补发 join-room，让服务端重新下发播放状态（playbackState）。
       if (socket.connected) {
         socket.emit('join-room', id);
@@ -943,16 +921,8 @@ export default function RoomView() {
       }
     });
 
-    // 房主发起踢出 → 观众收到确认弹窗
-    socket.on('kick-vote-request', (data: KickVoteRequest) => {
-      // 目标本人不弹窗
-      if (data.targetUserId === useAuthStore.getState().user?.id) return;
-      setKickVote(data);
-    });
-
-    // 踢出结果
-    socket.on('kick-vote-result', (data: any) => {
-      setKickVote(null);
+    // 房主踢出结果：从成员栏移除并提示
+    socket.on('kick-result', (data: any) => {
       if (data.kicked) {
         setMembers(prev => prev.filter(m => m.userId !== data.targetUserId));
         setOnlineUserIds(prev => {
@@ -960,7 +930,7 @@ export default function RoomView() {
           next.delete(data.targetUserId);
           return next;
         });
-        appendSystemMessage(`🚨 「${data.targetName}」已被投票踢出房间（同意 ${data.agrees}/${data.total}），5 小时内无法再次进入`);
+        appendSystemMessage(`🚨 「${data.targetName}」已被房主踢出房间，5 小时内无法再次进入`);
       }
     });
 
@@ -1078,65 +1048,12 @@ export default function RoomView() {
     return pc;
   };
 
-  // ===== 本地文件推流（房主端）：把 captureStream 的视频/音频轨加入指定 PC =====
-  // 仅房主本地文件模式下调用；网络直链模式不走这里（观众各自加载直链，不经 WebRTC 转发）。
-  const pushLocalFileTracks = (pc: RTCPeerConnection) => {
-    // 网络视频模式下，视频由每位观众各自加载直链，房主不通过 WebRTC 转发视频轨。
-    // 关键修复：
-    //   1) isHost / usingRemoteUrl 均为 state，此处经 room-joined 异步回调调用会捕获旧值，
-    //      改用 isHostRef / usingRemoteUrlRef（同步镜像）。
-    //   2) localVideoRef 依赖挂载 effect 赋值，房主刚进房时可能还是 null，
-    //      改用 hostSessionRef.current?.video（模块级单例，创建即可用），
-    //      否则房主的视频轨道从未加到 PC，导致「本地文件观众无法观看」。
-    const hostVideo = hostSessionRef.current?.video;
-    // 仅当房主正在放映时才推视频/音频轨。房主未播放时 captureStream 得到的是「未激活」
-    // 轨道（视频未产帧），加入 PC 后观众看到的会是黑屏，且房主点播放时旧轨不会复活。
-    // 因此：房主播放中观众加入 → 立即推流；房主未播放观众加入 → 不加轨，等 startPlayback 补推。
-    if (isHostRef.current && !usingRemoteUrlRef.current && hostVideo && isPlayingRef.current) {
-      const stream = getVideoCaptureStream();
-      if (stream) {
-        // 视频：来自 captureStream；音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）
-        stream.getVideoTracks().forEach(track => pc.addTrack(track, stream));
-        const audioTrack = hostCaptureAudioTrackRef.current;
-        if (audioTrack) {
-          try { pc.addTrack(audioTrack, stream); } catch {}
-        } else {
-          stream.getAudioTracks().forEach(track => pc.addTrack(track, stream));
-        }
-      }
-    }
-  };
-
   const addLocalTracksTo = (pc: RTCPeerConnection) => {
     if (localMicRef.current) {
       localMicRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localMicRef.current!);
       });
     }
-    // 本地文件模式：房主推视频/音频轨；网络直链模式：此函数内部无操作（观众各自加载直链）
-    pushLocalFileTracks(pc);
-  };
-
-  const getVideoCaptureStream = (): MediaStream | null => {
-    const session = hostSessionRef.current;
-    // 【C5】复用会话已缓存的推流。
-    // <video>.captureStream() 每次调用都会返回一个全新的 MediaStream 实例，反复调用会产生
-    // 多条彼此独立的流：旧实例无人持有也 stop 不掉（因为 session.captureStream 一直是 null），
-    // 房间解散时 destroyHostSession 的 stop() 是执行不到的死代码 → 推流轨道泄漏。
-    // 这里改为「首次创建后缓存到 session.captureStream，后续全部复用」。
-    // 注意：不校验 readyState 只需判空。视频元素换 src 后同一条 captureStream 会自动
-    // 跟随新片源（它采集的是元素本身的画面），因此换片无需重建缓存。
-    if (session?.captureStream && session.captureStream.getTracks().some(t => t.readyState === 'live')) {
-      return session.captureStream;
-    }
-    const video = (session?.video || localVideoRef.current) as any;
-    if (!video) return null;
-    const capture = video.captureStream || video.mozCaptureStream;
-    if (!capture) return null;
-    const stream: MediaStream = capture.call(video);
-    if (stream.getTracks().length === 0) return null;
-    if (session) session.captureStream = stream;
-    return stream;
   };
 
   /**
@@ -1555,26 +1472,15 @@ export default function RoomView() {
     });
   };
 
-  // ===== 踢出（房主发起，观众投票确认） =====
+  // ===== 踢出（房主直接踢出，无需投票） =====
 
   const requestKick = (targetUserId: string) => {
     setMenuUserId(null);
     if (!socketRef.current) return;
     const target = members.find(m => m.userId === targetUserId);
     if (!target) return;
-    if (!confirm(`确定要发起踢出「${target.nickname}」吗？\n房间内 1/3 的人同意后，TA 将被踢出且 5 小时内无法再次进入。`)) return;
-    socketRef.current.emit('kick-request', { roomId: id, targetUserId });
-    appendSystemMessage(`🗳️ 你已发起踢出「${target.nickname}」的投票，等待其他观众确认...`);
-  };
-
-  const answerKickVote = (agree: boolean) => {
-    if (!kickVote || !socketRef.current) return;
-    socketRef.current.emit('kick-vote', {
-      roomId: id,
-      targetUserId: kickVote.targetUserId,
-      agree
-    });
-    setKickVote(null);
+    if (!confirm(`确定要踢出「${target.nickname}」吗？\nTA 将立即被踢出，且 5 小时内无法再次进入。`)) return;
+    socketRef.current.emit('kick-user', { roomId: id, targetUserId });
   };
 
   // ===== 聊天 =====
@@ -1641,60 +1547,6 @@ export default function RoomView() {
 
     setChatInput('');
     startCooldown();
-  };
-
-  // ===== 房主：视频播放 =====
-
-  const selectVideoFile = async () => {
-    if ((window as any).electronAPI?.selectVideoFile) {
-      const file = await (window as any).electronAPI.selectVideoFile();
-      if (file) {
-        // 让主进程用 pathToFileURL 生成正确的 file:// URL：
-        // 直接拼接 `file://${path}` 在含空格/中文/特殊字符时会失效或被截断
-        let src = `file://${file.path}`;
-        try {
-          const converted = await (window as any).electronAPI.getVideoUrl?.(file.path);
-          if (converted) src = converted;
-        } catch {
-          /* 回退到拼接方式 */
-        }
-        loadVideoFile(src, file.name, false);
-      }
-    } else {
-      fileInputRef.current?.click();
-    }
-  };
-
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      // createObjectURL 必须配对 revokeObjectURL，否则 Blob 会一直驻留内存
-      const url = URL.createObjectURL(file);
-      loadVideoFile(url, file.name, true);
-    }
-    // 重置 value，保证连续选择同一文件也能触发 change 事件
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  /** ownObjectUrl=true 表示 src 是 createObjectURL 产生的，换片/清理时需要 revoke */
-  const loadVideoFile = (src: string, name: string, ownObjectUrl = false) => {
-    // 【直链-6】加载本地文件前先销毁可能存在的 HLS 实例（比如房主刚看过网络直链再换本地片源），
-    // 避免它与新的本地 src 争抢同一个 video 元素。
-    destroyHls();
-    // 先释放上一个 ObjectURL
-    if (localObjectUrlRef.current) {
-      URL.revokeObjectURL(localObjectUrlRef.current);
-      localObjectUrlRef.current = null;
-    }
-    if (ownObjectUrl) {
-      localObjectUrlRef.current = src;
-    }
-    setSelectedFile({ name });
-    const el = hostSessionRef.current?.video || localVideoRef.current;
-    if (el) {
-      el.src = src;
-      el.load();
-    }
   };
 
   // ===== 网络视频（HLS / 直链）加载 =====
@@ -1971,7 +1823,6 @@ export default function RoomView() {
   };
 
   // ===== 网络直链播放（房主端）：加载直链并广播给观众各自加载 =====
-  // 注意：此分支与本地文件播放（startLocalFilePlayback）完全独立，互不影响。
   const startRemotePlayback = () => {
     const url = remotePlayUrl.trim();
     if (!url) { alert('请先粘贴要播放的网络视频地址'); return; }
@@ -1990,80 +1841,9 @@ export default function RoomView() {
     });
   };
 
-  // ===== 本地文件播放（房主端）：captureStream 推流给观众（WebRTC） =====
-  const startLocalFilePlayback = async () => {
-    if (!selectedFile) {
-      alert('请先选择视频文件');
-      return;
-    }
-
-    setIsPlaying(true);
-    isPlayingRef.current = true;
-
-    const hostVideo = hostSessionRef.current?.video || localVideoRef.current;
-    if (hostVideo) {
-      try {
-        // 先建立音频分流（需要用户手势才能启动 AudioContext，此刻正好是点击事件内）
-        setupHostAudioGraph();
-        await hostVideo.play();
-      } catch (err) {
-        console.error('播放失败:', err);
-        alert('视频播放失败，请检查文件格式');
-        setIsPlaying(false);
-        isPlayingRef.current = false;
-        return;
-      }
-    }
-
-    const stream = getVideoCaptureStream();
-    if (stream) {
-      peersRef.current.forEach(pc => {
-        // 关键修复：先移除旧的「视频」sender，再重新 addTrack。
-        // 观众加入时（房主未播放）addLocalTracksTo 已把「未激活」的 captureStream 视频轨加进 PC，
-        // 该未激活轨不会在房主播放后复活 → 观众黑屏直到切页重连。因此必须 removeTrack 旧视频轨，
-        // 再 addTrack 播放中的新视频轨，触发 onnegotiationneeded 重新协商。
-        // 注意：只移除视频 sender；音频 sender 含麦克风轨（语音聊天），不能一并移除。
-        pc.getSenders().forEach(sender => {
-          if (sender.track && sender.track.kind === 'video') {
-            try { pc.removeTrack(sender); } catch {}
-          }
-        });
-        stream.getVideoTracks().forEach(track => {
-          try { pc.addTrack(track, stream); } catch {}
-        });
-        // 音频：优先用 WebAudio 分流轨道（房主本地静音不影响观众）。
-        // 仅当该音轨尚未加入此 PC 时才补充（避免重复 addTrack 同一 track 抛错）。
-        const audioTrack = hostCaptureAudioTrackRef.current;
-        if (audioTrack) {
-          const alreadyAdded = pc.getSenders().some(s => s.track === audioTrack);
-          if (!alreadyAdded) {
-            try { pc.addTrack(audioTrack, stream); } catch {}
-          }
-        } else {
-          stream.getAudioTracks().forEach(track => {
-            const alreadyAdded = pc.getSenders().some(s => s.track === track);
-            if (!alreadyAdded) {
-              try { pc.addTrack(track, stream); } catch {}
-            }
-          });
-        }
-      });
-    }
-
-    socketRef.current?.emit('host-start-play', {
-      roomId: id,
-      movieName: selectedFile.name,
-      resolution: getResolution()
-    });
-  };
-
-  // 播放入口：按片源模式路由到「网络直链」或「本地文件」两条独立链路
+  // 播放入口：现仅支持网络视频直链播放
   const startPlayback = () => {
-    if (usingRemoteUrlRef.current) {
-      startRemotePlayback();
-    } else {
-      startLocalFilePlayback();
-    }
+    startRemotePlayback();
   };
 
   // 暂停/继续由房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
@@ -2463,7 +2243,7 @@ export default function RoomView() {
                 <div className="video-overlay" style={{ pointerEvents: 'none' }}>
                   <p>
                     {isHost
-                      ? (selectedFile || remotePlayUrl ? '⏸ 已暂停' : '请选择视频文件并开始放映')
+                      ? (remotePlayUrl ? '⏸ 已暂停' : '请粘贴视频直链并开始播放')
                       : '等待房主开始播放'}
                   </p>
                 </div>
@@ -2528,64 +2308,35 @@ export default function RoomView() {
             {/* 房主控制面板 */}
             {isHost && (
               <div className="host-controls">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="video/*,.mkv,.flv,.wmv"
-                  style={{ display: 'none' }}
-                  onChange={handleFileInput}
-                />
-
-                {/* 片源模式：本地文件 / 网络视频直链 */}
+                {/* 片源模式：现仅保留网络视频直链 */}
                 <div className="source-tabs">
-                  <button
-                    className={`tab ${!usingRemoteUrl ? 'active' : ''}`}
-                    onClick={() => {
-                      setUsingRemoteUrl(false);
-                      usingRemoteUrlRef.current = false;
-                      // 【直链-6】切回「本地文件」必须销毁 HLS 实例。
-                      // 否则 session.hls 仍持有 attachMedia 绑在同一个 video 元素上的旧实例，
-                      // 接着 loadVideoFile 给 el.src 赋本地文件 → 两个片源争抢同一个播放器，
-                      // hls.js 还会尝试 recover 并在后台持续拉取旧链接的分片。
-                      destroyHls();
-                      setVideoError('');
-                    }}
-                  >📁 本地文件</button>
                   <button
                     className={`tab ${usingRemoteUrl ? 'active' : ''}`}
                     onClick={() => { setUsingRemoteUrl(true); usingRemoteUrlRef.current = true; }}
                   >🌐 网络视频直链</button>
                 </div>
 
-                {usingRemoteUrl ? (
-                  <div className="url-play-row">
-                    <span className="selected-file">📽️ {remotePlayUrl ? remotePlayUrl : '尚未设置播放源'}</span>
-                    <input
-                      className="input"
-                      type="text"
-                      placeholder="粘贴视频直链（支持 .m3u8 HLS 或 mp4/webm 等）"
-                      value={urlInput}
-                      onChange={(e) => setUrlInput(e.target.value)}
-                    />
-                    <button className="btn btn-secondary btn-sm" onClick={() => setRemotePlayUrl(urlInput.trim())}>
-                      设为播放源
-                    </button>
-                  </div>
-                ) : (
-                  !selectedFile && (
-                    <button onClick={selectVideoFile} className="btn btn-primary">
-                      📁 选择视频文件
-                    </button>
-                  )
-                )}
+                <div className="url-play-row">
+                  <span className="selected-file">📽️ {remotePlayUrl ? remotePlayUrl : '尚未设置播放源'}</span>
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder="粘贴视频直链（支持 .m3u8 HLS 或 mp4/webm 等）"
+                    value={urlInput}
+                    onChange={(e) => setUrlInput(e.target.value)}
+                  />
+                  <button className="btn btn-secondary btn-sm" onClick={() => setRemotePlayUrl(urlInput.trim())}>
+                    设为播放源
+                  </button>
+                </div>
 
                 {!isPlaying ? (
                   <button
                     onClick={startPlayback}
                     className="btn btn-success"
-                    disabled={usingRemoteUrl ? !remotePlayUrl.trim() : !selectedFile}
+                    disabled={!remotePlayUrl.trim()}
                   >
-                    ▶️ {usingRemoteUrl ? '播放网络视频' : '开始放映'}
+                    ▶️ 播放网络视频
                   </button>
                 ) : (
                   <>
@@ -2790,27 +2541,6 @@ export default function RoomView() {
             </div>
           )}
 
-          {/* 踢出确认弹窗（房主发起后观众收到） */}
-          {kickVote && (
-            <div className="modal-mask">
-              <div className="modal-card card">
-                <h3>🗳️ 踢出投票</h3>
-                <p>
-                  房主发起投票：是否同意踢出「<strong>{kickVote.targetName}</strong>」？<br />
-                  房间内 1/3 的人同意（{kickVote.needed}/{kickVote.total} 人）即踢出，且 5 小时内无法再次进入。
-                </p>
-                <div className="modal-actions">
-                  <button className="btn btn-secondary" onClick={() => answerKickVote(false)}>
-                    否（不同意）
-                  </button>
-                  <button className="btn btn-danger" onClick={() => answerKickVote(true)}>
-                    是（同意踢出）
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
           {/* 静音 / 踢出 操作菜单：固定定位在顶层，避免被头像栏裁剪 */}
           {menuUserId && menuRect && (
             <div className="menu-backdrop" onClick={() => { setMenuUserId(null); setMenuRect(null); }} />
@@ -2827,7 +2557,7 @@ export default function RoomView() {
                 </button>
                 {isHost && !isMemberHost && (
                   <button className="danger" onClick={() => requestKick(m.userId)}>
-                    🗳️ 踢出房间
+                    🚪 踢出房间
                   </button>
                 )}
               </div>

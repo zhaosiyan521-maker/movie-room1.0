@@ -210,19 +210,6 @@
   min-width: 0;
 }
 
-.vote-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px 16px;
-  background-color: rgba(245, 197, 24, 0.12);
-  border: 1px solid rgba(245, 197, 24, 0.4);
-  border-radius: 8px;
-  font-size: 14px;
-  color: var(--warning-color);
-}
-
 .video-container {
   position: relative;
   background-color: #000;
@@ -293,12 +280,6 @@
 .voice-status.on {
   color: #46d369;
   font-weight: 600;
-}
-
-.voice-hint {
-  margin-left: auto;
-  font-size: 12px;
-  color: var(--text-muted);
 }
 
 .host-controls {
@@ -438,7 +419,7 @@
   justify-content: center;
 }
 
-/* 语音控制条内的小尺寸按钮（对齐「本地文件」tab 大小） */
+/* 语音控制条内的小尺寸按钮（对齐片源按钮大小） */
 .voice-action-btn {
   padding: 6px 12px !important;
   font-size: 13px !important;
@@ -544,11 +525,6 @@
   font-size: 11px;
   color: var(--text-muted);
   text-align: right;
-}
-
-.host-hint {
-  font-size: 12px;
-  color: var(--text-muted);
 }
 
 /* 分辨率徽标（item 9：分辨率同步展示） */
@@ -710,7 +686,7 @@
   white-space: nowrap;
 }
 
-/* 房主片源模式切换（本地文件 / 网络视频直链） */
+/* 房主片源模式（网络视频直链） */
 .source-tabs {
   display: flex;
   gap: 6px;
