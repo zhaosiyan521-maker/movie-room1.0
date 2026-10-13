@@ -568,15 +568,21 @@ export function setupSocketHandlers(io: Server) {
       roomPlaybackStates.delete(room.id);
       lastPositionPersistAt.delete(room.id);
 
-      // 【播放源持久化】「结束放映」只结束本场放映，**不清除播放源**。
-      // 播放源一旦被房主「设为播放源」就保存在 rooms.sourceUrl，
-      // 只有房间被解散（记录删除）时才会消失 —— 这是用户明确要求的语义。
-      // 若在这里清库，房主结束一场后再想放同一部片就得重新粘贴直链。
-      // 注意：status 改回 WAITING 后，join-room 的 DB 回落条件
+      // 【播放源语义】「结束放映」= 本场作废，**播放源一并清除**（用户 2026-10-14 明确要求）。
+      // 与「暂停」严格区分：暂停保留播放源（见 host-pause），只有「结束放映」才清空。
+      // 清空后房间回到「尚未设置播放源」，房主要再看需重新粘贴直链。
+      // 注意：status 改回 WAITING 且 sourceUrl 置空后，join-room 的 DB 回落条件
       // （status==='PLAYING' && sourceUrl）不再成立，新观众不会被误拉进放映。
       await prisma.room.update({
         where: { id: room.id },
-        data: { status: 'WAITING' }
+        data: {
+          status: 'WAITING',
+          sourceUrl: null,
+          sourceIsHls: false,
+          sourceResolution: null,
+          sourceUpdatedAt: null,
+          lastPositionMs: 0
+        }
       }).catch(() => {});
 
       // 广播给观众（含房主自己，房主端也会收到 playback-stop 同步 isPlaying）

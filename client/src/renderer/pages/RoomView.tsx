@@ -183,6 +183,16 @@ export default function RoomView() {
   // HTML 规范下媒体元素在 DOM 中移动会触发一次 pause 事件。这个窗口用于忽略该「假暂停」，
   // 避免误判为「房主主动暂停」而向观众广播 host-pause。
   const suppressPauseRef = useRef(0);
+  // 【原生控制条】本场放映是否「进行中」：房主点了「播放网络视频」后为 true，
+  // 「结束放映」（本地清理或收到服务端 playback-stop）后为 false。
+  // 原生控制条的 play/pause 只有在本场进行中时才需要广播给观众。
+  // ⚠️ 不能用 isPlaying 代替它：房主用原生键暂停后 isPlaying 就已经是 false，
+  // 拿它当守卫会导致「暂停之后按原生播放键失灵」——这正是旧实现的 bug。
+  const hostScreenActiveRef = useRef(false);
+  // 【原生控制条】观众端专用：房主是否已经开过这场放映。
+  // 用来区分「还没开始」（→ 等待房主开始播放）与「开始了但暂停了」（→ 房主已暂停）。
+  // 只存在于观众端 —— 房主端已不再自绘任何暂停提示。
+  const [screeningStarted, setScreeningStarted] = useState(false);
 
   // ===== 全屏观看 + 弹幕设置 =====
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -590,21 +600,35 @@ export default function RoomView() {
           duration: el.duration || 0
         });
       };
-      // 房主用原生控制条暂停/继续时，广播给观众同步（移除自定义按钮后由这里兜底）
+      // 【原生控制条】房主用浏览器自带控制条暂停/继续 —— 这是本项目唯一的暂停/播放入口，
+      // 网页端不再自绘播放/暂停按钮或暂停遮罩。
+      // 这里必须**同时**改本地 UI 状态并广播：
+      //   旧实现只广播、不改本地状态，且用 isPlayingRef 当守卫 —— 房主按原生暂停后
+      //   （服务端把 playback-pause 广播回房间）isPlayingRef 变成 false，此时再按原生
+      //   播放键，守卫 `if (isPlayingRef.current)` 不成立 → 既不广播也不复位状态，
+      //   于是「已暂停」永久卡住、观众一直停着，而房主本地视频其实已经在播（房间失同步）。
+      //   改为用 hostScreenActiveRef（本场是否进行中）当守卫，与「当前是否正在播放」解耦。
       v.onpause = () => {
         // 忽略「假暂停」：切页回来时 DOM 移动触发的 pause（抑制窗口内），不应广播。
         if (Date.now() - suppressPauseRef.current < 800) return;
-        // 仅当正在放映中才广播，避免切页隐藏/加载时误触发。
-        // 用 isPlayingRef（同步镜像）而非闭包捕获的 isPlaying state（会是旧值 false，导致广播发不出）。
-        if (isPlayingRef.current && socketRef.current) {
-          socketRef.current.emit('host-pause', { roomId: id });
-        }
+        // 本场未进行（从未开播 / 已结束放映）时不广播
+        if (!hostScreenActiveRef.current) return;
+        // 已经是暂停态就不重复广播（加载、拖拽等会多次触发 pause）
+        if (!isPlayingRef.current) return;
+        setIsPlaying(false);
+        isPlayingRef.current = false;
+        const sock = hostSessionRef.current?.socket ?? socketRef.current;
+        sock?.emit('host-pause', { roomId: id });
       };
       v.onplay = () => {
         if (Date.now() - suppressPauseRef.current < 800) return;
-        if (isPlayingRef.current && socketRef.current) {
-          socketRef.current.emit('host-resume', { roomId: id });
-        }
+        if (!hostScreenActiveRef.current) return;
+        // 已经在播放态，无需重复广播
+        if (isPlayingRef.current) return;
+        setIsPlaying(true);
+        isPlayingRef.current = true;
+        const sock = hostSessionRef.current?.socket ?? socketRef.current;
+        sock?.emit('host-resume', { roomId: id });
       };
       // 房主拖动进度条（原生控制条）seek 后，广播给观众跟随 seek。
       // 用持久 socket（session.socket）上报，保证房主切页场景下（若有）也安全。
@@ -692,6 +716,15 @@ export default function RoomView() {
       // 关键：区分「房主自己回来」与「观众加入」——
       //   观众：用 remoteVideoRef 加载/续播；
       //   房主：恢复本地视频（session.video）的播放状态，而不是去操作 remoteVideoRef。
+      //
+      // 【原生控制条】房主端还要标记「本场是否进行中」：
+      // 服务端只有在本场仍未作废时才会下发 playbackState（内存命中，
+      // 或房间 status==='PLAYING' 且库里有源的回落）。所以 playbackState 非 null
+      // 就等价于「本场进行中（可能正暂停）」→ 房主按原生播放键应当恢复整场放映。
+      // 反之「结束放映」后内存被删、status 改回 WAITING、sourceUrl 置空 → null → 不再广播。
+      hostScreenActiveRef.current = !!data.playbackState;
+      setScreeningStarted(!!data.playbackState);
+
       if (data.playbackState?.playing) {
         const ps = data.playbackState;
         setIsPlaying(true);
@@ -836,6 +869,8 @@ export default function RoomView() {
     socket.on('playback-start', (data: any) => {
       setIsPlaying(true);
       isPlayingRef.current = true;
+      // 【原生控制条】本场已开播，观众端提示文案切换到「房主已暂停」口径
+      setScreeningStarted(true);
       setResolution(data?.resolution || null);
       if (data?.videoUrl) {
         // 网络视频模式：观众各自加载直链，不经过房主带宽。
@@ -862,6 +897,7 @@ export default function RoomView() {
     socket.on('playback-resume', () => {
       setIsPlaying(true);
       isPlayingRef.current = true;
+      setScreeningStarted(true);
       playViewerVideo(remoteVideoRef.current);
       localVideoRef.current?.play().catch(() => {});
     });
@@ -869,6 +905,13 @@ export default function RoomView() {
     socket.on('playback-stop', () => {
       setIsPlaying(false);
       isPlayingRef.current = false;
+      // 本场放映已结束：观众端文案回到「等待房主开始播放」
+      setScreeningStarted(false);
+      // 房主端还要把画面与播放源一起清掉（结束放映 = 播放源作废）。
+      // 用 isHostRef 判断：观众端调 clearHostVideo 会误清自己的元素。
+      if (isHostRef.current) {
+        resetHostPlaybackUi();
+      }
       remoteVideoRef.current?.pause();
       localVideoRef.current?.pause();
     });
@@ -1554,6 +1597,47 @@ export default function RoomView() {
   };
 
   /**
+   * 【原生控制条】清空房主本地视频的「画面与元素状态」（「结束放映」时调用）。
+   *
+   * 「结束放映」= 本场作废 + 播放源清除（用户 2026-10-14 明确要求），
+   * 所以这里不能只 pause()：必须把 src 摘掉，让视频区真正回到空白。
+   * 否则画面停在最后一帧，且浏览器原生播放键仍能继续播放 —— 看起来就像「放映没结束」。
+   */
+  const clearHostVideo = () => {
+    // 先落状态、开抑制窗口：摘 src / load() 会触发 pause、emptied 等事件，
+    // 若不抑制会被 v.onpause 误判成「房主主动暂停」而向观众多广播一次 host-pause。
+    hostScreenActiveRef.current = false;
+    isPlayingRef.current = false;
+    suppressPauseRef.current = Date.now();
+    destroyHls();
+    const el = hostSessionRef.current?.video || localVideoRef.current;
+    if (el) {
+      try { el.pause(); } catch {}
+      el.removeAttribute('src');
+      try { el.load(); } catch {}
+    }
+    directUrlRef.current = '';
+    directIsHlsRef.current = false;
+  };
+
+  /**
+   * 【原生控制条】「结束放映」后的本地清理：画面 + 播放源相关状态一起清空。
+   * 与 clearHostVideo 分开是为了让服务端发来的 playback-stop（例如房间被解散）
+   * 复用同一套清理，保证本地表现与库里「播放源已清除」一致。
+   */
+  const resetHostPlaybackUi = () => {
+    clearHostVideo();
+    setRemotePlayUrl('');
+    setUrlInput('');
+    setUsingRemoteUrl(false);
+    usingRemoteUrlRef.current = false;
+    setNeedClickPlay(false);
+    setVideoError('');
+    setProgress({ current: 0, duration: 0 });
+    setIsPlaying(false);
+  };
+
+  /**
    * 判断一个直链是否为 HLS 流。
    * 除了 .m3u8 扩展名，还覆盖常见的无扩展名 HLS 直链特征：
    *   - 路径含 .m3u8
@@ -1831,6 +1915,9 @@ export default function RoomView() {
     const isHls = looksLikeHls(url);
     setIsPlaying(true);
     isPlayingRef.current = true;
+    // 【原生控制条】本场放映开始：此后房主用浏览器原生控制条做的暂停/播放
+    // 才算「本场的暂停/播放」，需要广播给观众。
+    hostScreenActiveRef.current = true;
     loadLocalUrl(url, isHls);
     socketRef.current?.emit('host-start-play', {
       roomId: id,
@@ -1847,17 +1934,16 @@ export default function RoomView() {
     startRemotePlayback();
   };
 
-  // 暂停/继续由房主直接操作视频原生控制条（onpause/onplay 广播 host-pause/host-resume）。
+  // 暂停/继续由房主直接操作视频原生控制条（v.onpause / v.onplay 广播 host-pause / host-resume）。
+  // 网页端不再自绘播放/暂停按钮或暂停遮罩。
   // 结束放映也由房主一键操作（已删除观众投票机制）。
 
   // 结束放映（房主一键结束，无需观众投票）
+  // 【原生控制条】结束放映 = 本场作废 + 播放源清除：先本地清空画面与播放源状态，
+  // 再通知服务端清库（rooms.sourceUrl 等置空）。两者保持一致，房主要再看需重新粘贴直链。
   const stopPlayback = () => {
     if (!socketRef.current) return;
-    // 本地暂停视频，并通知观众结束
-    const el = hostSessionRef.current?.video || localVideoRef.current;
-    el?.pause();
-    setIsPlaying(false);
-    isPlayingRef.current = false;
+    resetHostPlaybackUi();
     socketRef.current.emit('host-stop-play', { roomId: id });
   };
 
@@ -2242,12 +2328,18 @@ export default function RoomView() {
                 </div>
               )}
 
-              {!isPlaying && (
+              {/* 【原生控制条】暂停提示（用户 2026-10-14 定稿）：
+                  · 房主端**不再显示**「⏸ 已暂停」——暂停/播放状态一律由浏览器自带控制条
+                    体现，网页自绘的遮罩会和原生控制条叠在一起。只有「还没设播放源」时
+                    才给一句引导文案（此时视频区是空的，不存在重叠与状态错位）。
+                  · 观众端没有原生控制条，仍需要文字提示：本场已开过 → 「房主已暂停」，
+                    否则 → 「等待房主开始播放」。 */}
+              {!isPlaying && (!isHost || !remotePlayUrl) && (
                 <div className="video-overlay" style={{ pointerEvents: 'none' }}>
                   <p>
                     {isHost
-                      ? (remotePlayUrl ? '⏸ 已暂停' : '请粘贴视频直链并开始播放')
-                      : '等待房主开始播放'}
+                      ? '请粘贴视频直链并开始播放'
+                      : (screeningStarted ? '⏸ 房主已暂停' : '等待房主开始播放')}
                   </p>
                 </div>
               )}
