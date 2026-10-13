@@ -1917,7 +1917,10 @@ export default function RoomView() {
     isPlayingRef.current = true;
     // 【原生控制条】本场放映开始：此后房主用浏览器原生控制条做的暂停/播放
     // 才算「本场的暂停/播放」，需要广播给观众。
+    // 同时置 screeningStarted：房主面板据此把「播放网络视频」换成「结束放映」，
+    // 保证本场进行中时网页端不再出现任何播放按钮（与「只用原生控制条」一致）。
     hostScreenActiveRef.current = true;
+    setScreeningStarted(true);
     loadLocalUrl(url, isHls);
     socketRef.current?.emit('host-start-play', {
       roomId: id,
@@ -2447,7 +2450,20 @@ export default function RoomView() {
                   )}
                 </div>
 
-                {!isPlaying ? (
+                {/* 【原生控制条】这里的按钮语义：
+                    · 本场放映进行中（可能正被房主用原生控制条暂停）→ **只给「结束放映」**。
+                      绝不能在这个状态下显示「播放网络视频」——那等于又冒出一个网页播放键，
+                      而且它走的是 startRemotePlayback（从 0 重新加载），点了会把整场拉回开头，
+                      不是「继续播放」。恢复播放的唯一入口是浏览器原生控制条的播放键。
+                    · 尚未开播（没有播放源 / 上一场已结束并清源）→ 显示「播放网络视频」作为开播入口。 */}
+                {screeningStarted ? (
+                  <button
+                    onClick={stopPlayback}
+                    className="btn btn-secondary"
+                  >
+                    ⏹️ 结束放映
+                  </button>
+                ) : (
                   <button
                     onClick={startPlayback}
                     className="btn btn-success"
@@ -2455,16 +2471,6 @@ export default function RoomView() {
                   >
                     ▶️ 播放网络视频
                   </button>
-                ) : (
-                  <>
-                    {/* 暂停/继续改用视频原生控制条，此处仅保留结束放映 */}
-                    <button
-                      onClick={stopPlayback}
-                      className="btn btn-secondary"
-                    >
-                      ⏹️ 结束放映
-                    </button>
-                  </>
                 )}
 
                 {/* 房主随时可解散房间 */}
