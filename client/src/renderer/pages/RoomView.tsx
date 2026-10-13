@@ -221,16 +221,6 @@ export default function RoomView() {
   // 视频加载错误提示：网络直链可能因跨域/失效而失败，需要明确反馈而非"点了没反应"
   const [videoError, setVideoError] = useState('');
 
-  // ===== 房主本地静音（不影响观众）=====
-  // 原理：视频元素音频经 WebAudio 分流为两路——
-  //   监听路（经过增益节点）→ 房主扬声器，可本地静音；
-  //   采集路（不经过增益节点）→ 发给观众的音频流，房主静音不影响。
-  const [hostMuted, setHostMuted] = useState(false);
-  const hostMutedRef = useRef(false);
-  const hostAudioCtxRef = useRef<AudioContext | null>(null);
-  const hostMonitorGainRef = useRef<GainNode | null>(null);
-  const hostCaptureAudioTrackRef = useRef<MediaStreamTrack | null>(null);
-
   // 电影播放完毕：房主弹窗「是否解散该房间」
   const [endedPrompt, setEndedPrompt] = useState(false);
 
@@ -407,14 +397,6 @@ export default function RoomView() {
     setIsPlaying(false);
     isPlayingRef.current = false;
     setEndedPrompt(false);
-    // 重置本地静音状态（音频图与元素复用，仅复位增益与状态）
-    setHostMuted(false);
-    hostMutedRef.current = false;
-    if (hostMonitorGainRef.current) {
-      try { hostMonitorGainRef.current.gain.value = 1; } catch {}
-      hostMonitorGainRef.current = null;
-    }
-    hostCaptureAudioTrackRef.current = null;
     recentMsgSigRef.current.clear();
   };
 
@@ -1053,59 +1035,6 @@ export default function RoomView() {
       localMicRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localMicRef.current!);
       });
-    }
-  };
-
-  /**
-   * 房主音频分流：把视频元素音频接入 WebAudio，拆成「本地监听」与「观众采集」两路。
-   * 房主静音只把监听路增益置 0，观众采集路不受影响。
-   * 注意：同一个媒体元素只能 createMediaElementSource 一次，源节点挂在元素属性上复用。
-   */
-  const setupHostAudioGraph = () => {
-    const el = (hostSessionRef.current?.video || localVideoRef.current) as any;
-    if (!el) return;
-    try {
-      if (!hostAudioCtxRef.current) {
-        hostAudioCtxRef.current = new AudioContext();
-      }
-      const ctx = hostAudioCtxRef.current;
-      ctx.resume?.().catch(() => {});
-
-      let source: MediaElementAudioSourceNode | undefined = el.__mrAudioSource;
-      if (!source) {
-        source = ctx.createMediaElementSource(el);
-        el.__mrAudioSource = source;
-
-        // 监听路：房主扬声器（可本地静音）
-        const monitorGain = ctx.createGain();
-        source.connect(monitorGain);
-        monitorGain.connect(ctx.destination);
-        hostMonitorGainRef.current = monitorGain;
-        monitorGain.gain.value = hostMutedRef.current ? 0 : 1;
-
-        // 采集路：发给观众（不经过监听增益，房主静音不影响观众）
-        const dest = ctx.createMediaStreamDestination();
-        source.connect(dest);
-        hostCaptureAudioTrackRef.current = dest.stream.getAudioTracks()[0] || null;
-      } else {
-        ctx.resume?.().catch(() => {});
-        if (hostMonitorGainRef.current) {
-          hostMonitorGainRef.current.gain.value = hostMutedRef.current ? 0 : 1;
-        }
-      }
-    } catch (err) {
-      // WebAudio 不可用时静默回退：音频仍走 captureStream 原路径，本地静音功能降级
-      console.error('初始化房主音频分流失败:', err);
-    }
-  };
-
-  /** 房主本地静音开关：只影响自己的扬声器，不影响观众听到的音频 */
-  const toggleHostMute = () => {
-    const next = !hostMuted;
-    setHostMuted(next);
-    hostMutedRef.current = next;
-    if (hostMonitorGainRef.current) {
-      try { hostMonitorGainRef.current.gain.value = next ? 0 : 1; } catch {}
     }
   };
 
@@ -2340,19 +2269,13 @@ export default function RoomView() {
                   </button>
                 ) : (
                   <>
-                    {/* 暂停/继续改用视频原生控制条，此处仅保留结束放映与本地静音 */}
+                    {/* 暂停/继续改用视频原生控制条，此处仅保留结束放映 */}
                     <button
                       onClick={stopPlayback}
                       className="btn btn-secondary"
                     >
                       ⏹️ 结束放映
                     </button>
-                    {/* 房主本地静音：只静自己的扬声器，观众不受影响（本地文件模式） */}
-                    {!usingRemoteUrl && (
-                      <button onClick={toggleHostMute} className="btn btn-secondary">
-                        {hostMuted ? '🔇 本地已静音' : '🔊 本地静音'}
-                      </button>
-                    )}
                   </>
                 )}
 
