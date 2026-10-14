@@ -56,3 +56,9 @@ uploads/
 .tmp-*/
 .tmp-chrome/
 .tmp-src/
+
+# 部署同步用的 SSH 私钥与 known_hosts（绝不能入库）
+dsh-sync-key
+dsh-sync-key.pub
+dsh-known-hosts
+dsh-payload.b64
