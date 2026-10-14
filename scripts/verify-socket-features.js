@@ -1,43 +1,63 @@
 /**
- * Socket 实时功能试运行测试：验证聊天、语音、播放控制、投票等实时功能可用。
- * 覆盖：双用户进房、互发消息、语音状态、房主播放控制、踢人投票、离开
+ * Socket 实时功能回归测试：验证聊天、语音、播放控制、踢人等实时功能可用。
+ * 覆盖：双用户进房、互发消息、聊天限流、语音状态、房主播放控制、非房主越权、
+ *       房主直接踢人、被踢后禁止再入、房主断线通知。
+ *
+ * 【P5 修复】
+ *  1. 删除了「放映投票」整节 —— 服务端**根本没有** playback-vote-request 事件
+ *     （该机制已按需求移除，仅客户端残留），旧版因此恒失败、脚本永远 exit 1。
+ *     改为验证真实的 host-pause 路径（房主直接暂停，无需投票）。
+ *  2. 删除所有恒真断言（`|| true`、`.length >= 0`、字面量 true）。
+ *  3. 「被踢后无法再进入」改为比较踢出前后的计数增量，而不是 `>= 1`（那已经满足）。
+ *  4. 清理不再全表 `updateMany({ data: { abruptLeaves: 0 } })`（会宽恕所有真实违规用户），
+ *     只重置本次创建的两个测试用户。
+ *  5. 连接等待加超时与 connect_error 处理；固定 sleep 改为 waitFor 轮询。
+ *  6. 目标地址支持 VERIFY_BASE 覆盖。
  */
 const path = require('path');
-const fs = require('fs');
 const { io } = require('socket.io-client');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
+const {
+  SERVER_DIR, BASE, loadSecret, resolveDatabaseUrl, sleep, waitFor, connectSocket, createChecker,
+} = require('./verify-common');
 
-const SERVER_DIR = path.join(__dirname, '..', 'server');
-process.env.DATABASE_URL = 'file:' + path.join(SERVER_DIR, 'prisma', 'dev.db').replace(/\\/g, '/');
-const BASE = 'http://127.0.0.1:3001';
+process.env.DATABASE_URL = resolveDatabaseUrl();
+const SECRET = loadSecret();
+const checker = createChecker('Socket 功能结果');
+const { check, skipCheck, report } = checker;
 
-function loadSecret() {
-  const env = fs.readFileSync(path.join(SERVER_DIR, '.env'), 'utf8');
-  return env.match(/JWT_SECRET="?([^"\r\n]+)"?/)[1].trim();
-}
-
-let pass = 0, fail = 0;
-const issues = [];
-function check(name, cond, detail = '') {
-  if (cond) { console.log(`  ✅ ${name}`); pass++; }
-  else { console.log(`  ❌ ${name}${detail ? ' → ' + detail : ''}`); fail++; issues.push({ name, detail }); }
-}
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const WATCHED_EVENTS = [
+  'user-joined', 'room-joined', 'chat-message', 'chat-limited', 'voice-state', 'user-speaking',
+  'playback-start', 'playback-pause', 'playback-resume', 'playback-stop', 'user-left', 'kicked',
+  'host-disconnected', 'kick-result', 'error',
+];
 
 (async () => {
   const prisma = new PrismaClient();
-  const SECRET = loadSecret();
-  console.log('\n========== Socket 实时功能试运行 ==========\n');
+  console.log('\n========== Socket 实时功能回归 ==========\n');
 
   const uniq = Date.now();
   const hash = await bcrypt.hash('socktest123', 10);
+  const testEmails = ['sockHost@test.local', 'sockViewer@test.local'];
+
+  // 幂等清理：先移除上次运行可能残留的房间（否则会占用房主配额导致建房失败）
+  const staleUsers = await prisma.user.findMany({ where: { email: { in: testEmails } }, select: { id: true } });
+  if (staleUsers.length) {
+    const ids = staleUsers.map((u) => u.id);
+    const staleRooms = await prisma.room.findMany({ where: { hostId: { in: ids } }, select: { id: true } });
+    for (const r of staleRooms) {
+      await prisma.roomBan.deleteMany({ where: { roomId: r.id } });
+      await prisma.roomMember.deleteMany({ where: { roomId: r.id } });
+      await prisma.room.delete({ where: { id: r.id } }).catch(() => {});
+    }
+  }
+
   const userA = await prisma.user.upsert({
     where: { email: 'sockHost@test.local' },
-    update: { passwordHash: hash, banned: false },
-    create: { username: 'sockHost', email: 'sockHost@test.local', passwordHash: hash, nickname: '房主' },
+    update: { passwordHash: hash, banned: false, maxRoomsPerIp: 5 },
+    create: { username: 'sockHost', email: 'sockHost@test.local', passwordHash: hash, nickname: '房主', maxRoomsPerIp: 5 },
   });
   const userB = await prisma.user.upsert({
     where: { email: 'sockViewer@test.local' },
@@ -54,150 +74,182 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const tokenA = jwt.sign({ userId: userA.id, tv: userA.tokenVersion }, SECRET, { expiresIn: '1h' });
   const tokenB = jwt.sign({ userId: userB.id, tv: userB.tokenVersion }, SECRET, { expiresIn: '1h' });
 
-  const sockA = io(BASE, { auth: { token: tokenA }, transports: ['websocket'], forceNew: true });
-  const sockB = io(BASE, { auth: { token: tokenB }, transports: ['websocket'], forceNew: true });
-
-  const events = { A: {}, B: {} };
+  const events = { A: {}, B: {}, B2: {} };
   function watch(sock, who) {
-    ['user-joined','room-joined','chat-message','voice-state','user-speaking',
-     'playback-start','playback-pause','playback-stop','user-left','kicked',
-     'host-disconnected','kick-result','playback-vote-request'].forEach(ev => {
-      events[who][ev] = [];
+    WATCHED_EVENTS.forEach((ev) => {
+      events[who][ev] = events[who][ev] || [];
       sock.on(ev, (d) => events[who][ev].push(d));
     });
   }
-  watch(sockA, 'A'); watch(sockB, 'B');
 
-  // ==================== 1. 连接与加入 ====================
-  console.log('[1] 连接与加入房间');
-  await new Promise(r => sockA.on('connect', r));
-  await new Promise(r => sockB.on('connect', r));
-  check('用户 A 连接成功', sockA.connected);
-  check('用户 B 连接成功', sockB.connected);
+  let sockA, sockB, sockB2;
+  try {
+    sockA = await connectSocket(io, BASE, tokenA, { label: '用户A' });
+    sockB = await connectSocket(io, BASE, tokenB, { label: '用户B' });
+    watch(sockA, 'A'); watch(sockB, 'B');
 
-  sockA.emit('join-room', room.id);
-  await sleep(600);
-  check('房主 A 加入房间收到 room-joined', events.A['room-joined'].length === 1,
-    `count=${events.A['room-joined'].length}`);
+    // ==================== 1. 连接与加入 ====================
+    console.log('[1] 连接与加入房间');
+    check('用户 A 连接成功', sockA.connected);
+    check('用户 B 连接成功', sockB.connected);
 
-  sockB.emit('join-room', room.id);
-  await sleep(600);
-  check('观众 B 加入房间收到 room-joined', events.B['room-joined'].length === 1);
-  check('A 收到 B 加入通知 user-joined', events.A['user-joined'].some(d => d.userId === userB.id));
-  check('B 的用户列表含房主 A', events.B['room-joined'][0]?.users?.some(u => u.userId === userA.id) ?? false,
-    JSON.stringify(events.B['room-joined'][0]?.users?.map(u=>u.userId)));
+    sockA.emit('join-room', room.id);
+    const aJoined = await waitFor(() => events.A['room-joined'].length === 1, 5000);
+    check('房主 A 加入房间收到 room-joined', aJoined, `count=${events.A['room-joined'].length}`);
 
-  // ==================== 2. 聊天 ====================
-  console.log('\n[2] 实时聊天');
-  sockA.emit('chat-message', { roomId: room.id, message: '大家好' });
-  await sleep(500);
-  check('B 收到 A 的聊天消息', events.B['chat-message'].some(d => d.message === '大家好'),
-    `count=${events.B['chat-message'].length}`);
-  sockB.emit('chat-message', { roomId: room.id, message: '你好呀' });
-  await sleep(500);
-  check('A 收到 B 的聊天消息', events.A['chat-message'].some(d => d.message === '你好呀'));
+    sockB.emit('join-room', room.id);
+    const bJoined = await waitFor(() => events.B['room-joined'].length === 1, 5000);
+    check('观众 B 加入房间收到 room-joined', bJoined);
+    check('A 收到 B 加入通知 user-joined',
+      await waitFor(() => events.A['user-joined'].some((d) => d.userId === userB.id), 4000));
+    check('B 的用户列表含房主 A',
+      events.B['room-joined'][0]?.users?.some((u) => u.userId === userA.id) ?? false,
+      JSON.stringify(events.B['room-joined'][0]?.users?.map((u) => u.userId)));
 
-  // 聊天限流：3 秒内连发应被拒
-  const limitedBefore = events.A['chat-message'].length;
-  sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸1' });
-  sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸2' });
-  sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸3' });
-  await sleep(500);
-  check('聊天限流生效（3秒内连发被抑制）', events.B['chat-message'].length < 4,
-    `B收到=${events.B['chat-message'].length}`);
+    // ==================== 2. 聊天 ====================
+    console.log('\n[2] 实时聊天');
+    sockA.emit('chat-message', { roomId: room.id, message: '大家好' });
+    check('B 收到 A 的聊天消息',
+      await waitFor(() => events.B['chat-message'].some((d) => d.message === '大家好'), 4000),
+      `count=${events.B['chat-message'].length}`);
+    sockB.emit('chat-message', { roomId: room.id, message: '你好呀' });
+    check('A 收到 B 的聊天消息',
+      await waitFor(() => events.A['chat-message'].some((d) => d.message === '你好呀'), 4000));
 
-  // ==================== 3. 语音状态 ====================
-  console.log('\n[3] 语音状态');
-  sockA.emit('voice-join', room.id);
-  await sleep(500);
-  check('B 收到 A 加入语音', events.B['voice-state'].some(d => d.userId === userA.id && d.inVoice === true));
-  sockA.emit('speaking', { roomId: room.id, speaking: true, level: 0.8 });
-  await sleep(500);
-  check('B 收到 A 说话状态', events.B['user-speaking'].some(d => d.userId === userA.id && d.speaking === true));
-  sockA.emit('voice-leave', room.id);
-  await sleep(500);
-  check('B 收到 A 离开语音', events.B['voice-state'].some(d => d.userId === userA.id && d.inVoice === false));
+    // 聊天限流：3 秒内连发只应有 1 条到达
+    const beforeLimited = events.B['chat-message'].length;
+    sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸1' });
+    sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸2' });
+    sockA.emit('chat-message', { roomId: room.id, message: '连续轰炸3' });
+    // 等到第一条（若有）到达，再确认总增量不超过 1
+    await waitFor(() => events.B['chat-message'].length > beforeLimited, 3000);
+    await sleep(600);
+    const burstDelivered = events.B['chat-message'].length - beforeLimited;
+    check('聊天限流生效（3 秒内连发只放行 1 条）', burstDelivered <= 1,
+      `实际送达=${burstDelivered}`);
+    check('限流时向发送方回执 chat-limited',
+      await waitFor(() => events.A['chat-limited'].length >= 1, 3000), `count=${events.A['chat-limited'].length}`);
 
-  // ==================== 4. 播放控制（房主） ====================
-  console.log('\n[4] 播放控制');
-  sockA.emit('host-start-play', { roomId: room.id, movieName: '测试电影.mp4' });
-  await sleep(600);
-  check('B 收到开始播放通知', events.B['playback-start'].some(d => d.movieName === '测试电影.mp4'));
-  const roomPlaying = await prisma.room.findUnique({ where: { id: room.id }, select: { status: true, currentMovie: true } });
-  check('数据库状态更新为 PLAYING', roomPlaying.status === 'PLAYING', `status=${roomPlaying.status}`);
-  check('数据库记录当前电影', roomPlaying.currentMovie === '测试电影.mp4');
+    // ==================== 3. 语音状态 ====================
+    console.log('\n[3] 语音状态');
+    sockA.emit('voice-join', room.id);
+    check('B 收到 A 加入语音',
+      await waitFor(() => events.B['voice-state'].some((d) => d.userId === userA.id && d.inVoice === true), 4000));
+    sockA.emit('speaking', { roomId: room.id, speaking: true, level: 0.8 });
+    check('B 收到 A 说话状态',
+      await waitFor(() => events.B['user-speaking'].some((d) => d.userId === userA.id && d.speaking === true), 4000));
+    sockA.emit('voice-leave', room.id);
+    check('B 收到 A 离开语音',
+      await waitFor(() => events.B['voice-state'].some((d) => d.userId === userA.id && d.inVoice === false), 4000));
 
-  // 非房主不能控制播放
-  sockB.emit('host-start-play', { roomId: room.id, movieName: '劫持.mp4' });
-  await sleep(500);
-  check('非房主发起播放无效', !events.A['playback-start'].some(d => d.movieName === '劫持.mp4'));
+    // ==================== 4. 播放控制（房主） ====================
+    console.log('\n[4] 播放控制');
+    sockA.emit('host-start-play', { roomId: room.id, movieName: '测试电影.mp4' });
+    check('B 收到开始播放通知',
+      await waitFor(() => events.B['playback-start'].some((d) => d.movieName === '测试电影.mp4'), 4000));
+    const roomPlaying = await waitFor(async () => {
+      const r = await prisma.room.findUnique({ where: { id: room.id }, select: { status: true, currentMovie: true } });
+      return r && r.status === 'PLAYING';
+    }, 4000) && await prisma.room.findUnique({ where: { id: room.id }, select: { status: true, currentMovie: true } });
+    check('数据库状态更新为 PLAYING', roomPlaying.status === 'PLAYING', `status=${roomPlaying.status}`);
+    check('数据库记录当前电影', roomPlaying.currentMovie === '测试电影.mp4');
 
-  // ==================== 5. 放映投票 ====================
-  console.log('\n[5] 放映投票（暂停/结束）');
-  sockA.emit('playback-vote-request', { roomId: room.id, action: 'pause' });
-  await sleep(500);
-  check('B 收到暂停投票请求', events.B['playback-vote-request'].some(d => d.action === 'pause'));
-  // 2 人房，阈值 1 票，A 发起即同意 → 直接通过
-  await sleep(600);
-  check('投票通过后 B 收到暂停指令', events.B['playback-pause'].length >= 1,
-    `count=${events.B['playback-pause'].length}`);
+    // 非房主不能控制播放
+    const bPlayBefore = events.A['playback-start'].length;
+    sockB.emit('host-start-play', { roomId: room.id, movieName: '劫持.mp4' });
+    await sleep(700);
+    check('非房主发起播放无效（A 未收到劫持播报）',
+      events.A['playback-start'].length === bPlayBefore && !events.A['playback-start'].some((d) => d.movieName === '劫持.mp4'));
+    check('非房主越权时收到 error 回执', events.B['error'].length >= 1, `count=${events.B['error'].length}`);
 
-  // ==================== 6. 房主踢人（直接踢出） ====================
-  console.log('\n[6] 房主踢人');
-  sockA.emit('kick-user', { roomId: room.id, targetUserId: userB.id });
-  await sleep(700);
-  check('全体收到踢出结果广播', events.A['kick-result'].some(d => d.targetUserId === userB.id));
-  check('B 收到被踢通知', events.B['kicked'].length >= 1, `count=${events.B['kicked'].length}`);
-  check('A 收到 B 离开通知', events.A['user-left'].some(d => d.userId === userB.id));
-  const banned = await prisma.roomBan.findUnique({ where: { roomId_userId: { roomId: room.id, userId: userB.id } } });
-  check('B 被写入房间黑名单', !!banned);
+    // ==================== 5. 房主直接暂停（原「放映投票」已按需求移除） ====================
+    console.log('\n[5] 暂停控制（房主直接操作，无投票机制）');
+    const pauseBefore = events.B['playback-pause'].length;
+    sockA.emit('host-pause', { roomId: room.id });
+    check('房主暂停后 B 收到 playback-pause',
+      await waitFor(() => events.B['playback-pause'].length > pauseBefore, 4000),
+      `count=${events.B['playback-pause'].length}`);
+    const resumeBefore = events.B['playback-resume']?.length || 0;
+    sockA.emit('host-resume', { roomId: room.id });
+    check('房主恢复后 B 收到 playback-resume',
+      await waitFor(() => (events.B['playback-resume']?.length || 0) > resumeBefore, 4000));
+    // 非房主不能暂停
+    const pauseBeforeB = events.A['playback-pause'].length;
+    sockB.emit('host-pause', { roomId: room.id });
+    await sleep(700);
+    check('非房主发起暂停无效', events.A['playback-pause'].length === pauseBeforeB);
 
-  // 被踢后不能再进
-  sockB.emit('join-room', room.id);
-  await sleep(500);
-  const kickedCount = events.B['kicked'].length;
-  check('被踢后无法再进入房间', kickedCount >= 1, `kicked=${kickedCount}`);
+    // ==================== 6. 房主踢人 ====================
+    console.log('\n[6] 房主踢人');
+    const kickedBefore = events.B['kicked'].length;
+    sockA.emit('kick-user', { roomId: room.id, targetUserId: userB.id });
+    check('全体收到踢出结果广播',
+      await waitFor(() => events.A['kick-result'].some((d) => d.targetUserId === userB.id), 4000));
+    check('B 收到被踢通知',
+      await waitFor(() => events.B['kicked'].length > kickedBefore, 4000),
+      `count=${events.B['kicked'].length}`);
+    check('A 收到 B 离开通知',
+      await waitFor(() => events.A['user-left'].some((d) => d.userId === userB.id), 4000));
+    const banned = await prisma.roomBan.findUnique({ where: { roomId_userId: { roomId: room.id, userId: userB.id } } });
+    check('B 被写入房间黑名单', !!banned);
 
-  // ==================== 7. 断开与房主中断处理 ====================
-  console.log('\n[7] 断线处理');
-  // B 已被踢，重新加入需先清黑名单
-  await prisma.roomBan.deleteMany({ where: { roomId: room.id } });
-  await prisma.roomMember.upsert({
-    where: { roomId_userId: { roomId: room.id, userId: userB.id } },
-    create: { roomId: room.id, userId: userB.id, role: 'VIEWER' },
-    update: {},
-  });
-  const sockB2 = io(BASE, { auth: { token: tokenB }, transports: ['websocket'], forceNew: true });
-  watch(sockB2, 'B');
-  await new Promise(r => sockB2.on('connect', r));
-  sockB2.emit('join-room', room.id);
-  await sleep(500);
-  check('清除黑名单后 B 可重新加入', true);
+    // 被踢后不能再进：必须比较「再入尝试之后」的计数增量
+    const kickedAfterKick = events.B['kicked'].length;
+    sockB.emit('join-room', room.id);
+    const rejoinRejected = await waitFor(() => events.B['kicked'].length > kickedAfterKick, 4000);
+    check('被踢后再次 join-room 被拒（kicked 计数增加）', rejoinRejected,
+      `before=${kickedAfterKick} after=${events.B['kicked'].length}`);
+    // 且没有收到 room-joined
+    const joinedAfterKick = events.B['room-joined'].length;
+    await sleep(400);
+    check('被踢后未收到 room-joined', events.B['room-joined'].length === joinedAfterKick);
 
-  // 房主断线（放映中）→ 观众收到通知
-  await prisma.room.update({ where: { id: room.id }, data: { status: 'PLAYING' } });
-  sockA.disconnect();
-  await sleep(1000);
-  check('房主断线后 B 收到 host-disconnected', events.B['host-disconnected'].length >= 1 ||
-    events.B['playback-stop'].length >= 0, `hd=${events.B['host-disconnected'].length}`);
+    // ==================== 7. 断线处理 ====================
+    console.log('\n[7] 断线处理');
+    // 清除黑名单后 B 可重新加入（用真实的 room-joined 事件判断，而不是字面量 true）
+    await prisma.roomBan.deleteMany({ where: { roomId: room.id } });
+    await prisma.roomMember.upsert({
+      where: { roomId_userId: { roomId: room.id, userId: userB.id } },
+      create: { roomId: room.id, userId: userB.id, role: 'VIEWER' },
+      update: {},
+    });
+    sockB2 = await connectSocket(io, BASE, tokenB, { label: '用户B2' });
+    watch(sockB2, 'B2');
+    sockB2.emit('join-room', room.id);
+    check('清除黑名单后 B 可重新加入',
+      await waitFor(() => events.B2['room-joined'].length >= 1, 5000),
+      `count=${events.B2['room-joined'].length}`);
 
-  sockA.close(); sockB.close(); sockB2.close();
+    // 房主断线（放映中）→ 观众收到通知。
+    // 服务端有 20 秒宽限期（HOST_GRACE_MS），因此必须等待超过该窗口。
+    await prisma.room.update({ where: { id: room.id }, data: { status: 'PLAYING' } });
+    sockA.disconnect();
+    const gotHostDisconnected = await waitFor(() => events.B2['host-disconnected'].length >= 1, 28000, 200);
+    check('房主断线后 B 收到 host-disconnected（等待宽限期结束）', gotHostDisconnected,
+      `count=${events.B2['host-disconnected'].length}`);
+    const statusAfter = await prisma.room.findUnique({ where: { id: room.id }, select: { status: true } });
+    check('房主断线后房间状态回到 WAITING', statusAfter?.status === 'WAITING', `status=${statusAfter?.status}`);
+  } finally {
+    try { sockA?.close(); } catch { /* ignore */ }
+    try { sockB?.close(); } catch { /* ignore */ }
+    try { sockB2?.close(); } catch { /* ignore */ }
 
-  // 清理
-  await prisma.roomBan.deleteMany({ where: { roomId: room.id } });
-  await prisma.roomMember.deleteMany({ where: { roomId: room.id } });
-  await prisma.room.delete({ where: { id: room.id } });
-  await prisma.user.deleteMany({ where: { email: { in: ['sockHost@test.local', 'sockViewer@test.local'] } } });
-  // 房主断线会增加 abruptLeaves，重置
-  await prisma.user.updateMany({ data: { abruptLeaves: 0 } });
-  await prisma.$disconnect();
-
-  console.log('\n' + '='.repeat(50));
-  console.log(`Socket 功能结果：通过 ${pass} / 失败 ${fail}`);
-  if (fail > 0) {
-    console.log('\n存在问题的功能：');
-    issues.forEach(i => console.log(`  - ${i.name}${i.detail ? '：' + i.detail : ''}`));
+    // 【P5】精确清理：只删本次创建的房间与两个测试用户；
+    // 不再 updateMany({}) 全表重置 abruptLeaves（那会宽恕所有真实违规用户）。
+    try {
+      await prisma.roomBan.deleteMany({ where: { roomId: room.id } });
+      await prisma.roomMember.deleteMany({ where: { roomId: room.id } });
+      await prisma.room.delete({ where: { id: room.id } }).catch(() => {});
+      await prisma.user.deleteMany({ where: { id: { in: [userA.id, userB.id] } } });
+    } catch (e) {
+      console.error('清理测试数据失败:', e.message);
+    }
+    await prisma.$disconnect();
   }
-  console.log('='.repeat(50) + '\n');
-  process.exit(fail > 0 ? 1 : 0);
-})().catch(e => { console.error('测试异常:', e); process.exit(1); });
+
+  report();
+  process.exit(checker.counts().fail > 0 ? 1 : 0);
+})().catch(async (e) => {
+  console.error('测试异常:', e);
+  process.exit(1);
+});

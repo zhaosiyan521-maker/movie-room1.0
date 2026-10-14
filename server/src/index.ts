@@ -21,9 +21,19 @@ dotenv.config();
 const app = express();
 const httpServer = createServer(app);
 
-// 真实 IP 来源：本应用为本地桌面端直连，不位于反代之后，
-// 故关闭 trust proxy，避免攻击者通过 X-Forwarded-For 伪造 IP 绕过封禁。
-app.set('trust proxy', false);
+// 真实 IP 来源：由 TRUST_PROXY 显式决定（见 config/index.ts 的 trustProxy 注释）。
+// 默认（未配置）= 直连模式，不信任任何转发头，避免攻击者用 X-Forwarded-For 伪造 IP
+// 绕过限流与封禁。若服务位于 Nginx / 云负载均衡之后，**必须**同时设置：
+//   TRUST_PROXY=1（单层 Nginx）或对应的跳数，且反代需正确传递 X-Forwarded-For。
+// 注意：这里的取值不再硬编码 false。旧代码写死 false 并注释「本应用为本地桌面端直连」，
+// 与同仓库的 Nginx 部署文档相互矛盾，已按可配置方式修正。
+app.set('trust proxy', config.trustProxy as any);
+if (config.trustProxy) {
+  console.warn(
+    `⚠️  已启用可信代理（TRUST_PROXY=${String(config.trustProxy)}）：` +
+    `req.ip 将依据 X-Forwarded-For 解析，请确认所有入口代理都会覆盖该请求头`
+  );
+}
 
 // 基本安全响应头（不引入额外依赖，手动设置关键项）
 app.use((req, res, next) => {

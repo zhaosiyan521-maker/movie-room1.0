@@ -49,6 +49,7 @@ if not exist "server\.env" (
         echo PORT=3001
         echo HOST="127.0.0.1"
         echo CLIENT_URL="http://localhost:5173,http://localhost:3001,http://127.0.0.1:3001"
+        echo TRUST_PROXY="0"
         echo SMTP_HOST=""
         echo SMTP_PORT="587"
         echo SMTP_SECURE="false"

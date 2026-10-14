@@ -1,57 +1,50 @@
 /**
  * 功能试运行测试：逐项覆盖所有用户功能，找出影响正常使用的问题。
  * 这是「功能是否能用」的验证，而非安全验证。
+ * 【P5】改为复用 scripts/verify-common.js：请求加超时，目标地址支持 VERIFY_BASE 覆盖。
  */
-const path = require('path');
-const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
+const { loadSecret, resolveDatabaseUrl, createChecker, api } = require('./verify-common');
 
-const SERVER_DIR = path.join(__dirname, '..', 'server');
-process.env.DATABASE_URL = 'file:' + path.join(SERVER_DIR, 'prisma', 'dev.db').replace(/\\/g, '/');
-const BASE = 'http://127.0.0.1:3001';
-
-function loadSecret() {
-  const env = fs.readFileSync(path.join(SERVER_DIR, '.env'), 'utf8');
-  return env.match(/JWT_SECRET="?([^"\r\n]+)"?/)[1].trim();
-}
-
-let pass = 0, fail = 0;
-const issues = [];
-function check(name, cond, detail = '') {
-  if (cond) { console.log(`  ✅ ${name}`); pass++; }
-  else { console.log(`  ❌ ${name}${detail ? ' → ' + detail : ''}`); fail++; issues.push({ name, detail }); }
-}
-
-async function api(p, opts = {}) {
-  try {
-    const res = await fetch(BASE + p, {
-      ...opts,
-      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    });
-    let body = null;
-    try { body = await res.json(); } catch { /* empty */ }
-    return { status: res.status, body };
-  } catch (e) {
-    return { status: 0, body: null, error: e.message };
-  }
-}
+process.env.DATABASE_URL = resolveDatabaseUrl();
+const SECRET = loadSecret();
+const checker = createChecker('功能试运行结果');
+const { check, skipCheck, report } = checker;
 
 (async () => {
   const prisma = new PrismaClient();
-  const SECRET = loadSecret();
   console.log('\n========== 功能试运行测试 ==========\n');
 
   const uniq = Date.now();
   const admin = await prisma.user.findFirst({ where: { isAdmin: true } });
 
+  // 【P5】夹具自愈：清理上次运行残留的测试房间。
+  // 服务端按「IP + 用户」限制同时开设的房间数（User.maxRoomsPerIp 默认 1），
+  // 而本脚本需要同时存在 3 个房间（普通房 / 密码房 / 满员小房）。
+  // 旧版没有清理，导致：上一次运行残留的房间直接让本次第一个建房就失败，
+  // 后续依赖 roomId/pwRoomId/tinyId 的检查连锁失败，且每次运行都会污染下一次。
+  const testEmails = ['funcA@test.local', 'funcB@test.local'];
+  const preexisting = await prisma.user.findMany({ where: { email: { in: testEmails } }, select: { id: true } });
+  if (preexisting.length) {
+    const ids = preexisting.map(u => u.id);
+    const staleRooms = await prisma.room.findMany({ where: { hostId: { in: ids } }, select: { id: true } });
+    for (const r of staleRooms) {
+      await prisma.roomBan.deleteMany({ where: { roomId: r.id } });
+      await prisma.roomMember.deleteMany({ where: { roomId: r.id } });
+      await prisma.room.delete({ where: { id: r.id } }).catch(() => {});
+    }
+  }
+
   // 建两个测试用户（带真实密码，用于登录测试）
   const hash = await bcrypt.hash('functest123', 10);
   const userA = await prisma.user.upsert({
     where: { email: 'funcA@test.local' },
-    update: { passwordHash: hash, banned: false, tokenVersion: 0 },
-    create: { username: 'funcA', email: 'funcA@test.local', passwordHash: hash, nickname: '测试A' },
+    // 【P5】配额调高到 5：本脚本需要同时开 3 个房间，默认 1 会让建房校验一律失败。
+    // 这是测试夹具自身的需要，不改变服务端默认值。
+    update: { passwordHash: hash, banned: false, tokenVersion: 0, maxRoomsPerIp: 5 },
+    create: { username: 'funcA', email: 'funcA@test.local', passwordHash: hash, nickname: '测试A', maxRoomsPerIp: 5 },
   });
   const userB = await prisma.user.upsert({
     where: { email: 'funcB@test.local' },
@@ -120,8 +113,15 @@ async function api(p, opts = {}) {
   });
   check('创建无密码房间成功', create.status === 201, `status=${create.status} ${JSON.stringify(create.body).slice(0,80)}`);
   const roomId = create.body?.room?.id;
-  check('创建后房主自动成为成员', create.body?.room?._count?.members === 1 ||
-    true, ''); // 成员计数在创建时可能未含本次
+  // 【P5】原断言是 `... === 1 || true`（恒真）。改为真正查一次房间详情确认成员数。
+  if (roomId) {
+    const createdDetail = await api(`/api/rooms/${roomId}`, { headers: authA });
+    check('创建后房主自动成为成员',
+      (createdDetail.body?.room?.members || []).some(m => m.user.id === userA.id),
+      `members=${JSON.stringify(createdDetail.body?.room?.members?.map(m => m.user.username))}`);
+  } else {
+    check('创建后房主自动成为成员', false, '房间创建失败，无法校验');
+  }
 
   const createPw = await api('/api/rooms', {
     method: 'POST', headers: authA,
@@ -201,7 +201,9 @@ async function api(p, opts = {}) {
   const userRooms = await api(`/api/users/${userA.id}/rooms`, { headers: authB });
   check('获取用户公开房间', userRooms.status === 200, `status=${userRooms.status}`);
   const pubRoom = (userRooms.body?.rooms || []).find(r => r.name === roomName);
-  check('公开视角不含明文密码', pubRoom ? !('password' in pubRoom) : true);
+  // 【P5】原写法 `pubRoom ? !('password' in pubRoom) : true` 在房间缺失时静默通过
+  check('公开视角能查到该房间', !!pubRoom);
+  check('公开视角不含明文密码', !!pubRoom && !('password' in pubRoom));
 
   // ==================== 13. 房间状态更新 ====================
   console.log('\n[13] 房间状态更新');
@@ -241,7 +243,7 @@ async function api(p, opts = {}) {
   check('房主可更新房间图片', imgUpd.status === 200, `status=${imgUpd.status} ${JSON.stringify(imgUpd.body).slice(0,80)}`);
   const imgArr = imgUpd.body?.images;
   check('返回图片路径数组', Array.isArray(imgArr) && imgArr.length === 1 && imgArr[0].startsWith('/uploads/'),
-    JSON.stringify(imgArr).slice(0,80));
+    JSON.stringify(imgArr ?? null)?.slice(0, 80) ?? 'undefined');
   // 图片可公开访问
   if (imgArr && imgArr[0]) {
     const imgRes = await fetch(BASE + imgArr[0]);
@@ -323,12 +325,6 @@ async function api(p, opts = {}) {
 
   await prisma.$disconnect();
 
-  console.log('\n' + '='.repeat(50));
-  console.log(`功能试运行结果：通过 ${pass} / 失败 ${fail}`);
-  if (fail > 0) {
-    console.log('\n存在问题的功能：');
-    issues.forEach(i => console.log(`  - ${i.name}${i.detail ? '：' + i.detail : ''}`));
-  }
-  console.log('='.repeat(50) + '\n');
-  process.exit(fail > 0 ? 1 : 0);
+  report();
+  process.exit(checker.counts().fail > 0 ? 1 : 0);
 })().catch(e => { console.error('测试异常:', e); process.exit(1); });

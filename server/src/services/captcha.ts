@@ -28,6 +28,25 @@ setInterval(() => {
 // 防止无界增长
 const MAX_CHALLENGES = 50_000;
 
+/**
+ * 已消费的滑块票据 jti（一次性）。
+ *
+ * 【M6 修复】此前的票据是不含 jti 的纯 JWT，`isValidCaptchaToken` 只验签，
+ * 因此同一张票据在 5 分钟有效期内可被反复用于 /api/auth/send-verify-link
+ *（一次验证 → 最多 5 次发信，取决于该接口的限流）。
+ * 这里记录已消费的 jti，做到「一次人机验证只对应一次业务操作」。
+ *
+ * 与 usedToken 表同理：票据 5 分钟即过期，因此按时间戳精确淘汰，绝不整体 clear。
+ */
+const CAPTCHA_TICKET_TTL_MS = config.captchaTtlSec * 1000;
+const usedCaptchaTickets = new Map<string, number>();
+setInterval(() => {
+  const cutoff = Date.now() - CAPTCHA_TICKET_TTL_MS;
+  for (const [jti, at] of usedCaptchaTickets) {
+    if (at < cutoff) usedCaptchaTickets.delete(jti);
+  }
+}, 60 * 1000).unref();
+
 // 底图尺寸（与客户端渲染尺寸保持一致比例，客户端按 CSS 缩放）
 const IMG_W = 300;
 const IMG_H = 150;
@@ -281,17 +300,37 @@ export function verifyCaptcha(id: string, pos: number): string | null {
   if (pos < 0 || pos > 1) return null;
   if (Math.abs(pos - c.gap) > 0.03) return null; // 容差 3%
 
-  return jwt.sign({ type: 'captcha' }, config.jwtSecret, {
+  return jwt.sign({ type: 'captcha', jti: uuidv4() }, config.jwtSecret, {
     expiresIn: `${config.captchaTtlSec}s`,
   });
 }
 
-/** 校验 captcha 票据是否有效 */
+/** 校验 captcha 票据是否有效（仅验签与类型，不消费） */
 export function isValidCaptchaToken(token: string): boolean {
   if (typeof token !== 'string' || !token) return false;
   try {
     const payload = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] }) as any;
     return payload.type === 'captcha';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 【M6】原子消费一张 captcha 票据：验签通过且未被使用过时标记为已用并返回 true。
+ * 同一张票据第二次调用返回 false，从而保证「一次人机验证 = 一次业务操作」。
+ */
+export function consumeCaptchaToken(token: string): boolean {
+  if (typeof token !== 'string' || !token) return false;
+  try {
+    const payload = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] }) as any;
+    if (payload.type !== 'captcha') return false;
+    const jti = typeof payload.jti === 'string' ? payload.jti : '';
+    // 兼容旧版无 jti 的票据：视为不可消费（拒绝），避免绕过一次性约束
+    if (!jti) return false;
+    if (usedCaptchaTickets.has(jti)) return false;
+    usedCaptchaTickets.set(jti, Date.now());
+    return true;
   } catch {
     return false;
   }

@@ -127,8 +127,35 @@ interface AuthenticatedSocket extends Socket {
   isAdmin?: boolean;
 }
 
+/**
+ * 【P2 修复】启动时回收「上次进程退出时残留」的房间成员行。
+ *
+ * 为什么需要：进程被强杀 / 断电 / PM2 重启时，所有 socket 的 disconnect 处理器
+ * 都不会执行，内存中的在线映射随之丢失，但 room_members 行仍留在库里。
+ * 这些行会永久占用房间名额（join 按行数判断满员），表现为「重启后房间显示已满、
+ * 但房间里其实一个人没有」。既然进程重启后内存映射已是权威的空状态，
+ * 这里可以安全地清空所有成员行，让成员行重新等于「本次进程生命周期内的真实成员」。
+ *
+ * 仅在启动时执行一次，且只删成员行（不动房间、用户、黑名单等其他数据）。
+ */
+async function reapStaleRoomMembers(): Promise<void> {
+  try {
+    const res = await prisma.roomMember.deleteMany({});
+    if (res.count > 0) {
+      dbg(`启动清理：已回收 ${res.count} 条上次运行残留的房间成员记录`);
+      console.log(`🧹 启动清理：回收了 ${res.count} 条残留的房间成员记录（占用的房间名额已释放）`);
+    }
+  } catch (error) {
+    // 清理失败不应阻断启动；但若持续失败，房间名额会被幽灵占用，需留日志
+    console.error('启动清理房间成员记录失败（房间名额可能被残留记录占用）:', error);
+  }
+}
+
 export function setupSocketHandlers(io: Server) {
   ioRef = io;
+
+  // 【P2】启动即回收上次运行残留的成员行（不 await，避免阻塞连接建立）
+  void reapStaleRoomMembers();
 
   // 中间件：认证
   io.use(async (socket: any, next) => {
@@ -227,21 +254,14 @@ export function setupSocketHandlers(io: Server) {
         if (typeof roomId !== 'string' || !roomId) return;
         const roomIdStr = roomId;
 
-        const member = await prisma.roomMember.findFirst({
-          where: {
-            roomId: roomIdStr,
-            userId: socket.userId!
-          }
-        });
-
-        if (!member) {
-          socket.emit('error', { message: '你不在该房间中' });
-          return;
-        }
-
-        // 【需求4】检查踢出记录： KICK_BAN_DURATION_MS（5 小时）内禁止再次进入。
+        // 【需求4】先检查踢出记录：KICK_BAN_DURATION_MS（5 小时）内禁止再次进入。
         // 这是独立时效，与房间是否换片、是否换过电影无关（跨电影依然有效）。
         // 超过 5 小时的记录虽然仍留在库中，但视为已失效，放行进入。
+        //
+        // 顺序很重要：被踢时 applyKick 会删除该用户的 roomMember 行，因此被踢者
+        // **必然不是成员**。若先判成员资格，他只会收到「你不在该房间中」而拿不到
+        // 真正的禁入原因与剩余时间 —— 表现为「点了进入没反应」，用户不知道要等多久。
+        // 先判黑名单可以把准确原因回给他。
         const ban = await prisma.roomBan.findUnique({
           where: { roomId_userId: { roomId: roomIdStr, userId: socket.userId! } }
         });
@@ -255,6 +275,18 @@ export function setupSocketHandlers(io: Server) {
             });
             return;
           }
+        }
+
+        const member = await prisma.roomMember.findFirst({
+          where: {
+            roomId: roomIdStr,
+            userId: socket.userId!
+          }
+        });
+
+        if (!member) {
+          socket.emit('error', { message: '你不在该房间中' });
+          return;
         }
 
         // 离开之前的房间
@@ -865,6 +897,28 @@ async function applyKick(
 
 async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server, voluntary = false) {
   socket.leave(roomId);
+
+  // 【P2 修复】释放数据库成员行。
+  //
+  // 旧实现只清理内存映射，**从不删除 room_members 行**。成员行仅在「房主主动离开 /
+  // 被踢 / 房间解散」时被删，因此普通观众关闭页面、断网、服务重启后行会永久残留，
+  // 造成两类故障：
+  //   1) 容量被幽灵占用：join 用 roomMember.count() 判断是否满员，人已走空仍返回
+  //      「房间已满」，新观众永远进不来（且没有任何自动回收机制）；
+  //   2) 房间列表的人数长期虚高（_count.members 直接来自这张表）。
+  // 这里在离开/断连时删除该用户的成员行，使「成员行 == 当前真正在房间内的人」。
+  // 注意：房主行同样删除；房主刷新页面会在宽限期内重新 join-room 并重新插入，
+  // 而房间解散判定（dissolveRoom）本身是按 roomId 删除全部剩余行的，不受影响。
+  try {
+    await prisma.roomMember.deleteMany({ where: { roomId, userId: socket.userId } });
+  } catch (error) {
+    // 删除失败会导致名额泄漏，必须留下日志便于排查
+    console.error(`释放房间成员行失败（roomId=${roomId}）:`, error);
+  }
+
+  // 语音状态与内存名单一并复位（原先依赖 voiceStates 在 911 行被删，
+  // 但被踢/断线路径不经过 leaveRoom 的统一出口时容易遗漏，故在此显式声明）
+  voiceStates.delete(socket.id);
 
   // 判断是否是房主在放映途中离开/断线
   let hostAbrupt = false;

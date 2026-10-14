@@ -1,42 +1,33 @@
 import express, { Router, Response } from 'express';
-import fs from 'fs';
-import path from 'path';
 import { prisma } from '../config/database';
 import { authMiddleware, adminMiddleware, AuthRequest } from '../middleware/auth';
 import { getIO, disconnectUser, pushBroadcastUpdate } from '../services/signaling';
 import { dissolveRoom } from '../services/roomDissolve';
+import { deleteUnreferencedImages, safeUploadFilename } from '../services/roomImages';
 
 export const adminRouter = Router();
 
-// 强制注销时清理用户房间图片文件（复用 room.ts 的跨房间引用检查思路，避免误删他人图片）
-const UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads');
-const IMG_NAME_RE = /^\/uploads\/([a-zA-Z0-9_-]+\.(?:png|jpg|jpeg|webp|gif))$/;
+/**
+ * 强制注销时清理该用户房间的图片文件。
+ * 【M5】改为复用 services/roomImages 的统一实现（带跨房间引用检查 + 路径穿越双重校验），
+ * 原先此处是第三份重复实现，容易与另外两处产生行为漂移。
+ */
 async function purgeRoomImages(rooms: { images: string | null }[]): Promise<void> {
   try {
-    const filenames = new Set<string>();
+    const refs = new Set<string>();
     for (const r of rooms) {
       if (!r.images) continue;
       try {
         const arr = JSON.parse(r.images);
         if (Array.isArray(arr)) {
           for (const p of arr) {
-            if (typeof p === 'string') {
-              const m = IMG_NAME_RE.exec(p);
-              if (m) filenames.add(m[1]);
-            }
+            if (safeUploadFilename(p)) refs.add(p as string);
           }
         }
       } catch { /* 忽略解析错误 */ }
     }
-    for (const fn of filenames) {
-      // 若仍被其他房间引用则跳过（uuid 唯一，正常情况下不会；保守处理）
-      const others = await prisma.room.findMany({ where: { images: { contains: fn } }, select: { id: true } });
-      if (others.length > 0) continue;
-      const abs = path.join(UPLOAD_DIR, fn);
-      const rel = path.relative(UPLOAD_DIR, abs);
-      if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
-      try { if (fs.existsSync(abs)) fs.unlinkSync(abs); } catch { /* ignore */ }
-    }
+    // 房间行此时已被删除，因此任意命中都意味着仍被其他房间引用 → 不会被删除
+    await deleteUnreferencedImages(Array.from(refs), []);
   } catch (e) {
     console.error('清理用户房间图片失败:', e);
   }
@@ -129,12 +120,14 @@ adminRouter.get('/rooms', async (req: AuthRequest, res: Response) => {
       take: 500
     });
 
-    // 只下发是否存在密码，不下发明文
+    // 只下发是否存在密码，不下发明文。
+    // 注意：必须用解构「剔除」password，不能写 `password: undefined` ——
+    // JSON.stringify 会直接丢掉 undefined 值的属性，所以那种写法只是巧合可用，
+    // 而 `'password' in room` 仍为 true，容易让后续维护者误判为已安全处理。
     res.json({
-      rooms: rooms.map(r => ({
+      rooms: rooms.map(({ password, ...r }) => ({
         ...r,
-        password: undefined,
-        hasPassword: !!r.password
+        hasPassword: Boolean(password)
       }))
     });
   } catch (error) {

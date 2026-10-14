@@ -18,10 +18,13 @@
     "db:generate": "npm run prisma:generate --workspace=server",
     "start": "npm run start --workspace=server",
     "start:web": "npm run build && npm run start",
+    "typecheck": "tsc --noEmit -p server/tsconfig.json && tsc --noEmit -p client/tsconfig.json",
     "verify:security": "node scripts/verify-security.js",
     "verify:e2e": "node scripts/verify-e2e.js",
     "verify:socket": "node scripts/verify-socket.js",
-    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket"
+    "verify:features": "node scripts/verify-features.js",
+    "verify:socket-features": "node scripts/verify-socket-features.js",
+    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

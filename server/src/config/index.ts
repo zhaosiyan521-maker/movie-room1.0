@@ -52,9 +52,34 @@ export const config = {
     .map(s => s.trim())
     .filter(Boolean),
 
-  // 服务监听地址：默认仅本机回环，避免暴露到局域网/公网。
-  // 如需局域网共享观影，显式设置 HOST=0.0.0.0 并同步配置 CLIENT_URL 白名单。
+  // 服务监听地址：默认仅本机回环（最安全）。
+  // 需要对外提供服务（局域网/公网部署）时，显式设置 HOST=0.0.0.0，
+  // 并同步配置 CLIENT_URL 白名单；若前面还有反向代理，另需设置 TRUST_PROXY（见下）。
   host: process.env.HOST || '127.0.0.1',
+
+  /**
+   * 可信反向代理配置（Express `trust proxy`）。
+   *
+   * 取值语义：
+   *   - 未设置 / 0 / "false"（默认）：直连模式，不信任任何转发头。
+   *     `req.ip` 取 socket 远端地址，攻击者无法用 X-Forwarded-For 伪造 IP。
+   *   - 正整数 n：信任最近 n 跳代理（单层 Nginx 填 1；云 LB + Nginx 填 2）。
+   *   - "loopback"：信任来自回环地址的代理。
+   *
+   * 为什么必须显式配置：本应用的多项安全机制都建立在「客户端真实 IP」之上 ——
+   * 登录/注册限流按 IP 计数、永久封禁写入 banned_ips、开房配额按 IP 统计。
+   *   - 直连部署却开启 trust proxy：攻击者伪造 X-Forwarded-For 即可绕过限流与封禁；
+   *   - 反向代理部署却关闭 trust proxy：所有请求的远端地址都是 127.0.0.1，
+   *     限流退化为全局共享额度，且封禁一个用户等于封禁所有访客。
+   * 因此该值必须与真实部署拓扑一致，文档见「部署方案-阿里云.md」。
+   */
+  trustProxy: ((): boolean | number | string => {
+    const raw = (process.env.TRUST_PROXY || '').trim();
+    if (!raw || raw === '0' || raw.toLowerCase() === 'false') return false;
+    if (raw.toLowerCase() === 'true') return true;
+    if (/^\d+$/.test(raw)) return Number(raw);
+    return raw; // 例如 "loopback"
+  })(),
 
   // 邮件（SMTP）：留空则仅在服务端控制台打印验证链接，方便本地联调
   smtp: {

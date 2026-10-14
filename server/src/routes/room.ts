@@ -6,13 +6,13 @@ import { prisma } from '../config/database';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { dissolveRoom } from '../services/roomDissolve';
 import { getIO, KICK_BAN_DURATION_MS } from '../services/signaling';
+import { UPLOAD_DIR, safeUploadFilename, deleteUnreferencedImages } from '../services/roomImages';
 
 export const roomRouter = Router();
 
 // 所有房间路由都需要认证
 roomRouter.use(authMiddleware);
 
-const UPLOAD_DIR = path.join(__dirname, '..', '..', 'uploads');
 const MAX_IMAGES = 5;
 
 /**
@@ -77,15 +77,12 @@ function saveBase64Image(dataUrl: string): string | null {
   return `/uploads/${filename}`;
 }
 
-// 校验客户端回传的 /uploads/ 路径：必须指向上传目录内真实存在的图片文件，
-// 避免任意路径注入或引用不存在/他人的文件
+// 校验客户端回传的 /uploads/ 路径：必须是合法文件名且指向真实存在的图片
+// （合法性判断与路径穿越防护统一由 services/roomImages 提供，避免多处实现漂移）
 function resolveUploadPath(p: string): string | null {
-  if (typeof p !== 'string' || !p.startsWith('/uploads/')) return null;
-  const filename = p.slice('/uploads/'.length);
-  if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp|gif)$/.test(filename)) return null;
+  const filename = safeUploadFilename(p);
+  if (!filename) return null;
   const abs = path.join(UPLOAD_DIR, filename);
-  const rel = path.relative(UPLOAD_DIR, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
   if (!fs.existsSync(abs)) return null;
   return p;
 }
@@ -103,49 +100,6 @@ function saveImages(images: any): string[] {
     }
   }
   return saved;
-}
-
-/**
- * 删除不再被引用的旧图片文件，避免磁盘泄漏。
- *
- * 安全要点：必须检查该图片是否仍被「其他房间」引用。
- * 否则攻击者可把别人的图片路径填进自己房间，再移除它，
- * 就会把他人房间正在使用的图片从磁盘删除（跨房间删图）。
- */
-async function deleteOrphanImages(oldImages: string[], keepImages: string[], currentRoomId?: string) {
-  const keep = new Set(keepImages);
-  for (const old of oldImages) {
-    if (keep.has(old)) continue;
-
-    const filename = old.replace('/uploads/', '');
-    // 再次校验文件名格式，防止 old 中混入非 uploads 路径
-    if (!/^[a-zA-Z0-9_-]+\.(png|jpg|jpeg|webp|gif)$/.test(filename)) continue;
-
-    const abs = path.join(UPLOAD_DIR, filename);
-    const rel = path.relative(UPLOAD_DIR, abs);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
-
-    // 若仍被其他房间引用，跳过删除
-    try {
-      const others = await prisma.room.findMany({
-        where: {
-          images: { contains: filename },
-          ...(currentRoomId ? { id: { not: currentRoomId } } : {}),
-        },
-        select: { id: true }
-      });
-      if (others.length > 0) continue;
-    } catch {
-      // 查询失败时保守处理：不删除，避免误伤他人图片
-      continue;
-    }
-
-    try {
-      if (fs.existsSync(abs)) fs.unlinkSync(abs);
-    } catch {
-      /* 忽略删除失败 */
-    }
-  }
 }
 
 function parseImages(images: string | null): string[] {
@@ -292,6 +246,11 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
 
       res.status(201).json({ room: publicRoom(room) });
     } catch (err: any) {
+      // 【M5】建库失败（房间名重复 / 配额超限 / 唯一约束冲突）时，刚写入磁盘的图片
+      // 不会被任何房间引用，会成为永久孤儿文件。统一实现已带跨房间引用检查，
+      // 因此这里可以安全地按「无引用即删除」回收（新文件名是 uuid，不会被他人引用）。
+      await deleteUnreferencedImages(imagePaths, []).catch(() => {});
+
       if (err?.appCode === 'ROOM_NAME_DUPLICATE' || err?.code === 'P2002') {
         return res.status(409).json({ error: '该房间名称已被使用，请换一个' });
       }
@@ -619,13 +578,40 @@ roomRouter.put('/:id/images', express.json({ limit: '20mb' }), async (req: AuthR
     const oldImages = parseImages(room.images);
     const imagePaths = saveImages(req.body.images);
 
-    const updated = await prisma.room.update({
-      where: { id: room.id },
-      data: { images: imagePaths.length > 0 ? JSON.stringify(imagePaths) : null }
-    });
+    // 【M5】房间行的读取与更新放进同一事务。
+    // 旧实现是「事务外读 room → 写新图片 → 按事务外读到的 oldImages 删旧文件」，
+    // 两个并发更新会互相破坏：A 读到 oldImages、B 也读到同一份 oldImages，
+    // 于是 B 的 update 覆盖 A 之后，A 的清理会删掉 B 刚上传的图片（反过来同理）。
+    // 这里把读到的 images 作为乐观并发令牌（compare-and-set），
+    // 检测到期间已被他人修改就返回 409，避免静默丢失任一方的更新与文件。
+    let updated;
+    try {
+      updated = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.room.findUnique({
+          where: { id: room.id },
+          select: { images: true }
+        });
+        if ((fresh?.images ?? null) !== (room.images ?? null)) {
+          const conflict: any = new Error('ROOM_IMAGES_CONFLICT');
+          conflict.appCode = 'ROOM_IMAGES_CONFLICT';
+          throw conflict;
+        }
+        return tx.room.update({
+          where: { id: room.id },
+          data: { images: imagePaths.length > 0 ? JSON.stringify(imagePaths) : null }
+        });
+      });
+    } catch (err: any) {
+      if (err?.appCode === 'ROOM_IMAGES_CONFLICT') {
+        // 本次刚落盘的图片没有任何房间引用，直接回收，避免孤儿文件
+        await deleteUnreferencedImages(imagePaths, []).catch(() => {});
+        return res.status(409).json({ error: '房间图片刚被其他操作修改，请刷新后重试' });
+      }
+      throw err;
+    }
 
-    // 清理不再被引用的旧图片，避免磁盘泄漏（需排除当前房间自身的引用）
-    await deleteOrphanImages(oldImages, imagePaths, room.id);
+    // 清理不再被引用的旧图片，避免磁盘泄漏（统一实现内含跨房间引用检查）
+    await deleteUnreferencedImages(oldImages, imagePaths, room.id);
 
     res.json({ images: parseImages(updated.images) });
   } catch (error) {

@@ -5,7 +5,7 @@ import { prisma } from '../config/database';
 import { config } from '../config/index';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { rateLimit } from '../middleware/rateLimit';
-import { createChallenge, verifyCaptcha, isValidCaptchaToken } from '../services/captcha';
+import { createChallenge, verifyCaptcha, consumeCaptchaToken } from '../services/captcha';
 import {
   issueEmailToken,
   verifyEmailToken,
@@ -29,6 +29,11 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: '操
 const sendLinkLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: '验证链接请求过于频繁，请稍后再试' });
 // 验证码接口限流：防止内存被挑战对象灌满（原本无限制，可被脚本化滥用）
 const captchaLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, message: '验证请求过于频繁，请稍后再试' });
+// 【M6】邮箱验证链接校验接口限流。
+// 该接口原先完全没有限流，而每次调用都要验签 JWT 并对 used_tokens / email_verifies
+// 各做一次数据库查询，可被匿名脚本刷接口（实测连续 40 次请求全部被处理，无 429）。
+// 键为「IP + 路径」，独立于登录限流的窗口，避免与正常注册流程互相挤兑。
+const verifyEmailLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, message: '验证请求过于频繁，请稍后再试' });
 
 function clientIp(req: Request): string {
   // trust proxy 已关闭，直接取 socket 真实远端地址，忽略任何 X-Forwarded-For 头
@@ -67,7 +72,9 @@ authRouter.post('/captcha/verify', captchaLimiter, (req: Request, res: Response)
 authRouter.post('/send-verify-link', sendLinkLimiter, async (req: Request, res: Response) => {
   try {
     const { email: rawEmail, purpose, captchaToken } = req.body || {};
-    if (!isValidCaptchaToken(captchaToken)) {
+    // 【M6】改为「消费式」校验：一张滑块票据只能换一次发信，
+    // 否则同一张票据在 5 分钟有效期内可反复使用，等于人机验证只做一遍。
+    if (!consumeCaptchaToken(captchaToken)) {
       return res.status(400).json({ error: '请先完成人机验证' });
     }
     if (typeof rawEmail !== 'string' || !EMAIL_RE.test(rawEmail.trim())) {
@@ -107,7 +114,7 @@ authRouter.post('/send-verify-link', sendLinkLimiter, async (req: Request, res: 
 
 // ===== 校验邮箱验证链接（前端点击链接后调用） =====
 // 仅做预览，不消耗令牌（真正消耗在 register / bind-email / change-password）
-authRouter.get('/verify-email', async (req: Request, res: Response) => {
+authRouter.get('/verify-email', verifyEmailLimiter, async (req: Request, res: Response) => {
   const t = (req.query.t as string || '').trim();
   if (!t) return res.status(400).json({ error: '验证链接缺少参数，请重新获取验证链接' });
 

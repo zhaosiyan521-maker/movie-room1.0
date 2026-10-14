@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../config/database';
 import { config } from '../config/index';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
-import { verifyEmailToken, consumeEmailToken } from '../services/verifyLink';
+import { verifyEmailToken, consumeEmailToken, consumeEmailVerified } from '../services/verifyLink';
 
 export const userRouter = Router();
 
@@ -186,6 +186,11 @@ userRouter.post('/change-password', async (req: AuthRequest, res: Response) => {
       if (!consumed) {
         return res.status(400).json({ error: '邮箱验证链接已被使用，请重新获取' });
       }
+      // 【M6】同时消费「已验证记录」。
+      // 该记录由 /verify-email 写入，且每次点击链接都会刷新 verifiedAt，
+      // isEmailVerified 又有 30 分钟有效期 —— 若不在业务动作成功时消费，
+      // 同一份验证在有效期内可被反复利用，且记录会无限增长（永不清理）。
+      await consumeEmailVerified(user.email, 'change-password');
     }
 
     const passwordHash = await bcrypt.hash(newPassword, 10);
@@ -232,6 +237,8 @@ userRouter.post('/bind-email', async (req: AuthRequest, res: Response) => {
     if (!consumed) {
       return res.status(400).json({ error: '邮箱验证链接已被使用，请重新获取' });
     }
+    // 【M6】同 change-password：消费「已验证记录」，避免在有效期内被反复利用
+    await consumeEmailVerified(email, 'bind-email');
 
     await prisma.user.update({
       where: { id: userId },

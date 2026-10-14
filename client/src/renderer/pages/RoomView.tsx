@@ -139,6 +139,8 @@ export default function RoomView() {
   const [room, setRoom] = useState<Room | null>(null);
   const [loading, setLoading] = useState(true);
   const [joined, setJoined] = useState(false);
+  /** 【M2】joined 的同步镜像，供 socket 闭包内的错误分发判断使用 */
+  const joinedRef = useRef(false);
   const [passwordInput, setPasswordInput] = useState('');
   const [error, setError] = useState('');
 
@@ -286,6 +288,65 @@ export default function RoomView() {
   const speakingRef = useRef(false);
   const cooldownTimerRef = useRef<any>(null);
 
+  /**
+   * 【M8-6】统一登记本组件创建的所有定时器，卸载/切房时一次性清理。
+   *
+   * 旧实现把各处 setTimeout 散落在业务代码里（弹幕移除、剪贴板提示、进度条隐藏、
+   * 信令补发 offer、视频加载重试等），卸载后它们仍会触发 setState / 发信令，
+   * 既造成「对已卸载组件更新状态」的告警，也让闭包与定时器长期存活。
+   * 这里统一登记，cleanupAll 末尾统一 clear。
+   */
+  const timersRef = useRef<Set<number>>(new Set());
+  const later = (fn: () => void, ms: number) => {
+    const t = window.setTimeout(() => {
+      timersRef.current.delete(t);
+      fn();
+    }, ms);
+    timersRef.current.add(t);
+    return t;
+  };
+
+  /**
+   * 【M8-2】ICE candidate 缓冲。
+   *
+   * setRemoteDescription 是异步的；同一批 websocket 帧里先到达的 candidate 会在
+   * remoteDescription 为空时抛 InvalidStateError（旧实现直接吞掉），而本端
+   * setLocalDescription 同步产出的 candidate 正是「同一 tick 就发出」的常态
+   * （同局域网、无 STUN 往返时尤其明显）。丢弃即等于协商缺腿 → 黑屏。
+   * 这里按 peer 缓存，待 setRemoteDescription 成功后再冲刷。
+   */
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  /** 【M8-3】每个 peer 已尝试的 ICE restart 次数（超过上限才真正移除该连接） */
+  const iceRestartAttemptsRef = useRef<Map<string, number>>(new Map());
+  /** 【M8-3】ICE restart 上限：两次仍连不上说明是结构性不通（如对称 NAT），继续重试无意义 */
+  const MAX_ICE_RESTART_ATTEMPTS = 2;
+
+  /**
+   * 【M8-7】说话检测循环的代际令牌。
+   * 该循环通过递归 setTimeout 永续运行，只在观察到 audioCtxRef 为空时退出。
+   * 快速「离开语音 → 立刻重进」时旧循环会看到新的非空 ctx 而继续跑在已销毁的
+   * analyser 上（重复上报 + 孤儿循环）。每次开启检测自增，循环内比对后自行退出。
+   */
+  const speakingSessionRef = useRef(0);
+  /**
+   * 【M8-1】弹幕速度的同步镜像。
+   * pushDanmaku 被 socket 处理器（在 setupWebSocket 里只注册一次、捕获首帧闭包）调用，
+   * 直接读 danmakuSpeed state 会让「收到他人弹幕」永远用挂载时的旧速度。
+   */
+  const danmakuSpeedRef = useRef(3);
+
+  /**
+   * 【M1】取「当前有效的信令 socket」。
+   *
+   * cleanupAll 在房主切页时会保留推流会话（hostStreaming 单例持有 socket）并清空
+   * socketRef.current。此后若仍从 socketRef 取连接，房主的 ICE candidate 会被
+   * `&& socketRef.current` 静默丢弃、makeOffer 变成空操作 → 切页期间新加入的观众
+   * 协商永远完不成，PC 进入 failed 并永久黑屏（正是 hostStreaming 想避免的场景）。
+   * 因此统一改为「优先会话 socket，其次组件 socket」。
+   */
+  const getLiveSocket = (): Socket | null =>
+    hostSessionRef.current?.socket || socketRef.current;
+
   // 【直链-1】当前正在播放的「原始直链」及其是否 HLS。
   // 非 HLS 直链由 <video src> 直连源站以节省服务器带宽；一旦加载失败，需要据此把同一条
   // 链接改为「走服务端代理」再重试一次（见 retryDirectViaProxy）。
@@ -320,6 +381,12 @@ export default function RoomView() {
     };
   }, [id]);
 
+  /** 【M8-6】清理所有由 later() 登记的定时器，避免卸载后仍触发 setState / 发信令 */
+  const clearAllTimers = () => {
+    timersRef.current.forEach(t => clearTimeout(t));
+    timersRef.current.clear();
+  };
+
   const cleanupAll = (disposeHostSession = false) => {
     // 房主：切换页面（disposeHostSession=false）时保留推流会话（socket + 本地视频 + WebRTC peers 继续存活），
     // 只有观众或房主主动「解散/退出」（disposeHostSession=true）才彻底断开。
@@ -339,6 +406,10 @@ export default function RoomView() {
         }
         socketRef.current.disconnect();
       }
+      // 【M1 修复】只在「真正离开」时清空组件引用。
+      // 旧实现无条件置空，导致房主切页后 getLiveSocket() 拿不到连接，
+      // pc.onicecandidate / makeOffer 全部失败（新观众黑屏）。
+      // 保留会话时交由 getLiveSocket() 回落到 session.socket。
       socketRef.current = null;
     }
     // 关键修复：必须复位 setupDoneRef。
@@ -352,6 +423,14 @@ export default function RoomView() {
     if (viewerLoadTimerRef.current) {
       clearTimeout(viewerLoadTimerRef.current);
       viewerLoadTimerRef.current = null;
+    }
+    if (sourceSavedTimerRef.current) {
+      clearTimeout(sourceSavedTimerRef.current);
+      sourceSavedTimerRef.current = null;
+    }
+    if (viewerBarTimerRef.current) {
+      clearTimeout(viewerBarTimerRef.current);
+      viewerBarTimerRef.current = null;
     }
 
     // 销毁 HLS 实例：否则旧实例会继续拉取分片，占用带宽与内存
@@ -401,19 +480,41 @@ export default function RoomView() {
         setHostSessionReady(false);
       }
     }
-    audioElsRef.current.forEach(el => {
-      el.pause();
-      el.srcObject = null;
-    });
-    audioElsRef.current.clear();
-    remoteStreamsRef.current.clear();
-    if (localMicRef.current) {
-      localMicRef.current.getTracks().forEach(t => t.stop());
-      localMicRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
+    // 【M3 修复】音频链路必须与 peers 同生共死。
+    //
+    // 旧实现把「音频元素 / 麦克风轨道 / AudioContext」的清理放在守卫之外，而 peers 的
+    // 清理在 `!hasHostSession || shouldDisposeHost` 守卫之内。于是房主在语音中切页时：
+    // peer connection 仍然存活，但 Audio 元素被 pause + 置空、麦克风轨道被 stop。
+    // 由于 ontrack 不会为已接收的轨道再次触发，房主回来后**永远听不到已经在语音里的
+    // 观众**，观众也听不到房主；同时服务端 voiceStates 仍标记房主在语音
+    //（cleanupAll 从不发 voice-leave，而房主 socket 是故意保持连接的），
+    // 所有观众会一直看到一个假的 🎤 标记。
+    // 现在：保留会话时（房主切页）整块跳过；真正离开时先通知服务端退出语音再拆。
+    if (!hasHostSession || shouldDisposeHost) {
+      // 先让服务端与其他客户端知道「我已退出语音」，避免幽灵麦克风标记
+      if (inVoice && id) {
+        try { getLiveSocket()?.emit('voice-leave', id); } catch { /* ignore */ }
+      }
+      audioElsRef.current.forEach(el => {
+        el.pause();
+        el.srcObject = null;
+      });
+      audioElsRef.current.clear();
+      remoteStreamsRef.current.clear();
+      if (localMicRef.current) {
+        localMicRef.current.getTracks().forEach(t => t.stop());
+        localMicRef.current = null;
+      }
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+      }
+      // 说话检测循环交给代际令牌退出（见 startSpeakingDetection）
+      speakingSessionRef.current += 1;
+      speakingRef.current = false;
+      setInVoice(false);
+      setMicOn(true);
+      micOnRef.current = true;
     }
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
 
@@ -434,6 +535,27 @@ export default function RoomView() {
     isPlayingRef.current = false;
     setEndedPrompt(false);
     recentMsgSigRef.current.clear();
+
+    // 【M4 修复】复位「加入状态」与房间标识。
+    // React Router 在 /room/A → /room/B 时复用同一组件实例，若不复位这些状态：
+    //   1) 组件仍以「已加入」渲染房间 B，**密码输入卡片被整个跳过** → doJoin() 不带
+    //      密码 → 服务端 403「房间密码错误」→ 用户卡在空白观影界面且无法输入密码；
+    //   2) screeningStarted / hostScreenActiveRef 残留，房主面板会对一个什么都没播的
+    //      房间显示「结束放映」，点击即向房间 B 发出 host-stop-play。
+    // 注意：房主切页（保留会话）时同样要复位——房间页面的 UI 状态本就该重新开始，
+    // 而推流会话存活这件事由 hostStreaming 单例与 session.joinedRoom 负责，与这些 UI 状态无关。
+    setJoined(false);
+    joinedRef.current = false;
+    setRoom(null);
+    setMembers([]);
+    setScreeningStarted(false);
+    hostScreenActiveRef.current = false;
+    setUrlInput('');
+    setPasswordInput('');
+    setProgress({ current: 0, duration: 0 });
+    setDanmakuSpeed(3);
+    danmakuSpeedRef.current = 3;
+    clearAllTimers();
   };
 
   const fetchRoom = async () => {
@@ -482,6 +604,9 @@ export default function RoomView() {
       });
 
       setJoined(true);
+      // 【M2】joined 的同步镜像：socket 的 error 处理器需要按「是否已加入」
+      // 决定错误该走页面卡片还是系统消息通道，而处理器捕获的是旧闭包。
+      joinedRef.current = true;
       setError('');
       setupWebSocket();
     } catch (error: any) {
@@ -600,6 +725,16 @@ export default function RoomView() {
           duration: el.duration || 0
         });
       };
+      // 【M7-3】切页期间播完的影片需要在这里补一次「播放结束」处理。
+      // cleanupAll 在房主切页时会解绑 onended（避免假 pause 那类误触发），因此
+      // 若影片在房主离开期间自然播完，事件不会被任何人接收：不会发 host-pause、
+      // 不会把房间改回 WAITING、也不会弹「是否解散」。房主回来时 room-joined 仍
+      // 报 playing:true，房间永久停在「放映中」。这里用「已播到片尾」判定补一次。
+      // 仅在 onended 可用且确实播到结尾时触发，避免误判正常的暂停/中途状态。
+      if (v.ended || (v.duration > 0 && v.currentTime > 0 && v.duration - v.currentTime < 1.5)) {
+        handleHostMovieEnded();
+      }
+
       // 【原生控制条】房主用浏览器自带控制条暂停/继续 —— 这是本项目唯一的暂停/播放入口，
       // 网页端不再自绘播放/暂停按钮或暂停遮罩。
       // 这里必须**同时**改本地 UI 状态并广播：
@@ -807,6 +942,13 @@ export default function RoomView() {
       if (data.socketId) {
         removePeer(data.socketId);
       }
+      // 【M8-4】成员列表必须同步剪枝。
+      // 旧实现只清理 online/voice/speaking 三个集合，成员数组只增不减：
+      // 长时间多观众场次下列表无界增长，且已离开的人仍是静音/踢出的可选目标
+      //（对已离开的 socketId 操作毫无意义）。这里按 userId 移除。
+      if (data.userId) {
+        setMembers(prev => prev.filter(m => m.userId !== data.userId));
+      }
     });
 
     // 统一处理远端协商描述（offer / answer）——完美协商模式。
@@ -836,9 +978,12 @@ export default function RoomView() {
         isSettingRemoteAnswerPendingRef.current.set(from, !isOffer);
         await pc.setRemoteDescription(new RTCSessionDescription(desc));
         isSettingRemoteAnswerPendingRef.current.set(from, false);
+        // 【M8-2】远端描述就绪后再冲刷此前缓冲的 candidate。
+        await flushPendingCandidates(from, pc);
         if (isOffer) {
           await pc.setLocalDescription();
-          socket.emit('answer', { target: from, answer: pc.localDescription });
+          // 【M1】回 answer 同样走 getLiveSocket()，避免房主切页时 answer 发不出去
+          getLiveSocket()?.emit('answer', { target: from, answer: pc.localDescription });
         }
       } catch (err) {
         console.error('处理远端协商描述失败:', err);
@@ -858,9 +1003,22 @@ export default function RoomView() {
 
     socket.on('ice-candidate', async (data: any) => {
       const pc = peersRef.current.get(data.from);
-      if (!pc) return;
+      const candidate = data?.candidate;
+      if (!candidate) return;
+      // 【M8-2】peer 或远端描述尚未就绪时先缓冲，不能丢弃。
+      // 旧实现在这两种情况下直接 return / 吞掉 InvalidStateError，而这些 candidate
+      // 往往正是对端 setLocalDescription 后同步产出的第一批（同局域网无 STUN 往返时
+      // 尤为常见）——丢弃即等于协商缺腿，表现为连不上、随后 failed 永久黑屏。
+      if (!pc || !pc.remoteDescription) {
+        const list = pendingCandidatesRef.current.get(data.from) || [];
+        list.push(candidate);
+        // 防御性上限：异常端持续灌候选时不至于无限占用内存
+        if (list.length > 256) list.shift();
+        pendingCandidatesRef.current.set(data.from, list);
+        return;
+      }
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (err) {
         console.error('添加 ICE 候选失败:', err);
       }
@@ -926,7 +1084,7 @@ export default function RoomView() {
       }
       setSourceSavedTip(true);
       if (sourceSavedTimerRef.current) clearTimeout(sourceSavedTimerRef.current);
-      sourceSavedTimerRef.current = window.setTimeout(() => setSourceSavedTip(false), 3000);
+      sourceSavedTimerRef.current = later(() => setSourceSavedTip(false), 3000);
     });
 
     // 房主拖动进度条 seek 后，观众跟随 seek（进度差拉大的主因修复）。
@@ -962,6 +1120,12 @@ export default function RoomView() {
     socket.on('host-disconnected', (data: any) => {
       setIsPlaying(false);
       isPlayingRef.current = false;
+      // 【M7-2】服务端已把房间改回 WAITING 并清空内存播放状态（见 signaling.ts 的
+      // handleHostAbruptLeave），即本场放映确实结束了。旧实现只改 isPlaying，
+      // 观众遮罩会永久停在「⏸ 房主已暂停」，与实际状态不符。
+      setScreeningStarted(false);
+      hostScreenActiveRef.current = false;
+      setProgress({ current: 0, duration: 0 });
       appendSystemMessage(`⚠️ ${data.message || '房主连接中断，放映已结束'}`);
     });
 
@@ -1032,14 +1196,28 @@ export default function RoomView() {
     });
 
     socket.on('error', (err: any) => {
-      setError(err.message);
+      const msg = typeof err?.message === 'string' && err.message ? err.message : '操作失败';
+      setError(msg);
+      // 【M2 修复】加入房间之后 error 卡片不再渲染，服务端拒绝会变成「点了没反应」。
+      // 典型：踢人配额已用完、视频地址格式无效、视频直链过长（见 signaling.ts）。
+      // 这里在已加入状态下把同一条错误也投到弹幕/系统消息通道，保证用户能看到。
+      if (joinedRef.current) {
+        appendSystemMessage(`⚠️ ${msg}`);
+      }
     });
   };
 
   // ===== WebRTC mesh =====
 
   const isPolite = (peerSocketId: string) => {
-    const myId = socketRef.current?.id || '';
+    // 【M1】必须从「当前有效的 socket」取自己的 id。
+    // 房主切页时 socketRef.current 为 null，旧写法 `'' < peerSocketId` 恒为 true，
+    // 于是房主对每个 peer 都判定自己 polite，而观众按真实 id 判定；
+    // 当 viewerId > hostId 时双方同时 polite → 同时接受冲突 offer 并各自回 answer，
+    // 本文件赖以消除黑屏的冲突/回滚机制随之退化。
+    // 取不到 id 时按「非 polite」处理（宁可让对端 rollback，也不要双方都退让）。
+    const myId = getLiveSocket()?.id || '';
+    if (!myId) return false;
     return myId < peerSocketId;
   };
 
@@ -1053,12 +1231,15 @@ export default function RoomView() {
     isSettingRemoteAnswerPendingRef.current.set(targetSocketId, false);
 
     pc.onicecandidate = (event) => {
-      if (event.candidate && socketRef.current) {
-        socketRef.current.emit('ice-candidate', {
-          target: targetSocketId,
-          candidate: event.candidate
-        });
-      }
+      if (!event.candidate) return;
+      // 【M1】用 getLiveSocket()：房主切页后 socketRef 为 null，但会话 socket 仍在线，
+      // 旧写法会把房主侧的所有 candidate 静默丢弃 → 观众 ICE 永远完不成 → 永久黑屏。
+      const live = getLiveSocket();
+      if (!live) return;
+      live.emit('ice-candidate', {
+        target: targetSocketId,
+        candidate: event.candidate
+      });
     };
 
     // 发起一次协商。
@@ -1079,10 +1260,14 @@ export default function RoomView() {
         if (!desc) return;
         // setLocalDescription 的产物不一定是 offer：若此刻恰好处于 have-remote-offer，
         // 它会生成 answer。按实际类型分发，保证信令语义正确。
+        // 【M1】使用 getLiveSocket()，否则房主切页期间 makeOffer 是空操作，
+        // 新观众的协商永远不会被发起。
+        const live = getLiveSocket();
+        if (!live) return;
         if (desc.type === 'offer') {
-          socketRef.current?.emit('offer', { target: targetSocketId, offer: desc });
+          live.emit('offer', { target: targetSocketId, offer: desc });
         } else if (desc.type === 'answer') {
-          socketRef.current?.emit('answer', { target: targetSocketId, answer: desc });
+          live.emit('answer', { target: targetSocketId, answer: desc });
         }
       } catch (err) {
         console.error('协商失败:', err);
@@ -1101,8 +1286,29 @@ export default function RoomView() {
     };
 
     pc.onconnectionstatechange = () => {
+      // 【M8-3】连接失败不再「一关了之」。
+      // 旧实现 failed/closed 直接 removePeer（close + 忘记 PC），而 PC 只在 offer 处理器
+      // 与 room-joined 里创建，之后再也没有重建通道，也不通知对端 —— 一次网络抖动、
+      // 电脑休眠、切后台超时就会让观众画面永久冻结，必须刷新页面才能恢复。
+      // 现在：先尝试带 ICE restart 的重新协商（最多 2 次），仍失败才真正移除。
+      if (pc.connectionState === 'connected') {
+        iceRestartAttemptsRef.current.set(targetSocketId, 0);
+        return;
+      }
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        removePeer(targetSocketId);
+        const attempts = iceRestartAttemptsRef.current.get(targetSocketId) || 0;
+        if (attempts >= MAX_ICE_RESTART_ATTEMPTS) {
+          iceRestartAttemptsRef.current.delete(targetSocketId);
+          removePeer(targetSocketId);
+          return;
+        }
+        iceRestartAttemptsRef.current.set(targetSocketId, attempts + 1);
+        // restartIce() 会把 iceRestart 标志置位并触发 negotiationneeded，
+        // 由 onnegotiationneeded → makeOffer 带着新凭据重新协商（完美协商模式下安全）。
+        try {
+          pc.restartIce();
+        } catch { /* 老浏览器不支持时退化为一次普通重协商 */ }
+        void makeOffer();
       }
     };
 
@@ -1180,7 +1386,7 @@ export default function RoomView() {
       if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
       // 静音播放一般下一帧就能起播，这里延迟复核：确认画面真的在播了才提示解锁声音。
       // 否则视频因其他原因（源失效/网络错误）根本没起来时也会弹提示，误导用户。
-      window.setTimeout(() => {
+      later(() => {
         const cur = remoteVideoRef.current;
         if (!cur) return;
         // 注意两种片源要一起判断：网络直链走 src（HLS 为 blob:），
@@ -1252,8 +1458,9 @@ export default function RoomView() {
         const el = remoteVideoRef.current;
         if (!el) {
           // 重试加上限：元素长期不挂载（如组件已卸载/对端异常）时停止空转，避免无限 setTimeout 泄漏
+          // 【M8-6】改用 later()：组件卸载后这些重试链会被统一清理
           if (attempt >= 100) return;
-          setTimeout(() => applyVideo(attempt + 1), 100);
+          later(() => applyVideo(attempt + 1), 100);
           return;
         }
         if (el.srcObject !== stream) {
@@ -1277,6 +1484,23 @@ export default function RoomView() {
     }
   };
 
+  /**
+   * 【M8-2】把缓冲的 ICE candidate 冲刷给已就绪的 peer。
+   * 在每次 setRemoteDescription 成功后调用。
+   */
+  const flushPendingCandidates = async (peerId: string, pc: RTCPeerConnection) => {
+    const list = pendingCandidatesRef.current.get(peerId);
+    if (!list || list.length === 0) return;
+    pendingCandidatesRef.current.delete(peerId);
+    for (const candidate of list) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error('冲刷缓冲的 ICE 候选失败:', err);
+      }
+    }
+  };
+
   const removePeer = (socketId: string) => {
     const pc = peersRef.current.get(socketId);
     if (pc) {
@@ -1287,6 +1511,8 @@ export default function RoomView() {
     isSettingRemoteAnswerPendingRef.current.delete(socketId);
     makeOfferRef.current.delete(socketId);
     remoteStreamsRef.current.delete(socketId);
+    pendingCandidatesRef.current.delete(socketId);
+    iceRestartAttemptsRef.current.delete(socketId);
     releaseAudioEl(socketId);
   };
 
@@ -1339,8 +1565,8 @@ export default function RoomView() {
     try {
       await navigator.clipboard.writeText(url);
       setCopiedUrl(url);
-      // 复制成功后自动关闭结果弹窗
-      setTimeout(() => {
+      // 复制成功后自动关闭结果弹窗（【M8-6】登记到统一定时器表）
+      later(() => {
         setShowSniffResult(false);
         setSniffUrls([]);
       }, 600);
@@ -1371,7 +1597,8 @@ export default function RoomView() {
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
       });
 
-      socketRef.current?.emit('voice-join', id);
+      // 【M1】统一用 getLiveSocket()，避免房主切页时事件发不出去
+      getLiveSocket()?.emit('voice-join', id);
       startSpeakingDetection(stream);
     } catch (error: any) {
       console.error('获取麦克风失败:', error);
@@ -1404,6 +1631,8 @@ export default function RoomView() {
       audioCtxRef.current = null;
     }
     speakingRef.current = false;
+    // 【M8-7】作废当前说话检测循环，避免它继续跑在已关闭的 AudioContext 上
+    speakingSessionRef.current += 1;
     setInVoice(false);
     setSpeakingUserIds(prev => {
       const me = useAuthStore.getState().user;
@@ -1411,7 +1640,8 @@ export default function RoomView() {
       if (me) next.delete(me.id);
       return next;
     });
-    socketRef.current?.emit('voice-leave', id);
+    // 【M1】用 getLiveSocket()：房主切页时组件 socket 引用为空，但会话 socket 仍在线
+    getLiveSocket()?.emit('voice-leave', id);
     peersRef.current.forEach((pc) => {
       pc.getSenders().forEach(sender => {
         if (sender.track && micTrackIds.has(sender.track.id)) {
@@ -1438,6 +1668,11 @@ export default function RoomView() {
     try {
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
+      // 【M8-7】本次检测的代际令牌。循环只认自己这一代：
+      // 快速「离开语音 → 立刻重进」时，旧循环下一次 tick 会发现代际已变而自行退出，
+      // 不会再跑在已 close 的 AudioContext / 已 stop 的流上（旧实现在 ≤200ms 窗口内
+      // 重进会让两条循环同时上报说话状态，并留下永不退出的孤儿循环）。
+      const session = ++speakingSessionRef.current;
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
@@ -1445,8 +1680,16 @@ export default function RoomView() {
       const data = new Uint8Array(analyser.frequencyBinCount);
 
       const check = () => {
-        if (!audioCtxRef.current) return;
-        analyser.getByteFrequencyData(data);
+        // 代际不符或上下文已销毁 → 结束本循环
+        if (speakingSessionRef.current !== session) return;
+        const liveCtx = audioCtxRef.current;
+        if (!liveCtx || liveCtx !== ctx) return;
+        try {
+          analyser.getByteFrequencyData(data);
+        } catch {
+          // 上下文已关闭时读取会抛异常，直接结束循环
+          return;
+        }
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         // 【C4】读 micOnRef 而非 micOn。check() 通过 setTimeout 永久自递归，
         // 闭包只捕获进入语音那一刻的渲染快照，读 state 会导致开关麦克风后判定失效。
@@ -1460,7 +1703,8 @@ export default function RoomView() {
           // 说话中持续上报音量等级
           emitSpeaking(true, level);
         }
-        setTimeout(check, 200);
+        // 【M8-6】登记到统一定时器表，组件卸载后不再继续空转
+        later(check, 200);
       };
       check();
     } catch (error) {
@@ -1469,7 +1713,8 @@ export default function RoomView() {
   };
 
   const emitSpeaking = (speaking: boolean, level = 0) => {
-    socketRef.current?.emit('speaking', { roomId: id, speaking, level });
+    // 【M1】统一用 getLiveSocket()：房主切页后 socketRef 为空但会话 socket 仍在线
+    getLiveSocket()?.emit('speaking', { roomId: id, speaking, level });
     const me = useAuthStore.getState().user;
     if (me) {
       if (speaking) {
@@ -1509,11 +1754,12 @@ export default function RoomView() {
 
   const requestKick = (targetUserId: string) => {
     setMenuUserId(null);
-    if (!socketRef.current) return;
     const target = members.find(m => m.userId === targetUserId);
     if (!target) return;
+    const sock = getLiveSocket();
+    if (!sock) return;
     if (!confirm(`确定要踢出「${target.nickname}」吗？\nTA 将立即被踢出，且 5 小时内无法再次进入。`)) return;
-    socketRef.current.emit('kick-user', { roomId: id, targetUserId });
+    sock.emit('kick-user', { roomId: id, targetUserId });
   };
 
   // ===== 聊天 =====
@@ -1524,11 +1770,22 @@ export default function RoomView() {
     const id = ++danmakuSeqRef.current;
     const top = Math.round((Math.random() * 82 + 6) * 10) / 10; // 6% ~ 88%
     // 【需求2】最高档放慢一倍（详见 speedToScrollDuration 的说明）
-    const duration = speedToScrollDuration(danmakuSpeed);
+    // 【M8-1】读 danmakuSpeedRef 而非 danmakuSpeed state。
+    // pushDanmaku 会被 socket 处理器调用，而 socket 处理器在 setupWebSocket 里
+    // 只注册一次、捕获首帧闭包 —— 直接读 state 会让「收到的他人弹幕」永远使用
+    // 挂载时的旧速度（例如 3），只有本地自己发的消息才跟随滑块。
+    const duration = speedToScrollDuration(danmakuSpeedRef.current);
     setDanmaku(prev => [...prev, { id, text, top, duration }]);
-    window.setTimeout(() => {
+    // 【M8-6】统一登记，卸载/切房时一并清理
+    later(() => {
       setDanmaku(prev => prev.filter(d => d.id !== id));
     }, duration * 1000 + 200);
+  };
+
+  /** 【M8-1】弹幕速度同时写 state 与 ref，保证 socket 闭包读到的始终是最新档位 */
+  const changeDanmakuSpeed = (value: number) => {
+    danmakuSpeedRef.current = value;
+    setDanmakuSpeed(value);
   };
 
   const appendMessage = (msg: ChatMessage) => {
@@ -1563,10 +1820,11 @@ export default function RoomView() {
 
   const sendMessage = () => {
     const text = chatInput.trim();
-    if (!text || !socketRef.current || chatCooldown > 0) return;
+    const sock = getLiveSocket();
+    if (!text || !sock || chatCooldown > 0) return;
     if (text.length > CHAT_MAX_LENGTH) return;
 
-    socketRef.current.emit('chat-message', {
+    sock.emit('chat-message', {
       roomId: id,
       message: text
     });
@@ -1922,7 +2180,8 @@ export default function RoomView() {
     hostScreenActiveRef.current = true;
     setScreeningStarted(true);
     loadLocalUrl(url, isHls);
-    socketRef.current?.emit('host-start-play', {
+    // 【M1】用 getLiveSocket()，保证房主侧的播放控制经持久会话 socket 发出
+    getLiveSocket()?.emit('host-start-play', {
       roomId: id,
       // 【直链-3】不再把整条 URL 当片名
       movieName: resolveRemoteMovieName(url),
@@ -1945,9 +2204,10 @@ export default function RoomView() {
   // 【原生控制条】结束放映 = 本场作废 + 播放源清除：先本地清空画面与播放源状态，
   // 再通知服务端清库（rooms.sourceUrl 等置空）。两者保持一致，房主要再看需重新粘贴直链。
   const stopPlayback = () => {
-    if (!socketRef.current) return;
+    const sock = getLiveSocket();
+    if (!sock) return;
     resetHostPlaybackUi();
-    socketRef.current.emit('host-stop-play', { roomId: id });
+    sock.emit('host-stop-play', { roomId: id });
   };
 
   // ===== 全屏观看 =====
@@ -1983,7 +2243,7 @@ export default function RoomView() {
     if (isHost) return;
     setShowViewerBar(true);
     if (viewerBarTimerRef.current) clearTimeout(viewerBarTimerRef.current);
-    viewerBarTimerRef.current = window.setTimeout(() => setShowViewerBar(false), 3000);
+    viewerBarTimerRef.current = later(() => setShowViewerBar(false), 3000);
   };
 
   const toggleFullscreen = () => {
@@ -2023,9 +2283,13 @@ export default function RoomView() {
       await api.post(`/rooms/${id}/leave`);
     } catch (error: any) {
       console.error('离开房间失败:', error);
+      // 【M7-1】失败也必须离开本页。
+      // 旧实现在房主侧直接 return：此时 socket/会话已被 cleanupAll 销毁、setupDoneRef
+      // 也已复位，而组件仍以 joined===true 挂载 —— 聊天、语音、踢人、结束放映全部静默失效，
+      // 且没有任何代码会重建连接（setupWebSocket 只在 doJoin 里调用），只能整页刷新。
+      // 既然本地状态已经拆掉，正确做法就是照常返回大厅并提示用户。
       if (isHost) {
-        alert(error.response?.data?.error || '解散房间失败');
-        return;
+        alert(error.response?.data?.error || '解散房间失败，已返回大厅');
       }
     }
 
@@ -2036,7 +2300,9 @@ export default function RoomView() {
   const handleHostMovieEnded = () => {
     setIsPlaying(false);
     isPlayingRef.current = false;
-    socketRef.current?.emit('host-pause', { roomId: id });
+    // 【M1/M7-3】用 getLiveSocket()：该处理既可能由原生控制条 onended 触发，
+    // 也可能在房主切页回来时由「已播到片尾」的补判触发（此时 socketRef 为空）。
+    getLiveSocket()?.emit('host-pause', { roomId: id });
     // 房间状态回到等待，房主可开始新电影或解散房间
     api.patch(`/rooms/${id}/status`, { status: 'WAITING' }).catch(() => {});
     setEndedPrompt(true);
@@ -2287,7 +2553,7 @@ export default function RoomView() {
                         max="5"
                         step="1"
                         value={danmakuSpeed}
-                        onChange={(e) => setDanmakuSpeed(Number(e.target.value))}
+                        onChange={(e) => changeDanmakuSpeed(Number(e.target.value))}
                       />
                     </label>
                     <div className="danmaku-setting-row">
@@ -2337,7 +2603,23 @@ export default function RoomView() {
                     才给一句引导文案（此时视频区是空的，不存在重叠与状态错位）。
                   · 观众端没有原生控制条，仍需要文字提示：本场已开过 → 「房主已暂停」，
                     否则 → 「等待房主开始播放」。 */}
-              {!isPlaying && (!isHost || !remotePlayUrl) && (
+              {/* 观众端（及房主非等待点击时）的视频错误提示。
+                  【M2 修复】videoError 原先只在 isHost && needClickPlay 的浮层里渲染，
+                  而观众永远不会进入该分支 —— hls.js 的致命错误（跨域/防盗链/直链过期）、
+                  重试 3 次后的网络错误、mp4 onError 的提示对观众全部不可见，
+                  观众只看到永久黑屏且没有任何恢复入口。这里单独渲染，错误优先于状态文案。 */}
+              {videoError && !(isHost && needClickPlay) && (
+                <div className="video-overlay" style={{ pointerEvents: 'none' }}>
+                  <p style={{ color: '#ff6b6b', maxWidth: 360 }}>{videoError}</p>
+                  {!isHost && (
+                    <p style={{ opacity: 0.75, fontSize: 13, marginTop: 8 }}>
+                      直播间链接可能已失效或源站限制跨域，请让房主重新设置播放源
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {!isPlaying && (!isHost || !remotePlayUrl) && !videoError && (
                 <div className="video-overlay" style={{ pointerEvents: 'none' }}>
                   <p>
                     {isHost
@@ -2435,7 +2717,8 @@ export default function RoomView() {
                       // 【播放源持久化】同时写入该房间的数据库记录：
                       // 此后暂停、结束放映、刷新页面、切页、服务重启都不会丢，
                       // 只有房间被解散时播放源才会随之消失。
-                      socketRef.current?.emit('host-set-source', {
+                      // 【M1】统一用 getLiveSocket()
+                      getLiveSocket()?.emit('host-set-source', {
                         roomId: id,
                         videoUrl: url,
                         isHls: looksLikeHls(url),
@@ -2537,7 +2820,7 @@ export default function RoomView() {
                       max="5"
                       step="1"
                       value={danmakuSpeed}
-                      onChange={(e) => setDanmakuSpeed(Number(e.target.value))}
+                      onChange={(e) => changeDanmakuSpeed(Number(e.target.value))}
                     />
                   </label>
                   <div className="danmaku-setting-row">

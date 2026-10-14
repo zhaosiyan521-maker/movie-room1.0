@@ -67,6 +67,8 @@ DATABASE_URL="file:./dev.db"
 JWT_SECRET="把第6步的64位随机字符串粘贴到这里"
 PORT=3001
 HOST="0.0.0.0"
+# 可信反向代理：直连 3001 填 0；用 Nginx 反代填 1（配错会破坏限流与封禁，见部署文档 10.1）
+TRUST_PROXY="0"
 CLIENT_URL="http://你的公网IP,http://localhost:3001"
 SMTP_HOST="smtp.qq.com"
 SMTP_PORT="465"
@@ -74,6 +76,7 @@ SMTP_SECURE="true"
 SMTP_USER="你的QQ邮箱@qq.com"
 SMTP_PASS="你的QQ邮箱授权码"
 SMTP_FROM="你的QQ邮箱@qq.com"
+# 初始管理员：留空则【不会创建任何管理员】；需创建时填 12 位以上强密码
 ADMIN_USERNAME="admin"
 ADMIN_PASSWORD="你的强密码至少12位"
 EOF
@@ -81,6 +84,7 @@ EOF
 # ✅ 成功标志：不报错，回到命令行提示符
 # ⚠️ 注意：上面 JWT_SECRET、CLIENT_URL、SMTP_*、ADMIN_PASSWORD
 #    都是「占位文字」，你必须先手动改好再粘贴！否则服务跑不起来。
+#    若不想创建管理员，把 ADMIN_PASSWORD 留空（写成 ADMIN_PASSWORD=""）。
 
 
 # ---------- 第 8 步：初始化数据库 ----------
