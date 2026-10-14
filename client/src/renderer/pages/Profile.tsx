@@ -26,7 +26,15 @@ export default function Profile() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
 
-  // 我创建的房间
+  /**
+   * 半透明提示弹窗（居中卡片）。
+   * 用于两处：用户名 30 天冷却期未满、用户名与昵称重名。
+   * 复用全站既有的 .modal-mask 半透明遮罩，点遮罩或「知道了」都能关闭。
+   */
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // 我创建的房间（屏幕上的板块已按要求移除，这里保留取数逻辑与状态，
+  // 以便日后需要时直接恢复 UI，不再取数）
   const [myRooms, setMyRooms] = useState<MyRoom[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(true);
 
@@ -41,6 +49,8 @@ export default function Profile() {
   const [bindEmail, setBindEmail] = useState('');
   const [bindMsg, setBindMsg] = useState('');
   const [bindSaving, setBindSaving] = useState(false);
+  /** 「更换邮箱」弹窗开关：输入新邮箱 + 滑块验证 + 发送验证链接都在弹窗内完成 */
+  const [showEmailModal, setShowEmailModal] = useState(false);
 
   // 邮箱链接验证是否完成
   // 必须同时校验时效：原先只看「本地有没有这个 token」，
@@ -84,9 +94,28 @@ export default function Profile() {
 
   const usernameLocked = !!nextUsernameChangeDate;
 
+  /**
+   * 距可修改用户名还有几天（向上取整：不足 1 天也显示 1 天）。
+   * 例：还剩 2.4 天 → 3；还剩 0.5 天 → 1。
+   */
+  const daysUntilUsernameChange = (() => {
+    if (!nextUsernameChangeDate) return 0;
+    const ms = nextUsernameChangeDate.getTime() - Date.now();
+    return Math.max(1, Math.ceil(ms / (24 * 60 * 60 * 1000)));
+  })();
+
   const handleSave = async () => {
     setSaving(true);
     setMessage('');
+
+    // 用户名 30 天冷却：本地已算出可修改时间，直接拦下、不发无用请求。
+    // 输入框在锁定期内是 disabled 的，因此这里主要防「用户在锁定前就把新用户名
+    // 填好、锁定后才点保存」这类边界，以及任何绕过 UI 的调用。
+    if (username !== user?.username && usernameLocked) {
+      setSaving(false);
+      setNotice(`请于${daysUntilUsernameChange}天后修改`);
+      return;
+    }
 
     try {
       const payload: any = { nickname };
@@ -97,7 +126,15 @@ export default function Profile() {
       setMessage('保存成功');
       fetchUser();
     } catch (error: any) {
-      setMessage(error.response?.data?.error || '保存失败');
+      const errMsg = String(error.response?.data?.error || '保存失败');
+      // 用户名/昵称重名：用与冷却提示一致的半透明弹窗，而不是行内消息
+      if (errMsg.includes('昵称')) {
+        setNotice('该昵称已存在');
+      } else if (errMsg.includes('用户名')) {
+        setNotice('该用户名已存在');
+      } else {
+        setMessage(errMsg);
+      }
     } finally {
       setSaving(false);
     }
@@ -140,6 +177,19 @@ export default function Profile() {
     }
   };
 
+  /**
+   * 打开「更换邮箱」弹窗：清空上一次的输入与提示，但如果本地已存在一条尚未使用的
+   * 已验证记录（用户可能刚验证完就关掉了弹窗），则直接沿用，避免重复走滑块+邮件。
+   */
+  const openEmailModal = () => {
+    setBindMsg('');
+    setShowEmailModal(true);
+  };
+
+  /**
+   * 完成更换邮箱。弹窗内已完成「滑块人机验证 + 邮件链接验证」，
+   * 这里只负责凭验证令牌提交。
+   */
   const handleBindEmail = async () => {
     setBindMsg('');
     if (!EMAIL_RE.test(bindEmail)) {
@@ -147,19 +197,20 @@ export default function Profile() {
       return;
     }
     if (!bindEmailVerified) {
-      setBindMsg('请验证邮箱');
+      setBindMsg('请先完成邮箱验证');
       return;
     }
     setBindSaving(true);
     try {
       await api.post('/users/bind-email', { email: bindEmail, emailVerifyToken: pending!.token });
-      setBindMsg('邮箱绑定成功');
       setBindEmail('');
       clear();
       fetchUser();
+      setShowEmailModal(false);
+      setMessage('邮箱更换成功');
     } catch (e: any) {
-      const msg = e.response?.data?.error || '绑定失败';
-      setBindMsg(/验证|verify/i.test(String(msg)) ? '请验证邮箱' : msg);
+      const msg = e.response?.data?.error || '更换失败';
+      setBindMsg(/验证|verify/i.test(String(msg)) ? '请先完成邮箱验证' : msg);
     } finally {
       setBindSaving(false);
     }
@@ -203,25 +254,37 @@ export default function Profile() {
               className="input"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
+              // 30 天冷却期内不进入编辑状态（按需求：只保留倒计时小字提示）
               disabled={usernameLocked}
               placeholder="3-20 位字母、数字或下划线"
             />
-            <span className="hint">
-              {usernameLocked
-                ? `用户名每 ${USERNAME_COOLDOWN_DAYS} 天只能修改一次，下次可修改时间：${nextUsernameChangeDate!.toLocaleDateString('zh-CN')}`
-                : `用户名每 ${USERNAME_COOLDOWN_DAYS} 天只能修改一次，且不能与其他用户重复`}
-            </span>
+            {/* 锁定期内只显示倒计时小字；解锁后不显示任何规则说明（原两种长文案已按要求清除） */}
+            {usernameLocked && (
+              <span className="hint">请于{daysUntilUsernameChange}天后修改</span>
+            )}
           </div>
 
           <div className="form-group">
             <label className="label">邮箱</label>
-            <input
-              type="email"
-              className="input"
-              value={user?.email || ''}
-              disabled
-            />
-            <span className="hint">邮箱不可直接修改，请使用下方「绑定/更换邮箱」</span>
+            <div className="email-row">
+              <input
+                type="email"
+                className="input"
+                value={user?.email || ''}
+                disabled
+              />
+              {/* 「邮箱」与「绑定/更换邮箱」合并为一处：按钮直接开弹窗填新邮箱 */}
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={openEmailModal}
+              >
+                更换邮箱
+              </button>
+            </div>
+            {bindEmailVerified && pending?.email && (
+              <span className="hint success-hint">✅ 新邮箱已验证：{pending.email}，点击「保存修改」完成更换</span>
+            )}
           </div>
 
           <div className="form-group">
@@ -315,108 +378,10 @@ export default function Profile() {
             {pwSaving ? '修改中...' : '修改密码'}
           </button>
         </div>
-
-        {/* 绑定 / 更换邮箱 */}
-        <div className="card profile-card">
-          <h2>📧 绑定 / 更换邮箱</h2>
-          <div className="form-group">
-            <label className="label">新邮箱地址 *</label>
-            <input
-              type="email"
-              className="input"
-              value={bindEmail}
-              onChange={(e) => setBindEmail(e.target.value)}
-              placeholder="请输入要绑定的新邮箱"
-            />
-          </div>
-
-          {bindEmailVerified ? (
-            <div className="svl-message success" style={{ marginBottom: 16 }}>
-              ✅ 邮箱已验证：{pending!.email}
-            </div>
-          ) : (
-            <div className="form-group">
-              <label className="label">邮箱验证（滑块 + 点击邮件链接）</label>
-              <SendVerifyLink email={bindEmail} purpose="bind-email" buttonLabel="发送验证链接" />
-            </div>
-          )}
-
-          {bindMsg && (
-            <div className={`message ${bindMsg.includes('成功') ? 'success' : 'error'}`}>
-              {bindMsg}
-            </div>
-          )}
-
-          <button
-            onClick={handleBindEmail}
-            className="btn btn-primary"
-            disabled={bindSaving}
-          >
-            {bindSaving ? '绑定中...' : '绑定邮箱'}
-          </button>
-        </div>
       </div>
 
-      {/* 我创建的房间 */}
-      <div className="card my-rooms-card">
-        <h2>🎬 我创建的房间</h2>
-        {roomsLoading ? (
-          <p className="empty-text">加载中...</p>
-        ) : myRooms.length === 0 ? (
-          <p className="empty-text">
-            你还没有创建过房间，
-            <span className="link-text" onClick={() => navigate('/create')}>去创建一个</span>
-          </p>
-        ) : (
-          <div className="my-rooms-list">
-            {myRooms.map(room => {
-              // 已结束的房间不可进入
-              if (room.status === 'ENDED') {
-                return (
-                  <div key={room.id} className="my-room-item is-disabled" aria-disabled="true">
-                    <div className="my-room-main">
-                      <span className="my-room-name">{room.name}</span>
-                      <span className={`room-status-badge status-${room.status.toLowerCase()}`}>
-                        {statusText(room.status)}
-                      </span>
-                    </div>
-                    <div className="my-room-meta">
-                      <span>👥 {room._count?.members || 0} 人</span>
-                      {room.currentMovie && <span>📽️ {room.currentMovie}</span>}
-                      <span>{new Date(room.createdAt).toLocaleDateString()}</span>
-                    </div>
-                  </div>
-                );
-              }
-              // 可进入的房间用 Link，键盘与读屏用户同样可达
-              return (
-                <Link
-                  key={room.id}
-                  to={`/room/${room.id}`}
-                  className="my-room-item"
-                >
-                  <div className="my-room-main">
-                    <span className="my-room-name">{room.name}</span>
-                    <span className={`room-status-badge status-${room.status.toLowerCase()}`}>
-                      {statusText(room.status)}
-                    </span>
-                  </div>
-                  <div className="my-room-meta">
-                    <span>👥 {room._count?.members || 0} 人</span>
-                    {room.currentMovie && <span>📽️ {room.currentMovie}</span>}
-                    <span>{new Date(room.createdAt).toLocaleDateString()}</span>
-                  </div>
-                </Link>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* 退出登录 */}
-      <div className="card profile-card">
-        <h2>🚪 退出登录</h2>
-        <p className="empty-text" style={{ marginBottom: 16 }}>退出后需要重新登录才能继续使用。</p>
+      {/* 退出登录：按要求只保留按钮本身（去掉板块外框与说明文字） */}
+      <div className="profile-logout">
         <button
           onClick={handleLogout}
           className="btn btn-danger"
@@ -424,6 +389,89 @@ export default function Profile() {
           退出登录
         </button>
       </div>
+
+      {/* 用户名冷却 / 重名提示：半透明遮罩 + 居中卡片，与打赏弹窗同款观感 */}
+      {notice && (
+        <div className="modal-mask" onClick={() => setNotice(null)}>
+          <div
+            className="modal-card card notice-card"
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="notice-text">{notice}</p>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => setNotice(null)}
+            >
+              知道了
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 更换邮箱弹窗：新邮箱输入 + 滑块人机验证 + 发送验证链接，全部在弹窗内完成 */}
+      {showEmailModal && (
+        <div className="modal-mask" onClick={() => !bindSaving && setShowEmailModal(false)}>
+          <div
+            className="modal-card card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="更换邮箱"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>📧 更换邮箱</h3>
+            <div className="form-group" style={{ marginTop: 12 }}>
+              <label className="label">新邮箱地址</label>
+              <input
+                type="email"
+                className="input"
+                value={bindEmail}
+                onChange={(e) => setBindEmail(e.target.value)}
+                placeholder="请输入要更换的邮箱"
+                autoFocus
+              />
+            </div>
+
+            {bindEmailVerified ? (
+              <div className="svl-message success" style={{ marginBottom: 16 }}>
+                ✅ 邮箱已验证：{pending!.email}
+              </div>
+            ) : (
+              <div className="form-group">
+                <label className="label">邮箱验证（滑块 + 点击邮件链接）</label>
+                <SendVerifyLink email={bindEmail} purpose="bind-email" buttonLabel="发送验证链接" />
+              </div>
+            )}
+
+            {bindMsg && (
+              <div className={`message ${bindMsg.includes('成功') ? 'success' : 'error'}`}>
+                {bindMsg}
+              </div>
+            )}
+
+            <div className="modal-actions" style={{ marginTop: 16 }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setShowEmailModal(false)}
+                disabled={bindSaving}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleBindEmail}
+                disabled={bindSaving}
+              >
+                {bindSaving ? '更换中...' : '更换邮箱'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

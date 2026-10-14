@@ -147,3 +147,97 @@
 .form-group {
   margin-bottom: 18px;
 }
+
+/* ===== 按钮与表单内容居中 ===== */
+/* 需求：个人中心里的按钮全部居中。
+   label 仍靠左（可读性），输入框/按钮/小字提示居中。 */
+.profile-card .form-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.profile-card .form-group > .label {
+  align-self: stretch;   /* 标签撑满一行，保持左对齐 */
+}
+
+.profile-card .form-group > .input {
+  width: 100%;
+}
+
+/* 卡片里不属于 .form-group 的直接按钮（保存修改 / 修改密码）也居中 */
+.profile-card > .btn {
+  display: block;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* 邮箱一行：当前邮箱只读 + 「更换邮箱」按钮，两者居中堆叠 */
+.email-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.email-row .input {
+  width: 100%;
+}
+
+/* 小字提示：倒计时 / 已验证提示 */
+.hint.success-hint {
+  color: var(--success-color);
+}
+
+/* 退出登录：只留一个居中按钮，不再有板块外框 */
+.profile-logout {
+  display: flex;
+  justify-content: center;
+  margin: 28px 0 8px;
+}
+
+/* ===== 半透明提示弹窗（用户名冷却 / 重名）===== */
+/* 兜底：.modal-mask 定义在 Layout.css、.modal-card/.modal-actions 定义在 RoomView.css。
+   正常导航下它们已加载；但直接刷新进 /profile 时（或未进过房间页）可能尚未加载，
+   弹窗会失去定位与遮罩。这里补齐等价样式，属性值与原定义保持一致。 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.modal-card {
+  max-width: 400px;
+  width: 90%;
+  text-align: center;
+  padding: 28px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+.notice-card {
+  max-width: 320px;
+  text-align: center;
+}
+
+.notice-text {
+  margin: 4px 0 20px;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.notice-card .btn {
+  display: block;
+  margin: 0 auto;
+  min-width: 96px;
+}
+

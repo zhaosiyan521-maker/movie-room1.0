@@ -2894,7 +2894,7 @@ export default function RoomView() {
                 {/* 提示文案精简为一行：原先「输入视频页面网址，自动嗅探其中的
                     .m3u8 / mp4 / webm 直链。」+「原视频网址」标签说了两遍同一件事，
                     且技术细节（支持的容器格式）对用户没有帮助。 */}
-                <p className="chat-rules" style={{ marginTop: 4 }}>
+                <p className="chat-rules" style={{ marginTop: 4, textAlign: 'center' }}>
                   输入视频网址🧙自动生成直链
                 </p>
                 <div className="form-group" style={{ marginTop: 12 }}>

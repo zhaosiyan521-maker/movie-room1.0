@@ -62,3 +62,7 @@ dsh-sync-key
 dsh-sync-key.pub
 dsh-known-hosts
 dsh-payload.b64
+# GitHub 推送专用密钥（同样绝不能入库）
+dsh-github-key
+dsh-github-key.pub
+dsh-github-known-hosts
