@@ -14,9 +14,13 @@ release/
 out/
 
 # Environment files
+# 用通配符覆盖一切变体（.env.e2e-test / .env.bak / .env.old ...），
+# 原先只列了 .env / .env.local / .env.production 三条，任何新变体都会漏网被提交。
+# 唯一例外是模板 .env.example，它必须入库。
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+!**/.env.example
 
 # Database
 *.db
@@ -45,6 +49,10 @@ uploads/
 
 # TypeScript 增量编译缓存
 *.tsbuildinfo
+
+# 沙箱/部署调试时留下的写探针文件（空文件，无任何价值）
+_writeprobe*
+.probe-*
 
 # WorkBuddy 工作区记忆（本机笔记，不入库）
 .workbuddy/
