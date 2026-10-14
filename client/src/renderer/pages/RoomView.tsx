@@ -269,7 +269,8 @@ export default function RoomView() {
   const [showSniffResult, setShowSniffResult] = useState(false); // 结果弹窗
   const [sniffTitle, setSniffTitle] = useState('');            // 页面标题
   const [sniffUrls, setSniffUrls] = useState<string[]>([]);    // 捕获到的直链列表
-  const [copiedUrl, setCopiedUrl] = useState<string | null>(null); // 已复制的直链
+  // 已被「选择」设为播放源的那条直链（用于把该行显示为「✅ 已选择」）
+  const [selectedSniffUrl, setSelectedSniffUrl] = useState<string | null>(null);
 
   const hlsRef = useRef<any>(null);
   const setupDoneRef = useRef(false);
@@ -1545,7 +1546,7 @@ export default function RoomView() {
       const urls: string[] = Array.isArray(data?.urls) ? data.urls : [];
       setSniffUrls(urls);
       setSniffTitle(typeof data?.title === 'string' ? data.title : '');
-      setCopiedUrl(null);
+      setSelectedSniffUrl(null);
       // 关闭输入弹窗，弹出结果弹窗
       setShowSniffInput(false);
       setShowSniffResult(true);
@@ -1561,19 +1562,47 @@ export default function RoomView() {
     setSniffUrls([]);
   };
 
-  const copySniffUrl = async (url: string) => {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopiedUrl(url);
-      // 复制成功后自动关闭结果弹窗（【M8-6】登记到统一定时器表）
-      later(() => {
-        setShowSniffResult(false);
-        setSniffUrls([]);
-      }, 600);
-    } catch {
-      // 剪贴板不可用（非安全上下文等）：降级为选中文本让用户手动复制
-      window.prompt('复制失败，请手动复制：', url);
-    }
+  /**
+   * 把一条直链设为当前房间的播放源（本地 UI + 落库）。
+   *
+   * 抽成函数是为了让两处入口行为完全一致：
+   *   1) 房主手动粘贴直链后点「设为播放源」
+   *   2) 直链捕获结果弹窗里点「选择」
+   * 旧实现只有第 1 处有这段逻辑，第 2 处只能复制到剪贴板、要用户自己再粘贴一次。
+   */
+  const applyPlaybackSource = (rawUrl: string) => {
+    const url = rawUrl.trim();
+    if (!url) return;
+    // 本地立即生效：输入框回填 + 当前播放源显示 + 切到网络直链模式
+    setUrlInput(url);
+    setRemotePlayUrl(url);
+    setUsingRemoteUrl(true);
+    usingRemoteUrlRef.current = true;
+    // 【播放源持久化】同时写入该房间的数据库记录：
+    // 此后暂停、结束放映、刷新页面、切页、服务重启都不会丢，
+    // 只有房间被解散时播放源才会随之消失。
+    // 【M1】统一用 getLiveSocket()，保证房主切页后事件仍能发出。
+    getLiveSocket()?.emit('host-set-source', {
+      roomId: id,
+      videoUrl: url,
+      isHls: looksLikeHls(url),
+      resolution: getResolution()
+    });
+  };
+
+  /**
+   * 捕获结果弹窗里「选择」某条直链：设为播放源，给一次明确反馈后关闭弹窗。
+   * 注意：只设为播放源，**不自动开播** —— 开播仍由房主点「▶️ 播放网络视频」决定，
+   * 否则正在放映时会走 startRemotePlayback 从 0 重新加载，把整场拉回开头。
+   */
+  const selectSniffUrl = (url: string) => {
+    applyPlaybackSource(url);
+    setSelectedSniffUrl(url);
+    // 让「✅ 已选择」先被看到，再关闭弹窗（【M8-6】登记到统一定时器表）
+    later(() => {
+      setShowSniffResult(false);
+      setSniffUrls([]);
+    }, 600);
   };
 
   // ===== 语音聊天 =====
@@ -2707,24 +2736,7 @@ export default function RoomView() {
                   />
                   <button
                     className="btn btn-secondary btn-sm"
-                    onClick={() => {
-                      const url = urlInput.trim();
-                      if (!url) { alert('请先粘贴视频直链'); return; }
-                      // 本地立即生效：输入框/播放按钮的可用状态
-                      setRemotePlayUrl(url);
-                      setUsingRemoteUrl(true);
-                      usingRemoteUrlRef.current = true;
-                      // 【播放源持久化】同时写入该房间的数据库记录：
-                      // 此后暂停、结束放映、刷新页面、切页、服务重启都不会丢，
-                      // 只有房间被解散时播放源才会随之消失。
-                      // 【M1】统一用 getLiveSocket()
-                      getLiveSocket()?.emit('host-set-source', {
-                        roomId: id,
-                        videoUrl: url,
-                        isHls: looksLikeHls(url),
-                        resolution: getResolution()
-                      });
-                    }}
+                    onClick={() => applyPlaybackSource(urlInput)}
                   >
                     设为播放源
                   </button>
@@ -2925,10 +2937,10 @@ export default function RoomView() {
                         <span className="sniff-index">{idx + 1}.</span>
                         <span className="sniff-url" title={u}>{u}</span>
                         <button
-                          className={`btn btn-sm ${copiedUrl === u ? 'btn-success' : 'btn-primary'}`}
-                          onClick={() => copySniffUrl(u)}
+                          className={`btn btn-sm ${selectedSniffUrl === u ? 'btn-success' : 'btn-primary'}`}
+                          onClick={() => selectSniffUrl(u)}
                         >
-                          {copiedUrl === u ? '✅ 已复制' : '复制'}
+                          {selectedSniffUrl === u ? '✅ 已选择' : '选择'}
                         </button>
                       </div>
                     ))}
