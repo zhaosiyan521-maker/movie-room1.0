@@ -332,13 +332,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-.voice-settings-hint {
-  margin: 0 0 6px 102px;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.4;
-}
-
 .voice-settings-foot {
   display: flex;
   justify-content: flex-end;
@@ -353,9 +346,6 @@
   }
   .voice-settings-row label {
     flex-basis: auto;
-  }
-  .voice-settings-hint {
-    margin-left: 0;
   }
 }
 

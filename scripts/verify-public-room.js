@@ -269,6 +269,19 @@ const { check, report } = checker;
     const adminStillIn = await postScreening(pubRoom.id, adminHeaders.Authorization.replace('Bearer ', ''), undefined);
     check('未设密码时管理员仍可通过放映通道', adminStillIn.status === 200,
       `status=${adminStillIn.status}`);
+
+    // ---- 13. 「永远置顶」在翻页时也必须成立 ----
+    // 早前实现只把「命中本页切片」的公共房间放进结果，翻到第 2 页公共房间就整批消失，
+    // 与「永远置顶」直接矛盾。这里用极小 limit 强制翻页来锁死该行为。
+    for (const page of [1, 2]) {
+      const res = await fetch(`${BASE}/api/rooms?page=${page}&limit=2`, { headers: adminHeaders });
+      const list = (await res.json()).rooms || [];
+      const pubs = list.filter(r => r.isPublicRoom);
+      check(`第 ${page} 页仍包含公共房间（永远置顶）`, pubs.length >= 1,
+        `本页=${list.map(r => (r.isPublicRoom ? 'P' : 'n')).join('')}`);
+      check(`第 ${page} 页公共房间排在最前`, list.length === 0 || list[0].isPublicRoom,
+        `顺序=${list.map(r => (r.isPublicRoom ? 'P' : 'n')).join('')}`);
+    }
   } finally {
     try { adminSock?.close(); } catch { /* ignore */ }
     try { aliceSock?.close(); } catch { /* ignore */ }

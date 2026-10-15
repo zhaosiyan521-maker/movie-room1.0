@@ -771,6 +771,12 @@ export default function RoomView() {
         const alreadyMember = r.members.some(m => m.user.id === me.id);
         if (alreadyMember) {
           doJoin();
+        } else if (hostFlag) {
+          // 【公共房间需求 · 关键】通过放映通道进来的用户此时**还不是**成员，
+          // 而界面渲染条件 `!joined ? 加入房间卡片 : 观影界面` 会把他挡在
+          // 「加入房间」卡片前 —— 拿不到房主控制面板，放映权限形同虚设。
+          // 因此这里替他静默完成 /join（silent：失败不弹密码错误卡片）。
+          doJoin(undefined, true);
         }
       }
     } catch (error: any) {
@@ -790,11 +796,20 @@ export default function RoomView() {
       const alreadyMember = room.members.some(m => m.user.id === user.id);
       if (alreadyMember) {
         doJoin();
+      } else if (hostFlag) {
+        // 同 fetchRoom：放映人/管理员即使不是成员也直接静默加入，直达放映界面
+        doJoin(undefined, true);
       }
     }
   }, [user, room]);
 
-  const doJoin = async (password?: string) => {
+  /**
+   * 加入房间。
+   *
+   * @param silent 自动加入（放映通道进入时）用：失败不写 error 卡片，
+   *               避免给放映人弹一个他根本不需要填的密码错误。
+   */
+  const doJoin = async (password?: string, silent = false) => {
     try {
       await api.post(`/rooms/${id}/join`, {
         password: password || undefined
@@ -807,6 +822,10 @@ export default function RoomView() {
       setError('');
       setupWebSocket();
     } catch (error: any) {
+      if (silent) {
+        console.error('自动加入房间失败（放映通道用户）:', error?.response?.data?.error || error?.message);
+        return;
+      }
       setError(error.response?.data?.error || '加入房间失败');
     }
   };

@@ -318,16 +318,29 @@ roomRouter.get('/', async (req: AuthRequest, res: Response) => {
       ];
     }
 
-    // 【公共房间需求】公共房间（管理员创建）永远置顶。
+    // 【公共房间需求】公共房间（管理员创建）**永远置顶**。
     //
-    // 采用「两次查询 + 拼接」：公共房间数量极少（管理员手动创建），先取全量 id 列表，
-    // 本页优先放公共房间，剩余位置用普通房间补足。比在数据库里按关联字段排序更简单可靠，
-    // 且分页语义清晰（公共房间占据最前面的若干位）。
+    // 实现要点：公共房间在**每一页**都全量出现在最前面，不参与分页切片。
+    // 早前版本只把「命中本页切片」的公共房间放进结果，导致翻到第 2 页时公共房间整批消失，
+    // 与「永远置顶」直接矛盾。这类房间数量极少（管理员手动创建），每页全量附带没有实际开销。
     const publicIdList = (await prisma.room.findMany({
       where: { host: { isAdmin: true } },
       select: { id: true },
     })).map(r => r.id);
     const publicIdSet = new Set(publicIdList);
+
+    const matchedPublic = publicIdList.length
+      ? await prisma.room.findMany({
+          where: { ...where, id: { in: publicIdList } },
+          select: {
+            ...ROOM_PUBLIC_SELECT,
+            hostId: true,
+            host: { select: ROOM_HOST_SELECT },
+            _count: { select: { members: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      : [];
 
     const skip = (paging.page - 1) * paging.limit;
 
@@ -338,31 +351,19 @@ roomRouter.get('/', async (req: AuthRequest, res: Response) => {
       _count: { select: { members: true } },
     } as const;
 
-    // 命中过滤条件的公共房间（按创建时间倒序）
-    const matchedPublic = publicIdList.length
-      ? await prisma.room.findMany({
-          where: { ...where, id: { in: publicIdList } },
-          select: ROOM_LIST_SELECT,
-          orderBy: { createdAt: 'desc' },
-        })
-      : [];
+    // 公共房间固定占据每页最前的 N 个位置，普通房间因此按 (limit - N) 为页长翻页
+    const publicTake = Math.min(matchedPublic.length, Math.max(0, paging.limit - 1));
+    const usableLimit = Math.max(1, paging.limit - publicTake);
 
-    const publicOnThisPage = matchedPublic.slice(skip, skip + paging.limit);
-    const plainNeeded = paging.limit - publicOnThisPage.length;
-    // 公共房间排在最前，故普通房间的偏移要扣掉「前面页里已占位的公共房间数」
-    const plainSkip = Math.max(0, skip - matchedPublic.length);
+    const plainRooms = await prisma.room.findMany({
+      where: publicIdSet.size ? { ...where, id: { notIn: [...publicIdList] } } : where,
+      select: ROOM_LIST_SELECT,
+      orderBy: { createdAt: 'desc' },
+      skip: skip === 0 ? 0 : Math.max(0, skip - matchedPublic.length),
+      take: usableLimit,
+    });
 
-    const plainRooms = plainNeeded > 0
-      ? await prisma.room.findMany({
-          where: publicIdSet.size ? { ...where, id: { notIn: [...publicIdSet] } } : where,
-          select: ROOM_LIST_SELECT,
-          orderBy: { createdAt: 'desc' },
-          skip: plainSkip,
-          take: plainNeeded,
-        })
-      : [];
-
-    const rooms = [...publicOnThisPage, ...plainRooms];
+    const rooms = [...matchedPublic, ...plainRooms];
 
     const total = await prisma.room.count({ where });
 
