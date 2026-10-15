@@ -1,79 +1,11 @@
 import { useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../store/authStore';
+import {
+  MAX_ROOM_IMAGES as MAX_IMAGES,
+  compressImageFiles,
+} from '../utils/roomImages';
 import './CreateRoom.css';
-
-const MAX_IMAGES = 5;
-// 单张图片体积上限（读取前拦截，避免 base64 膨胀拖垮进程）
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
-// 解码后像素总量上限（约 8000×5000）。缩放发生在解码之后，
-// 一张高压缩比的巨图（如 30000×30000 PNG）解码即需数 GB 内存，
-// 不校验会导致 Electron 渲染进程 OOM 崩溃。
-const MAX_PIXELS = 40_000_000;
-
-/**
- * 客户端压缩图片：最大边长 1000px，JPEG 0.8。
- *
- * 关键点：img.onload 内必须整体 try/catch。
- * Promise 构造函数的 executor 在 new Promise() 返回时就已执行完毕，
- * 此后回调里抛出的异常不会被外层捕获，会变成未捕获的全局错误，
- * 而外层 Promise 永远 pending —— 导致 await 永久挂起、finally 不执行，
- * 文件 input 的 value 也无法重置（再次选同一文件连 change 都不触发）。
- */
-function compressImage(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    if (!file.type.startsWith('image/')) {
-      return reject(new Error('请选择图片文件'));
-    }
-    if (file.size > MAX_FILE_BYTES) {
-      return reject(new Error('图片不能超过 10MB'));
-    }
-
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('图片读取失败'));
-    reader.onload = () => {
-      const img = new Image();
-      img.onerror = () => reject(new Error('图片读取失败'));
-      img.onload = () => {
-        try {
-          if (!img.naturalWidth || !img.naturalHeight) {
-            return reject(new Error('图片尺寸无效'));
-          }
-          if (img.naturalWidth * img.naturalHeight > MAX_PIXELS) {
-            return reject(new Error('图片分辨率过大，请压缩后再上传'));
-          }
-
-          const maxSide = 1000;
-          let width = img.naturalWidth;
-          let height = img.naturalHeight;
-          if (width > maxSide || height > maxSide) {
-            const ratio = Math.min(maxSide / width, maxSide / height);
-            width = Math.max(1, Math.round(width * ratio));
-            height = Math.max(1, Math.round(height * ratio));
-          }
-
-          const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) return reject(new Error('图片处理失败'));
-          ctx.drawImage(img, 0, 0, width, height);
-
-          const url = canvas.toDataURL('image/jpeg', 0.8);
-          if (!url.startsWith('data:image/jpeg')) {
-            return reject(new Error('图片编码失败'));
-          }
-          resolve(url);
-        } catch {
-          // 无论如何都要 settle，避免 Promise 永久挂起
-          reject(new Error('图片处理失败'));
-        }
-      };
-      img.src = String(reader.result);
-    };
-    reader.readAsDataURL(file);
-  });
-}
 
 export default function CreateRoom() {
   const navigate = useNavigate();
@@ -106,13 +38,7 @@ export default function CreateRoom() {
     }
 
     // allSettled 而非 all：一张失败不至于让已成功的图片全部白做
-    const results = await Promise.allSettled(
-      files.slice(0, remaining).map(compressImage)
-    );
-    const ok = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => (r as PromiseFulfilledResult<string>).value);
-    const failed = results.length - ok.length;
+    const { ok, failed } = await compressImageFiles(files, remaining);
 
     if (ok.length) {
       setImages(prev => [...prev, ...ok]);

@@ -74,7 +74,7 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(167, 139, 250, 0.25);
 }
 
-/* ===== 【公共房间需求】双入口选择弹层 ===== */
+/* ===== 【公共房间需求】三步弹窗 ===== */
 /* 兜底：.modal-mask / .modal-card 的**结构**样式分别定义在 RoomView.css / Layout.css，
    而本页只在路由里使用，若用户没进过房间页就直达大厅，那两份 CSS 可能尚未加载，
    弹层会失去定位与遮罩。这里补齐结构样式（值与上面两处保持一致），保证独立可用。 */
@@ -98,53 +98,67 @@
   padding: 28px;
 }
 
+/* --- 弹窗①：选择进入方式 --- */
 .screening-picker {
   display: flex;
   flex-direction: column;
   gap: 10px;
   max-width: 380px;
   width: calc(100% - 32px);
-  text-align: left;
 }
 
-.screening-title {
-  margin: 0;
+.screening-roomname {
+  margin: 0 0 4px;
   font-size: 18px;
   color: var(--text-primary);
-  text-align: center;
+  word-break: break-word;
 }
 
-.screening-sub {
+/* 房主 / 观众 信息块：与房间页加入卡片的 .room-info 观感一致 */
+.screening-roominfo {
+  background-color: rgba(255, 255, 255, 0.04);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 6px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.screening-roominfo p {
   margin: 0;
-  font-size: 13px;
-  color: var(--text-muted);
-  text-align: center;
+  font-size: 14px;
+  color: var(--text-secondary);
 }
 
 .screening-option {
   width: 100%;
 }
 
-.screening-divider {
-  height: 1px;
-  background-color: var(--border-color);
-  margin: 4px 0;
-}
-
-.screening-channel-label {
-  margin: 0;
-  font-size: 14px;
-  color: var(--text-secondary);
-}
-
-.screening-pass-row {
+/* --- 弹窗②：输入密码 --- */
+.screening-pass-modal {
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 420px;
+  width: calc(100% - 32px);
 }
 
-.screening-pass-row .input {
-  flex: 1 1 auto;
-  min-width: 0;
+.screening-passtitle {
+  margin: 0;
+  font-size: 22px;
+  color: var(--text-primary);
+}
+
+.screening-passinput {
+  text-align: center;
+}
+
+.screening-pashint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
 }
 
 .screening-error {
@@ -153,18 +167,29 @@
   color: var(--error-color);
 }
 
-.screening-hint {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
+/* --- 弹窗③：编辑房间信息（复用 CreateRoom 的表单样式） --- */
+.edit-room-modal {
+  max-width: 520px;
+  width: calc(100% - 32px);
+  max-height: 86vh;
+  overflow-y: auto;
+  text-align: left;
 }
 
-.screening-foot {
+.edit-room-title {
+  margin: 0 0 16px;
+  font-size: 20px;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.edit-room-actions {
   display: flex;
   justify-content: flex-end;
-  margin-top: 4px;
+  gap: 10px;
+  margin-top: 20px;
 }
+
 
 .room-card-header {
   display: flex;

@@ -1,7 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../store/authStore';
+import {
+  MAX_ROOM_IMAGES,
+  compressImageFiles,
+} from '../utils/roomImages';
 import './RoomList.css';
+import './CreateRoom.css';
 
 interface Room {
   id: string;
@@ -13,6 +18,8 @@ interface Room {
   hasPassword?: boolean;
   maxViewers: number;
   currentMovie?: string;
+  /** 【新需求】本场我是否已经改过房间信息（改过则跳过编辑弹窗） */
+  hasEditedThisSession?: boolean;
   host: {
     id: string;
     username: string;
@@ -134,31 +141,77 @@ export default function RoomList() {
     setMatchedUsers([]);
   };
 
-  // ===== 【公共房间需求】双入口选择 =====
+  // ===== 【公共房间需求】三步弹窗 =====
   //
-  // 公共房间点击卡片不再直接进入，而是先问用户走哪条路：
-  //   「加入房间」→ 与普通房间完全一致的既有流程（/room/:id + 房间密码）
-  //   「放映通道」→ 先向服务端换取放映权限，成功后再进房（进房后即显示房主控制面板）
+  // 弹窗①（选择进入方式）：房名 + 房主/观众 + 「加入房间」「放映通道」「返回列表」
+  // 弹窗②（输入密码，严格按设计稿）：只在走放映通道时出现
+  // 弹窗③（编辑房间信息）：密码校验通过后弹一次；本场已改过则跳过
   const [pickerRoom, setPickerRoom] = useState<Room | null>(null);
+  const [showPassModal, setShowPassModal] = useState(false);
   const [screeningPass, setScreeningPass] = useState('');
   const [screeningError, setScreeningError] = useState('');
   const [screeningBusy, setScreeningBusy] = useState(false);
 
+  // 弹窗③的表单（字段与「创建房间」一致）
+  const [editRoom, setEditRoom] = useState<Room | null>(null);
+  const [editForm, setEditForm] = useState({ name: '', description: '', password: '', maxViewers: 30 });
+  const [editImages, setEditImages] = useState<string[]>([]);
+  const [editError, setEditError] = useState('');
+  const [editSaving, setEditSaving] = useState(false);
+  const editFileRef = useRef<HTMLInputElement>(null);
+
   const openPicker = (room: Room) => {
     setPickerRoom(room);
+    setShowPassModal(false);
     setScreeningPass('');
     setScreeningError('');
     setScreeningBusy(false);
   };
 
-  const closePicker = () => {
-    if (screeningBusy) return;
+  const closeAll = () => {
+    if (screeningBusy || editSaving) return;
     setPickerRoom(null);
+    setShowPassModal(false);
+    setEditRoom(null);
     setScreeningPass('');
     setScreeningError('');
   };
 
-  /** 走放映通道：先拿放映权限，再跳转到房间页 */
+  /** 点「放映通道」：关闭弹窗①，打开弹窗②（输入密码） */
+  const openPassModal = () => {
+    setShowPassModal(true);
+    setScreeningPass('');
+    setScreeningError('');
+  };
+
+  /** 弹窗②「返回列表」：关闭全部弹窗 */
+  const backToList = () => {
+    if (screeningBusy) return;
+    setPickerRoom(null);
+    setShowPassModal(false);
+    setEditRoom(null);
+    setScreeningPass('');
+    setScreeningError('');
+  };
+
+  /** 打开编辑房间弹窗（用房间当前信息预填） */
+  const openEditModal = (room: Room) => {
+    setEditRoom(room);
+    setEditForm({
+      name: room.name || '',
+      description: room.description || '',
+      password: '',
+      maxViewers: room.maxViewers || 30,
+    });
+    // 已有图片回填（它们是 /uploads 下的相对地址，直接可预览）
+    setEditImages(Array.isArray(parseRoomImages(room.images)) ? parseRoomImages(room.images) : []);
+    setEditError('');
+  };
+
+  /**
+   * 弹窗②「进入放映厅」：校验密码 → 拿到放映权限 → 进房。
+   * 若本场尚未编辑过房间信息，先弹弹窗③；已改过则直接进房。
+   */
   const enterScreeningChannel = async () => {
     if (!pickerRoom || screeningBusy) return;
     setScreeningBusy(true);
@@ -167,17 +220,75 @@ export default function RoomList() {
       const { data } = await api.post(`/rooms/${pickerRoom.id}/screening`, {
         password: screeningPass
       });
-      if (data?.canScreen) {
-        setPickerRoom(null);
-        setScreeningPass('');
-        navigate(`/room/${pickerRoom.id}`);
+      if (!data?.canScreen) {
+        setScreeningError('进入放映厅失败，请稍后重试');
         return;
       }
-      setScreeningError('进入放映通道失败，请稍后重试');
+      // 需求：每人每场只能改一次，改过之后再进来自动跳过编辑弹窗
+      if (data.hasEditedThisSession) {
+        const id = pickerRoom.id;
+        setPickerRoom(null);
+        setShowPassModal(false);
+        setScreeningPass('');
+        navigate(`/room/${id}`);
+        return;
+      }
+      // 先关掉密码弹窗，再弹出编辑房间弹窗
+      setShowPassModal(false);
+      setScreeningPass('');
+      openEditModal(pickerRoom);
     } catch (e: any) {
-      setScreeningError(e?.response?.data?.error || '进入放映通道失败');
+      setScreeningError(e?.response?.data?.error || '进入放映厅失败');
     } finally {
       setScreeningBusy(false);
+    }
+  };
+
+  /** 弹窗③：图片选择（与创建房间同一套压缩逻辑） */
+  const handleEditImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const remaining = MAX_ROOM_IMAGES - editImages.length;
+    if (remaining <= 0) {
+      setEditError(`最多只能添加 ${MAX_ROOM_IMAGES} 张图片`);
+      if (editFileRef.current) editFileRef.current.value = '';
+      return;
+    }
+    const { ok, failed } = await compressImageFiles(files, remaining);
+    if (ok.length) setEditImages(prev => [...prev, ...ok]);
+    setEditError(failed > 0 ? `${failed} 张图片处理失败（可能过大或格式不支持），其余已添加` : '');
+    if (editFileRef.current) editFileRef.current.value = '';
+  };
+
+  /** 弹窗③「确认」：覆盖房间信息 + 图片，然后进入房间 */
+  const confirmEditRoom = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editRoom || editSaving) return;
+    setEditError('');
+    setEditSaving(true);
+    try {
+      await api.patch(`/rooms/${editRoom.id}`, {
+        name: editForm.name,
+        description: editForm.description || null,
+        // 语义（与占位提示一致）：留空 = 保持原密码不变；
+        // 填了新值 = 覆盖为新密码。这样用户不会因为"没动密码框"而意外清掉密码。
+        ...(editForm.password ? { password: editForm.password } : {}),
+        maxViewers: editForm.maxViewers,
+      });
+      // 图片走独立接口（那里已有跨房间引用检查与旧文件清理）
+      await api.put(`/rooms/${editRoom.id}/images`, { images: editImages });
+
+      const id = editRoom.id;
+      setEditRoom(null);
+      setPickerRoom(null);
+      setShowPassModal(false);
+      // 刷新列表，让大厅立刻反映新房间信息
+      fetchRooms();
+      navigate(`/room/${id}`);
+    } catch (err: any) {
+      setEditError(err?.response?.data?.error || '保存房间信息失败');
+    } finally {
+      setEditSaving(false);
     }
   };
 
@@ -185,7 +296,6 @@ export default function RoomList() {
     <div className="room-list-page fade-in">
       <div className="page-header">
         <h1>🎬 观影房间</h1>
-        <p>选择一个房间，与好友一起看电影</p>
       </div>
 
       <div className="room-list-layout">
@@ -333,54 +443,186 @@ export default function RoomList() {
         </div>
       </div>
 
-      {/* 【公共房间需求】双入口选择弹层 */}
-      {pickerRoom && (
-        <div className="modal-mask" onClick={closePicker}>
+      {/* ===== 弹窗①：选择进入方式（房名 + 房主/观众 + 三个按钮）===== */}
+      {pickerRoom && !showPassModal && !editRoom && (
+        <div className="modal-mask" onClick={closeAll}>
           <div className="modal-card screening-picker" onClick={e => e.stopPropagation()}>
-            <h3 className="screening-title">🏛️ {pickerRoom.name}</h3>
-            <p className="screening-sub">请选择进入方式</p>
+            <h3 className="screening-roomname">{pickerRoom.name}</h3>
 
-            {/* 入口二：与普通房间完全一致的既有流程（房间普通密码仍由房间页处理） */}
+            <div className="screening-roominfo">
+              <p>👤 房主：{pickerRoom.host.nickname || pickerRoom.host.username}</p>
+              <p>👥 观众：{pickerRoom._count.members}/{pickerRoom.maxViewers}</p>
+            </div>
+
             <button
-              className="btn btn-secondary screening-option"
+              className="btn btn-primary btn-block screening-option"
               onClick={() => navigate(`/room/${pickerRoom.id}`)}
             >
-              🚪 加入房间
+              加入房间
             </button>
 
-            <div className="screening-divider" />
+            <button
+              className="btn btn-primary btn-block screening-option"
+              onClick={openPassModal}
+            >
+              放映通道
+            </button>
 
-            {/* 入口一：放映通道 —— 通过后获得放映权限（≈房主，但不可解散房间） */}
-            <p className="screening-channel-label">🎬 放映通道（获得放映权限）</p>
-            <div className="screening-pass-row">
-              <input
-                type="password"
-                className="input"
-                placeholder="放映密码"
-                value={screeningPass}
-                onChange={e => setScreeningPass(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') enterScreeningChannel(); }}
-                disabled={screeningBusy}
-              />
-              <button
-                className="btn btn-primary"
-                onClick={enterScreeningChannel}
-                disabled={screeningBusy}
-              >
-                {screeningBusy ? '验证中…' : '进入'}
-              </button>
-            </div>
+            <button className="btn btn-secondary btn-block screening-option" onClick={closeAll}>
+              返回列表
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ===== 弹窗②：输入密码（UI 与文案严格按设计稿）===== */}
+      {pickerRoom && showPassModal && !editRoom && (
+        <div className="modal-mask" onClick={backToList}>
+          <div className="modal-card screening-pass-modal" onClick={e => e.stopPropagation()}>
+            <h3 className="screening-passtitle">输入密码</h3>
+
+            <input
+              type="password"
+              className="input screening-passinput"
+              placeholder="请输入密码"
+              value={screeningPass}
+              onChange={e => setScreeningPass(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') enterScreeningChannel(); }}
+              disabled={screeningBusy}
+            />
+
+            <p className="screening-pashint">请向管理员索要密码</p>
 
             {screeningError && <p className="screening-error">{screeningError}</p>}
-            <p className="screening-hint">
-              放映密码为一次性密码，由管理员设置；管理员本人无需密码
-            </p>
 
-            <div className="screening-foot">
-              <button className="btn btn-secondary" onClick={closePicker} disabled={screeningBusy}>
-                取消
-              </button>
-            </div>
+            <button
+              className="btn btn-primary btn-block screening-option"
+              onClick={enterScreeningChannel}
+              disabled={screeningBusy}
+            >
+              进入放映厅
+            </button>
+
+            <button
+              className="btn btn-secondary btn-block screening-option"
+              onClick={backToList}
+              disabled={screeningBusy}
+            >
+              返回列表
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ===== 弹窗③：编辑房间信息（与「创建房间」同一套表单，按钮为「确认」）===== */}
+      {editRoom && (
+        <div className="modal-mask" onClick={() => { /* 必须保存或取消，点遮罩不关 */ }}>
+          <div className="modal-card edit-room-modal" onClick={e => e.stopPropagation()}>
+            <h3 className="edit-room-title">修改房间信息</h3>
+            <form onSubmit={confirmEditRoom}>
+              <div className="form-group">
+                <label className="label">房间名称 *</label>
+                <input
+                  type="text"
+                  className="input"
+                  value={editForm.name}
+                  onChange={e => setEditForm(p => ({ ...p, name: e.target.value }))}
+                  placeholder="例如：周末电影之夜"
+                  maxLength={50}
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="label">房间描述</label>
+                <textarea
+                  className="input textarea"
+                  value={editForm.description}
+                  onChange={e => setEditForm(p => ({ ...p, description: e.target.value }))}
+                  placeholder="简单描述一下要播放的电影或活动..."
+                  rows={3}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="label">房间图片（最多 {MAX_ROOM_IMAGES} 张，观众在房间外可见）</label>
+                <input
+                  ref={editFileRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  style={{ display: 'none' }}
+                  onChange={handleEditImages}
+                />
+                <div className="image-picker">
+                  {editImages.map((img, idx) => (
+                    <div key={img + idx} className="image-preview">
+                      <img src={img} alt={`房间图片 ${idx + 1}`} />
+                      <button
+                        type="button"
+                        className="image-remove"
+                        onClick={() => setEditImages(p => p.filter((_, i) => i !== idx))}
+                        title="删除图片"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                  {editImages.length < MAX_ROOM_IMAGES && (
+                    <button
+                      type="button"
+                      className="image-add-btn"
+                      onClick={() => editFileRef.current?.click()}
+                    >
+                      <span className="image-add-icon">🖼️</span>
+                      <span>添加图片</span>
+                      <span className="image-add-count">{editImages.length}/{MAX_ROOM_IMAGES}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label className="label">入场密码（可选）</label>
+                <input
+                  type="password"
+                  className="input"
+                  value={editForm.password}
+                  onChange={e => setEditForm(p => ({ ...p, password: e.target.value }))}
+                  placeholder={editRoom.hasPassword ? '留空表示保持原密码不变' : '留空表示不需要密码'}
+                />
+                <span className="hint">设置密码后，观众需要输入密码才能加入</span>
+              </div>
+
+              <div className="form-group">
+                <label className="label">最大观众数</label>
+                <select
+                  className="input"
+                  value={editForm.maxViewers}
+                  onChange={e => setEditForm(p => ({ ...p, maxViewers: Number(e.target.value) }))}
+                >
+                  {[5, 10, 15, 20, 25, 30].map(n => (
+                    <option key={n} value={n}>{n} 人</option>
+                  ))}
+                </select>
+              </div>
+
+              {editError && <div className="error-message">{editError}</div>}
+
+              <div className="edit-room-actions">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => setEditRoom(null)}
+                  disabled={editSaving}
+                >
+                  取消
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={editSaving}>
+                  {editSaving ? '保存中…' : '确认'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

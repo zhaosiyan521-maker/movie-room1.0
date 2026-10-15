@@ -136,23 +136,13 @@ export async function claimScreening(
   // 管理员：免密直达，不消耗密码、不占放映位
   if (isAdmin) return { ok: true, asAdmin: true };
 
-  // 判定顺序很重要：
-  //   「密码不存在」必须优先于「已有人在放映」。
-  // 否则一次性密码被前一个人用掉后，后来者会收到「已有放映人」这种误导性提示，
-  // 而真实情况是「通道已关闭，需要管理员重新设密码」——两者给用户的下一步动作完全不同。
-  if (!room.screeningPassword) {
-    // 未设置放映密码（含被前一人用掉）= 通道对非管理员绝对关闭
-    return { ok: false, reason: 'no-pass' };
-  }
-
-  // 已有有效放映人 → 不能抢占（此时密码仍在，说明管理员刚又设了新的）
   const active = await getActiveScreeningHost(roomId);
-  if (active && active !== userId) return { ok: false, reason: 'taken' };
 
-  // 宽限期内由**本人**重连回来（刷新页面/网络抖动）：直接恢复放映人身份，
-  // 既不再消耗密码（密码早已作废），也不写入新记录。
-  // 若少了这一步，放映人一刷新就会被自己的旧记录挡在门外，
-  // 而密码又已作废 —— 等于「一刷新就永久失去放映权限」，与需求里的 3 分钟宽限直接冲突。
+  // 「本人再次进入」必须**最先**判定，且不需要密码：
+  // 放映人刷新页面 / 暂离后再点放映通道（或前端在编辑弹窗后重新校验）时，
+  // 一次性密码早已作废，若先走密码分支就会被自己的旧记录挡在门外 ——
+  // 等于「一刷新就永久失去放映权限」，与 3 分钟宽限的设计直接冲突。
+  // 这里同时恢复在线状态（清掉 graceUntil）。
   if (active === userId) {
     await prisma.roomScreeningHost.update({
       where: { roomId },
@@ -160,6 +150,16 @@ export async function claimScreening(
     });
     return { ok: true, asAdmin: false };
   }
+
+  // 判定顺序很重要：密码不存在必须优先于「已有人在放映」。
+  // 否则一次性密码被前一个人用掉后，后来者会收到「已有放映人」这种误导性提示，
+  // 而真实情况是「通道已关闭，需要管理员重新设密码」——两者给用户的下一步动作完全不同。
+  if (!room.screeningPassword) {
+    return { ok: false, reason: 'no-pass' };
+  }
+
+  // 已有其他有效放映人 → 不能抢占（此时密码仍在，说明管理员刚又设了新的）
+  if (active) return { ok: false, reason: 'taken' };
 
   // 比对密码（与房间普通密码一样是明文比对；两者互相独立）
   const input = typeof password === 'string' ? password : '';
@@ -217,11 +217,47 @@ export async function releaseScreening(roomId: string): Promise<void> {
     await prisma.roomScreeningHost.deleteMany({ where: { roomId } });
     await prisma.room.update({
       where: { id: roomId },
-      data: { screeningPassword: null, screeningUpdatedAt: new Date(), status: 'WAITING' }
+      data: {
+        screeningPassword: null,
+        screeningUpdatedAt: new Date(),
+        status: 'WAITING',
+        // 【新需求】本场结束 → 同时复位「本场是否已编辑过房间信息」，
+        // 让下一场的第一位放映人重新获得一次编辑机会（每人每场一次）。
+        roomEditedAt: null,
+      }
     }).catch(() => {});
   } catch (error) {
     console.error(`释放放映位失败（roomId=${roomId}）:`, error);
   }
+}
+
+/**
+ * 【新需求】当前这位放映人本场是否已经编辑过房间信息。
+ *
+ * 判定方式：房间的 roomEditedAt 是否晚于该放映人的 claimedAt —— 即「他上台之后有人改过」。
+ * 由于放映位释放时会清空 roomEditedAt，且新放映人 upsert 时会刷新 claimedAt，
+ * 这个比较天然做到「每人每场一次」，无需额外字段。
+ */
+export async function hasEditedThisSession(roomId: string, userId: string): Promise<boolean> {
+  const row = await prisma.roomScreeningHost.findUnique({
+    where: { roomId },
+    select: { userId: true, claimedAt: true }
+  });
+  if (!row || row.userId !== userId) return false;
+  const room = await prisma.room.findUnique({
+    where: { id: roomId },
+    select: { roomEditedAt: true }
+  });
+  if (!room?.roomEditedAt) return false;
+  return room.roomEditedAt.getTime() >= row.claimedAt.getTime();
+}
+
+/** 【新需求】记录一次「放映人修改了房间信息」 */
+export async function markRoomEdited(roomId: string): Promise<void> {
+  await prisma.room.update({
+    where: { id: roomId },
+    data: { roomEditedAt: new Date() }
+  }).catch(() => {});
 }
 
 /**

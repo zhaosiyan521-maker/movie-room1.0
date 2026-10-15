@@ -7,7 +7,7 @@ import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { dissolveRoom } from '../services/roomDissolve';
 import { getIO, KICK_BAN_DURATION_MS } from '../services/signaling';
 import { UPLOAD_DIR, safeUploadFilename, deleteUnreferencedImages } from '../services/roomImages';
-import { claimScreening, canScreen, canDissolve } from '../services/roomAccess';
+import { claimScreening, canScreen, canDissolve, hasEditedThisSession, markRoomEdited, isPublicRoom, getActiveScreeningHost, releaseScreening } from '../services/roomAccess';
 
 export const roomRouter = Router();
 
@@ -441,9 +441,12 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
     //   canScreen  —— 可执行放映操作（真实房主 / 放映人 / 管理员）
     //   canDissolve—— 可解散房间（真实房主 / 管理员；**放映人不可解散**）
     const me = req.user!;
-    const [canScreenNow, canDissolveNow] = await Promise.all([
+    const [canScreenNow, canDissolveNow, hasEdited, isPublic] = await Promise.all([
       canScreen(req.params.id, me.id, me.isAdmin),
       canDissolve(req.params.id, me.id, me.isAdmin),
+      hasEditedThisSession(req.params.id, me.id),
+      // 【新需求】房间页的加入卡片需要它来决定是否显示「放映通道」入口
+      isPublicRoom(req.params.id),
     ]);
 
     res.json({
@@ -451,6 +454,8 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
         ...publicRoom(room),
         canScreen: canScreenNow,
         canDissolve: canDissolveNow,
+        hasEditedThisSession: hasEdited,
+        isPublicRoom: isPublic,
       }
     });
   } catch (error) {
@@ -483,7 +488,10 @@ roomRouter.post('/:id/screening', express.json(), async (req: AuthRequest, res: 
 
     const result = await claimScreening(roomId, me.id, password, me.isAdmin);
     if (result.ok) {
-      return res.json({ ok: true, asAdmin: result.asAdmin, canScreen: true });
+      // 【新需求】告诉客户端「本场这位放映人是否已经改过房间信息」——
+      // 改过就跳过信息编辑弹窗直接进房；没改过则弹一次（每人每场只能改一次）。
+      const hasEdited = await hasEditedThisSession(roomId, me.id);
+      return res.json({ ok: true, asAdmin: result.asAdmin, canScreen: true, hasEditedThisSession: hasEdited });
     }
 
     switch (result.reason) {
@@ -587,7 +595,13 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
         return res.status(400).json({ error: '房间密码格式无效' });
       }
     }
-    if (!isHost && !req.user!.isAdmin && room.password && room.password !== password) {
+    // 【新需求】房间密码对以下三类人不生效：
+    //   1) 真实房主；2) 管理员；3) **当前放映人**。
+    // 第 3 条是必须的：放映人正是设置这个密码的人（编辑房间信息时填的），
+    // 若连他自己都被自己刚设的密码挡住，就出现「设完密码后自己被锁在门外」的荒谬情况。
+    // 密码只用来拦「点加入房间的普通观众」。
+    const isScreeningHost = (await getActiveScreeningHost(roomId)) === userId;
+    if (!isHost && !isScreeningHost && !req.user!.isAdmin && room.password && room.password !== password) {
       return res.status(403).json({ error: '房间密码错误' });
     }
 
@@ -608,7 +622,9 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
         data: {
           roomId,
           userId,
-          role: isHost ? 'HOST' : 'VIEWER'
+          // 放映人也按 HOST 落角色（与房主同权限档），但**解散判定不看 role**，
+          // 而是走 roomAccess.canDissolve，因此不会出现「放映人解散房间」。
+          role: (isHost || isScreeningHost) ? 'HOST' : 'VIEWER'
         }
       });
     }).catch((err: any) => {
@@ -667,6 +683,20 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
       const io = getIO();
       await dissolveRoom(roomId, { io });
       return res.json({ message: '房间已解散' });
+    }
+
+    // 【公共房间需求】放映人主动「退出房间」时，**立即**释放放映位。
+    //
+    // 为什么必须在这里做：公开的退出路径是「客户端先调本接口，再断开 socket」。
+    // 只靠断开时的 markScreeningGrace 会留下 3 分钟宽限——对主动退出的人来说，
+    // 这 3 分钟里任何人都无法从放映通道进来（密码也不存在了），
+    // 表现为「放映人退了，下一个人却进不来」。主动退出应当即时释放。
+    // （断线/刷新走的是另一条路径：socket 断开 → leaveRoom → 记宽限，保留重连机会。）
+    if (await isPublicRoom(roomId)) {
+      const activeHost = await getActiveScreeningHost(roomId);
+      if (activeHost === userId) {
+        await releaseScreening(roomId);
+      }
     }
 
     // 普通成员离开
@@ -728,6 +758,110 @@ roomRouter.patch('/:id/status', express.json(), async (req: AuthRequest, res: Re
   } catch (error) {
     console.error('Update room status error:', error);
     res.status(500).json({ error: '更新房间状态失败' });
+  }
+});
+
+/**
+ * 【新需求】放映人修改房间信息。
+ *
+ * 允许改：名称、描述、入场密码、最大观众数。
+ * 图片仍走 PUT /:id/images（那里已有「未被其他房间引用才删旧文件」的清理逻辑）。
+ *
+ * 权限用 canScreen：放映人 / 真实房主 / 管理员都能改（需求：任何通过放映通道的人都可改，
+ * 改完对后续所有人生效）。改完写 roomEditedAt，用于「每人每场只能改一次」的判定。
+ */
+roomRouter.patch('/:id', express.json(), async (req: AuthRequest, res: Response) => {
+  try {
+    const roomId = req.params.id;
+    const { name, description, password, maxViewers } = req.body || {};
+
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { id: true, name: true, hostId: true }
+    });
+    if (!room) return res.status(404).json({ error: '房间不存在' });
+    if (!(await canScreen(roomId, req.user!.id, req.user!.isAdmin))) {
+      return res.status(403).json({ error: '只有房主可以修改房间信息' });
+    }
+
+    const data: any = {};
+
+    if (name !== undefined) {
+      if (typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ error: '房间名称为必填项' });
+      }
+      if (Array.from(name.trim()).length > 50) {
+        return res.status(400).json({ error: '房间名称不能超过 50 个字符' });
+      }
+      data.name = name.trim();
+    }
+
+    if (description !== undefined) {
+      if (description !== null && typeof description !== 'string') {
+        return res.status(400).json({ error: '房间描述格式无效' });
+      }
+      if (typeof description === 'string' && Array.from(description).length > 500) {
+        return res.status(400).json({ error: '房间描述不能超过 500 个字符' });
+      }
+      data.description = (typeof description === 'string' && description.trim()) ? description.trim() : null;
+    }
+
+    if (password !== undefined) {
+      if (password !== null && typeof password !== 'string') {
+        return res.status(400).json({ error: '房间密码格式无效' });
+      }
+      if (typeof password === 'string' && password.length > 64) {
+        return res.status(400).json({ error: '房间密码不能超过 64 个字符' });
+      }
+      // 空字符串 = 取消密码（此后「加入房间」不再要求输入密码）
+      data.password = (typeof password === 'string' && password) ? password : null;
+    }
+
+    if (maxViewers !== undefined) {
+      const n = Number(maxViewers);
+      if (!Number.isInteger(n) || n < 1 || n > 30) {
+        return res.status(400).json({ error: '观众数量必须在 1-30 人之间' });
+      }
+      data.maxViewers = n;
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ error: '没有需要修改的内容' });
+    }
+
+    // 【新需求】房间名唯一性。
+    //
+    // 注意：Room.name **没有**数据库唯一约束（创建房间用的是「事务内查重」，
+    // 见 POST /），所以这里不能靠 catch P2002 —— 必须显式查重，
+    // 且要排除自己（否则原样保存也会被判为重复）。
+    // 口径与创建一致：只与「在映房间」（WAITING / PLAYING）比较。
+    if (data.name) {
+      const duplicate = await prisma.room.findFirst({
+        where: {
+          id: { not: roomId },
+          name: data.name,
+          status: { in: ['WAITING', 'PLAYING'] },
+        },
+        select: { id: true },
+      });
+      if (duplicate) {
+        return res.status(409).json({ error: '该房间名称已被使用，请换一个' });
+      }
+    }
+
+    const updated = await prisma.room.update({
+      where: { id: roomId },
+      select: { ...ROOM_PUBLIC_SELECT, hostId: true },
+      data
+    });
+
+    // 记录「本场已被修改」，供「每人每场只能改一次」判定
+    await markRoomEdited(roomId);
+
+    res.json({ room: publicRoom(updated) });
+  } catch (error: any) {
+    console.error('Update room info error:', error);
+    res.status(500).json({ error: '更新房间信息失败' });
   }
 });
 

@@ -349,6 +349,65 @@
   }
 }
 
+/* ===== 【新需求】放映通道弹窗（与大厅弹窗同一套样式，值保持一致）===== */
+.join-room-card .screening-pass-modal,
+.screening-pass-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 420px;
+  width: calc(100% - 32px);
+  text-align: center;
+}
+
+.screening-passtitle {
+  margin: 0;
+  font-size: 22px;
+  color: var(--text-primary);
+}
+
+.screening-passinput {
+  text-align: center;
+}
+
+.screening-pashint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.screening-error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--error-color);
+}
+
+.screening-option {
+  width: 100%;
+}
+
+.edit-room-modal {
+  max-width: 520px;
+  width: calc(100% - 32px);
+  max-height: 86vh;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.edit-room-title {
+  margin: 0 0 16px;
+  font-size: 20px;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.edit-room-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
 .host-controls {
   display: flex;
   align-items: center;

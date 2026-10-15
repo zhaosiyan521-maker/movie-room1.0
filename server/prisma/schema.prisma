@@ -74,6 +74,11 @@ model Room {
   // 字段命名刻意与 password 区分：房间普通密码与放映密码互不冲突、互不影响。
   screeningPassword    String?
   screeningUpdatedAt   DateTime?
+  /// 【公共房间】本场放映期间，房间信息最后一次被放映人修改的时间。
+  /// 与放映人记录的 claimedAt 比较即可判断「当前这位放映人本场是否已经改过」——
+  /// 改过就跳过信息编辑弹窗（需求：每人每场电影只能改一次，改过之后再进来自动跳过）。
+  /// 不需要额外的布尔字段：本场开始时由 releaseScreening 一并清空，天然复位。
+  roomEditedAt         DateTime?
 
   // 房间状态：WAITING, PLAYING, ENDED
   status          String          @default("WAITING")

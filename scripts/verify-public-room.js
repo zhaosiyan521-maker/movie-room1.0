@@ -270,6 +270,94 @@ const { check, report } = checker;
     check('未设密码时管理员仍可通过放映通道', adminStillIn.status === 200,
       `status=${adminStillIn.status}`);
 
+    // ---- 14. 【新需求】房间信息编辑 + 每人每场一次 ----
+    // 重新拿一个放映位（前面的用例已把放映位释放并清了密码）
+    await fetch(`${BASE}/api/admin/public-rooms/${pubRoom.id}/screening-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...adminHeaders },
+      body: JSON.stringify({ password: 'edit-999' }),
+    });
+    const editClaim = await postScreening(pubRoom.id, aliceToken, 'edit-999');
+    check('编辑用例：alice 取得放映位', editClaim.status === 200, `status=${editClaim.status}`);
+    check('取得放映位时返回 hasEditedThisSession（本场尚未修改）',
+      editClaim.body?.hasEditedThisSession === false,
+      `hasEditedThisSession=${editClaim.body?.hasEditedThisSession}`);
+
+    const patchRoom = async (token, body) => {
+      const res = await fetch(`${BASE}/api/rooms/${pubRoom.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      let json = null; try { json = await res.json(); } catch { /* ignore */ }
+      return { status: res.status, json };
+    };
+
+    // 放映人可以改房间信息
+    const newName = `改过的公共房间-${String(uniq).slice(-5)}`;
+    const patched = await patchRoom(aliceToken, {
+      name: newName, description: '放映人改的描述', password: 'join-pwd-1', maxViewers: 12,
+    });
+    check('放映人可以修改房间信息', patched.status === 200, `status=${patched.status} ${JSON.stringify(patched.json)}`);
+    check('修改后的名称已生效', patched.json?.room?.name === newName, `name=${patched.json?.room?.name}`);
+    check('修改后的最大观众数已生效', patched.json?.room?.maxViewers === 12, `maxViewers=${patched.json?.room?.maxViewers}`);
+
+    // 改过之后：本场再次进入应被标记为「已编辑」，前端据此跳过编辑弹窗
+    const reClaim = await postScreening(pubRoom.id, aliceToken, 'edit-999');
+    check('同一放映人本场再次进入 → hasEditedThisSession=true（跳过编辑弹窗）',
+      reClaim.status === 200 && reClaim.body?.hasEditedThisSession === true,
+      `status=${reClaim.status} hasEdited=${reClaim.body?.hasEditedThisSession}`);
+
+    // 重名拒绝
+    const dupName = await patchRoom(aliceToken, { name: plainRoom.name });
+    check('改名为已存在的房间名被拒（409）', dupName.status === 409,
+      `status=${dupName.status} ${JSON.stringify(dupName.json)}`);
+
+    // 改名后：加入房间需要刚设置的密码
+    const afterPwdSet = await prisma.room.findUnique({ where: { id: pubRoom.id }, select: { password: true } });
+    check('放映人设置的入场密码已落库', afterPwdSet?.password === 'join-pwd-1',
+      `password=${afterPwdSet?.password}`);
+
+    // 越权：非放映人不能改
+    const bobPatch = await patchRoom(bobToken, { name: 'bob乱改' });
+    check('非放映人不能修改公共房间信息（403）', bobPatch.status === 403,
+      `status=${bobPatch.status}`);
+
+    // 房间详情返回 isPublicRoom（房间页据此显示「放映通道」入口）
+    const detailPublic = (await (await fetch(`${BASE}/api/rooms/${pubRoom.id}`, { headers: adminHeaders })).json()).room;
+    check('房间详情返回 isPublicRoom', detailPublic.isPublicRoom === true,
+      `isPublicRoom=${detailPublic.isPublicRoom}`);
+
+    // 先让上一个放映人「退出房间」释放放映位。
+    //
+    // 这条路径同时也是【主动退出应即时释放放映位】的回归断言：
+    // 公开流程是「客户端先调 POST /:id/leave，再断开 socket」，
+    // 若只在 socket 断开时记 3 分钟宽限，那么这位放映人退出后的 3 分钟内
+    // 任何人都无法从放映通道进入（密码已不存在），表现为「他退了，下一个人却进不来」。
+    // 注意：前面的用例已让 alice 离开过房间（成员行被删），这里先重新加入再退出。
+    // 放映人此时是「设密码的人」，加入时不应再被自己刚设的房间密码拦住。
+    const rejoinRes = await httpJoin(aliceToken);
+    check('放映人（设密码者）重新加入不被自己设的密码拦住', rejoinRes.ok,
+      `status=${rejoinRes.status}`);
+    const aliceLeaveRes = await fetch(`${BASE}/api/rooms/${pubRoom.id}/leave`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...aliceHeaders },
+    });
+    check('放映人主动退出后放映位立即释放（不留 3 分钟空窗）',
+      aliceLeaveRes.ok && (await prisma.roomScreeningHost.count({ where: { roomId: pubRoom.id } })) === 0,
+      `httpStatus=${aliceLeaveRes.status} 残留放映位=${await prisma.roomScreeningHost.count({ where: { roomId: pubRoom.id } })}`);
+
+    // 换人上台：bob 用新密码进入 → 他是新的放映人，本场尚未修改过 → hasEdited=false
+    await fetch(`${BASE}/api/admin/public-rooms/${pubRoom.id}/screening-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...adminHeaders },
+      body: JSON.stringify({ password: 'reset-check' }),
+    });
+    const resetClaim = await postScreening(pubRoom.id, bobToken, 'reset-check');
+    check('换人上台后 hasEditedThisSession 重新为 false（每人每场一次）',
+      resetClaim.status === 200 && resetClaim.body?.hasEditedThisSession === false,
+      `status=${resetClaim.status} hasEdited=${resetClaim.body?.hasEditedThisSession}`);
+
     // ---- 13. 「永远置顶」在翻页时也必须成立 ----
     // 早前实现只把「命中本页切片」的公共房间放进结果，翻到第 2 页公共房间就整批消失，
     // 与「永远置顶」直接矛盾。这里用极小 limit 强制翻页来锁死该行为。
