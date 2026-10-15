@@ -2868,7 +2868,7 @@ export default function RoomView() {
       {/* ===== 【新需求】弹窗②：输入密码（UI 与文案与大厅保持一致）===== */}
       {showScreeningPass && (
         <div className="modal-mask" onClick={() => { if (!screeningBusy) setShowScreeningPass(false); }}>
-          <div className="modal-card screening-pass-modal" onClick={e => e.stopPropagation()}>
+          <div className="modal-card card screening-pass-modal" onClick={e => e.stopPropagation()}>
             <h3 className="screening-passtitle">输入密码</h3>
             <input
               type="password"
@@ -2902,7 +2902,7 @@ export default function RoomView() {
       {/* ===== 【新需求】弹窗③：编辑房间信息（与「创建房间」同一套表单）===== */}
       {editRoomOpen && (
         <div className="modal-mask">
-          <div className="modal-card edit-room-modal">
+          <div className="modal-card card edit-room-modal">
             <h3 className="edit-room-title">修改房间信息</h3>
             <form onSubmit={confirmEditRoom}>
               <div className="form-group">

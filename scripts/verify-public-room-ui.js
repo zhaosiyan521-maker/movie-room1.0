@@ -144,6 +144,25 @@ const has = (text, s) => (text || '').includes(s);
       m1o.buttons.includes('加入房间') && m1o.buttons.includes('放映通道') && m1o.buttons.includes('返回列表'),
       `buttons=${JSON.stringify(m1o.buttons)}`);
 
+    // 视觉可用性：弹窗不能透明（真实踩过的坑，见弹窗②处的说明）
+    const styleOf = (sel) => evalJs(`
+      (() => {
+        const el = document.querySelector('${sel}');
+        if (!el) return 'null';
+        const s = getComputedStyle(el);
+        return JSON.stringify({ bg: s.backgroundColor, display: s.display, vis: s.visibility, op: s.opacity });
+      })()
+    `);
+    const opaque = (bg) => {
+      if (!bg || bg === 'transparent') return false;
+      const m = bg.match(/rgba?\(([^)]+)\)/);
+      if (!m) return false;
+      const parts = m[1].split(',').map(s => s.trim());
+      return parts.length < 4 || Number(parts[3]) > 0.95;
+    };
+    const bgA = JSON.parse(await styleOf('.screening-picker') || 'null');
+    chk('弹窗①有不透明背景（不是透明弹窗）', !!bgA && opaque(bgA.bg), `background=${bgA?.bg}`);
+
     // ---- 点「放映通道」→ 弹窗②（严格按图 2）----
     await evalJs(`
       (() => {
@@ -170,6 +189,17 @@ const has = (text, s) => (text || '').includes(s);
     chk('弹窗②按钮为「进入放映厅」与「返回列表」',
       m2o.buttons.includes('进入放映厅') && m2o.buttons.includes('返回列表'),
       `buttons=${JSON.stringify(m2o.buttons)}`);
+
+    // ---- 视觉可用性：弹窗不能是透明的 ----
+    // 真实踩过的坑：弹窗只写了 .modal-card 而漏了 .card，于是没有背景色 ——
+    // 背景页面透上来、文字压在列表上（手机上尤其明显），而 DOM 断言全部通过。
+    // 因此这里显式读取计算样式，要求底色不透明且确实可见。
+    const bg2 = JSON.parse(await styleOf('.screening-pass-modal') || 'null');
+    chk('弹窗②有不透明背景（不是透明弹窗）', !!bg2 && opaque(bg2.bg),
+      `background=${bg2?.bg}`);
+    chk('弹窗②是可见的（display/visibility/opacity 正常）',
+      !!bg2 && bg2.display !== 'none' && bg2.vis !== 'hidden' && Number(bg2.op) > 0.9,
+      JSON.stringify(bg2));
 
     // ---- 输入密码 → 弹窗③（编辑房间信息）----
     await evalJs(`
@@ -212,6 +242,10 @@ const has = (text, s) => (text || '').includes(s);
         m3o.buttons.includes('确认') && m3o.buttons.includes('取消'),
         `buttons=${JSON.stringify(m3o.buttons)}`);
       chk('弹窗③预填了房间当前名称', m3o.nameValue === roomName, `name=${m3o.nameValue}`);
+
+      // 弹窗③同样不能透明
+      const bg3 = JSON.parse(await styleOf('.edit-room-modal') || 'null');
+      chk('弹窗③有不透明背景（不是透明弹窗）', !!bg3 && opaque(bg3.bg), `background=${bg3?.bg}`);
     }
 
     try { ws.close(); } catch { /* ignore */ }

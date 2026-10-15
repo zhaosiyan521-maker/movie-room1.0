@@ -96,6 +96,14 @@
   width: 90%;
   text-align: center;
   padding: 28px;
+  /* 【必须】背景与圆角在这里兜底，而不是只依赖 .card：
+     .card 定义在 global.css，正常都会加载；但弹窗若漏了 card 类就会变成**全透明**
+     （背景页面透上来、文字压在列表上，手机上尤其明显）。这里补上背景，
+     即使将来又有人漏写 card 类，弹窗也不会透明。 */
+  background-color: var(--bg-card);
+  border: 1px solid rgba(124, 77, 255, 0.14);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
 }
 
 /* --- 弹窗①：选择进入方式 --- */

@@ -527,6 +527,13 @@
   width: 90%;
   text-align: center;
   padding: 28px;
+  /* 【必须】背景在这里兜底，而不是只依赖 .card：
+     弹窗若漏了 card 类就会变成**全透明**（背景页面透上来）。已在公共放映厅
+     三步弹窗上踩过这个坑，故把背景写进结构样式本身。 */
+  background-color: var(--bg-card);
+  border: 1px solid rgba(124, 77, 255, 0.14);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
 }
 
 .modal-card h3 {

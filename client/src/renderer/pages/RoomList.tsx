@@ -446,7 +446,7 @@ export default function RoomList() {
       {/* ===== 弹窗①：选择进入方式（房名 + 房主/观众 + 三个按钮）===== */}
       {pickerRoom && !showPassModal && !editRoom && (
         <div className="modal-mask" onClick={closeAll}>
-          <div className="modal-card screening-picker" onClick={e => e.stopPropagation()}>
+          <div className="modal-card card screening-picker" onClick={e => e.stopPropagation()}>
             <h3 className="screening-roomname">{pickerRoom.name}</h3>
 
             <div className="screening-roominfo">
@@ -478,7 +478,7 @@ export default function RoomList() {
       {/* ===== 弹窗②：输入密码（UI 与文案严格按设计稿）===== */}
       {pickerRoom && showPassModal && !editRoom && (
         <div className="modal-mask" onClick={backToList}>
-          <div className="modal-card screening-pass-modal" onClick={e => e.stopPropagation()}>
+          <div className="modal-card card screening-pass-modal" onClick={e => e.stopPropagation()}>
             <h3 className="screening-passtitle">输入密码</h3>
 
             <input
@@ -517,7 +517,7 @@ export default function RoomList() {
       {/* ===== 弹窗③：编辑房间信息（与「创建房间」同一套表单，按钮为「确认」）===== */}
       {editRoom && (
         <div className="modal-mask" onClick={() => { /* 必须保存或取消，点遮罩不关 */ }}>
-          <div className="modal-card edit-room-modal" onClick={e => e.stopPropagation()}>
+          <div className="modal-card card edit-room-modal" onClick={e => e.stopPropagation()}>
             <h3 className="edit-room-title">修改房间信息</h3>
             <form onSubmit={confirmEditRoom}>
               <div className="form-group">
