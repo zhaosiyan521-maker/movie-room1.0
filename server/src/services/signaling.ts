@@ -3,6 +3,14 @@ import jwt from 'jsonwebtoken';
 import { config } from '../config';
 import { prisma } from '../config/database';
 import { dissolveRoom } from './roomDissolve';
+import {
+  canScreen,
+  canDissolve,
+  isPublicRoom,
+  markScreeningGrace,
+  releaseScreening,
+  reapScreeningHosts
+} from './roomAccess';
 
 // 存储房间和用户的映射
 const roomUsers = new Map<string, Set<string>>(); // roomId -> Set of socketIds
@@ -16,6 +24,9 @@ const lastSpeakingAt = new Map<string, number>();
 // 【需求4】被房主踢出后禁止再次进入该房间的时长：5 小时。
 // room.ts 的「加入房间」校验复用同一常量，故导出，避免两处各写一份导致口径漂移。
 export const KICK_BAN_DURATION_MS = 5 * 60 * 60 * 1000;
+
+/** 【公共房间】放映位超时巡检定时器（进程内单例，避免重复注册） */
+let screeningReaperTimer: NodeJS.Timeout | null = null;
 
 // 【需求4】房主每场电影的踢人配额：每场 2 次。
 // 在换片（host-start-play）时清零；暂停/继续属于同一场，不清零。
@@ -157,6 +168,15 @@ export function setupSocketHandlers(io: Server) {
   // 【P2】启动即回收上次运行残留的成员行（不 await，避免阻塞连接建立）
   void reapStaleRoomMembers();
 
+  // 【公共房间需求】启动即清理宽限期已过的放映位（上次运行残留的「放映中」不应继续占位），
+  // 之后每 30 秒巡检一次：放映人掉线超 3 分钟未回，就把通道释放回「未设密码」状态。
+  void reapScreeningHosts();
+  if (!screeningReaperTimer) {
+    screeningReaperTimer = setInterval(() => { void reapScreeningHosts(); }, 30 * 1000);
+    // 不阻止进程退出（pm2 restart / 测试脚本结束时能正常收尾）
+    screeningReaperTimer.unref?.();
+  }
+
   // 中间件：认证
   io.use(async (socket: any, next) => {
     try {
@@ -219,7 +239,15 @@ export function setupSocketHandlers(io: Server) {
     return target.rooms.has(myRoom);
   }
 
-  // 校验某 socket 是否「确实在该房间且为房主」。杜绝非房主伪造播放控制、或向其他房间注入事件。
+  /**
+   * 校验某 socket 是否有「放映权限」（可执行开播/暂停/结束/设源等房主操作）。
+   *
+   * 【公共房间需求】判定从「必须是 hostId」放宽为 canScreen：
+   *   - 管理员：始终通过（便于随时接管公共房间）
+   *   - 真实房主：通过（普通房间行为完全不变）
+   *   - 公共房间的放映人：通过（通过放映通道进入的那个人）
+   * 注意：**解散房间不在这里判**，放映人没有解散权（见 canDissolve）。
+   */
   async function requireHost(socket: AuthenticatedSocket, roomId: unknown): Promise<any | null> {
     if (!requireInRoom(socket, roomId)) {
       socket.emit('error', { message: '你不在该房间中' });
@@ -229,7 +257,12 @@ export function setupSocketHandlers(io: Server) {
       where: { id: roomId },
       select: { id: true, hostId: true, name: true, status: true, maxViewers: true }
     });
-    if (!room || room.hostId !== socket.userId) {
+    if (!room) {
+      socket.emit('error', { message: '房间不存在' });
+      return null;
+    }
+    const allowed = await canScreen(roomId, socket.userId!, socket.isAdmin === true);
+    if (!allowed) {
       socket.emit('error', { message: '只有房主可以执行该操作' });
       return null;
     }
@@ -591,6 +624,23 @@ export function setupSocketHandlers(io: Server) {
       socket.to(room.id).emit('playback-pause', { byHost: true });
     });
 
+    // 【公共房间需求】电影自然播完 = 本场结束 → 仅作废放映权限。
+    //
+    // 为什么不复用 host-stop-play：那个事件会连带清空播放源（sourceUrl 等），
+    // 会破坏既有行为（播完后想重播同一部片、或暂停后继续都要重新设源）。
+    // 本事件**只**释放放映位并保持放映密码处于已作废状态，不碰播放相关字段。
+    socket.on('host-screening-end', async (data: { roomId: string }) => {
+      if (!requireInRoom(socket, data?.roomId)) return;
+      const roomId = data.roomId;
+      if (!(await canScreen(roomId, socket.userId!, socket.isAdmin === true))) return;
+
+      // 只有公共房间存在放映位；普通房间这里是空操作
+      if (await isPublicRoom(roomId)) {
+        await releaseScreening(roomId);
+        io.to(roomId).emit('screening-ended', { roomId });
+      }
+    });
+
     // 房主一键结束放映（已删除观众投票机制，结束放映由房主直接操作）
     socket.on('host-stop-play', async (data: { roomId: string }) => {
       const room = await requireHost(socket, data?.roomId);
@@ -619,6 +669,12 @@ export function setupSocketHandlers(io: Server) {
 
       // 广播给观众（含房主自己，房主端也会收到 playback-stop 同步 isPlaying）
       io.to(room.id).emit('playback-stop', { byHost: true });
+
+      // 【公共房间需求】「结束放映」= 本场结束 → 放映权限立即作废：
+      // 清空放映人记录、保持放映密码为「已作废」状态（通道回到未设密码），
+      // 之后必须由管理员重新设置密码，下一个人才能再走放映通道。
+      // 对普通房间而言这个调用是空操作（没有放映人记录），不影响既有行为。
+      await releaseScreening(room.id);
     });
 
     // 同步播放进度（仅房主可发起，避免观众恶意扰乱进度）
@@ -792,12 +848,16 @@ export function setupSocketHandlers(io: Server) {
 
         if (typeof targetUserId !== 'string' || !targetUserId) return;
 
-        // 验证发起者是房主
+        // 验证发起者有放映权限（真实房主 / 公共房间的放映人 / 管理员）
         const room = await prisma.room.findUnique({
           where: { id: roomId },
           select: { id: true, hostId: true }
         });
-        if (!room || room.hostId !== socket.userId) {
+        if (!room) {
+          socket.emit('error', { message: '房间不存在' });
+          return;
+        }
+        if (!(await canScreen(roomId, socket.userId!, socket.isAdmin === true))) {
           socket.emit('error', { message: '只有房主可以踢出成员' });
           return;
         }
@@ -948,7 +1008,22 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
       where: { id: roomId },
       select: { id: true, hostId: true, status: true }
     });
-    if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
+
+    // ===== 【公共房间需求】公共房间永不自动消失 =====
+    //
+    // 公共房间（管理员创建）必须一直存在，直到管理员在后台手动解散，房间内人数为 0 也不删。
+    // 因此这里**整块跳过**原有三套自动解散逻辑：
+    //   1) 放映中断线 → 宽限期后解散
+    //   2) 房主主动退出 → 立即解散
+    //   3) 房主断线（非放映中）→ 宽限期后解散
+    // 放映人掉线只走 markScreeningGrace（3 分钟宽限，超时由 reapScreeningHosts 释放权限），
+    // 房间本身与放映密码都不受影响。
+    const isPublic = room ? await isPublicRoom(roomId) : false;
+    if (room && isPublic) {
+      // 放映人掉线只记宽限截止时间（3 分钟内连回来仍是放映人）；
+      // 若掉线的不是放映人，markScreeningGrace 内部会自行忽略。
+      await markScreeningGrace(roomId, socket.userId!);
+    } else if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
       if (voluntary) {
         // 放映途中房主主动解散（HTTP 接口已放行房主随时解散，此处为 socket 兜底）：直接解散
         await dissolveRoom(roomId, { io }).catch(() => {});

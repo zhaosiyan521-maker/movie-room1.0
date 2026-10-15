@@ -60,13 +60,29 @@ interface AdminAnnouncement {
   _count?: { reads: number };
 }
 
+/** 【公共房间需求】后台「公共房间」列表项 */
+interface AdminPublicRoom {
+  id: string;
+  name: string;
+  status: string;
+  createdAt: string;
+  memberCount: number;
+  owner: string;
+  /** none=未设密码（通道关闭）/ ready=密码待用 / screening=放映中 */
+  channelState: 'none' | 'ready' | 'screening';
+  screeningUser: string | null;
+  screeningGraceUntil: string | null;
+  screeningUpdatedAt: string | null;
+}
+
 /** 【需求3】后台功能项。以后所有新增的管理员功能都应加入这里，统一放进可折叠面板。 */
-type AdminTab = 'users' | 'ips' | 'rooms' | 'broadcast';
+type AdminTab = 'users' | 'ips' | 'rooms' | 'publicRooms' | 'broadcast';
 
 const ADMIN_TAB_LABELS: Record<AdminTab, string> = {
   users: '用户管理',
   ips: '封禁 IP',
   rooms: '房间列表',
+  publicRooms: '公共房间',
   broadcast: '广播/公告'
 };
 
@@ -90,6 +106,9 @@ export default function Admin() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [bannedIps, setBannedIps] = useState<BannedIp[]>([]);
   const [rooms, setRooms] = useState<AdminRoom[]>([]);
+  // 【公共房间需求】公共房间列表与其放映密码输入
+  const [publicRooms, setPublicRooms] = useState<AdminPublicRoom[]>([]);
+  const [screeningInputs, setScreeningInputs] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   // 消息带类型：原先所有消息（含「封禁失败」）都用 success 绿色样式渲染，
@@ -129,14 +148,21 @@ export default function Admin() {
         return;
       }
 
+      // 【公共房间需求】公共房间列表（含放映通道状态）
+      if (tab === 'publicRooms') {
+        const { data } = await api.get('/admin/public-rooms');
+        if (reqId !== reqIdRef.current) return;
+        setPublicRooms(data.rooms || []);
+        return;
+      }
+
       const params = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';
       // 搜索时无需拉取与搜索无关的封禁 IP 列表（原实现每次按键都会多打一个请求）
       if (tab === 'rooms') {
         const { data: roomsData } = await api.get(`/admin/rooms${params}`);
         if (reqId !== reqIdRef.current) return;
         setRooms(roomsData.rooms || []);
-      } else if (params) {
-        const { data: usersData } = await api.get(`/admin/users${params}`);
+      } else if (params) {        const { data: usersData } = await api.get(`/admin/users${params}`);
         if (reqId !== reqIdRef.current) return;
         setUsers(usersData.users || []);
       } else {
@@ -246,6 +272,41 @@ export default function Admin() {
       fetchAll();
     } catch (error: any) {
       setMessage({ type: 'error', text: error.response?.data?.error || '解散房间失败' });
+    }
+  };
+
+  // ===== 【公共房间需求】后台「公共房间」操作 =====
+
+  /** 解散公共房间（与普通房间解散一致：彻底删除） */
+  const dissolvePublicRoom = async (room: AdminPublicRoom) => {
+    if (!confirm(
+      `⚠️ 确定解散公共房间「${room.name}」吗？\n\n` +
+      `房间及其全部成员记录将被彻底删除，房间内的用户会被立即请出。\n` +
+      `公共房间不会自动消失，这是唯一的删除方式。此操作不可恢复。`
+    )) return;
+    try {
+      const { data } = await api.post(`/admin/rooms/${room.id}/dissolve`);
+      setMessage({ type: 'success', text: data.message || `已解散公共房间「${room.name}」` });
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '解散公共房间失败' });
+    }
+  };
+
+  /**
+   * 设置/重置放映密码。
+   * 传空值即清空 —— 清空后放映通道对所有人关闭（管理员仍可免密进入）。
+   */
+  const setScreeningPassword = async (room: AdminPublicRoom, password: string) => {
+    try {
+      const { data } = await api.post(`/admin/public-rooms/${room.id}/screening-password`, {
+        password: password.trim() ? password.trim() : null
+      });
+      setMessage({ type: 'success', text: data.message || '已更新放映密码' });
+      setScreeningInputs(prev => ({ ...prev, [room.id]: '' }));
+      fetchAll();
+    } catch (error: any) {
+      setMessage({ type: 'error', text: error.response?.data?.error || '设置放映密码失败' });
     }
   };
 
@@ -359,6 +420,9 @@ export default function Admin() {
               </button>
               <button className={`filter-btn ${tab === 'rooms' ? 'active' : ''}`} onClick={() => selectTab('rooms')}>
                 🏠 房间列表 ({rooms.length})
+              </button>
+              <button className={`filter-btn ${tab === 'publicRooms' ? 'active' : ''}`} onClick={() => selectTab('publicRooms')}>
+                🏛️ 公共房间 ({publicRooms.length})
               </button>
               <button className={`filter-btn ${tab === 'broadcast' ? 'active' : ''}`} onClick={() => selectTab('broadcast')}>
                 📢 广播/公告
@@ -606,6 +670,82 @@ export default function Admin() {
                 </div>
               );
             })
+          )}
+        </div>
+      ) : tab === 'publicRooms' ? (
+        /* ===== 【公共房间需求】公共房间管理 ===== */
+        <div className="admin-room-list card">
+          {publicRooms.length === 0 ? (
+            <div className="loading">暂无公共房间（用管理员账号创建一个房间即会出现在这里）</div>
+          ) : (
+            <div className="public-room-list">
+              <p className="public-room-intro">
+                公共房间由管理员账号创建，在大厅中永远置顶并显示为「🏛️ 公共放映厅」。
+                它们<strong>不会自动消失</strong>（房间内无人也保留），只能在这里手动解散。
+                「放映密码」是一次性密码：首位用户在放映通道使用后立即作废，
+                本场结束（或放映人掉线超过 3 分钟）后需重新设置。
+              </p>
+              {publicRooms.map(room => {
+                const stateText =
+                  room.channelState === 'screening'
+                    ? `放映中：${room.screeningUser || '未知用户'}`
+                    : room.channelState === 'ready'
+                      ? '密码待用（尚未被使用）'
+                      : '未设密码（放映通道对所有人关闭）';
+                const stateClass =
+                  room.channelState === 'screening'
+                    ? 'public-room-state-screening'
+                    : room.channelState === 'ready'
+                      ? 'public-room-state-ready'
+                      : 'public-room-state-none';
+                return (
+                  <div key={room.id} className="public-room-item">
+                    <div className="public-room-head">
+                      <span className="admin-room-name">🏛️ {room.name}</span>
+                      <span className={`public-room-state ${stateClass}`}>{stateText}</span>
+                    </div>
+                    <div className="public-room-meta">
+                      <span className="admin-room-sub">👥 {room.memberCount}</span>
+                      <span className={`status-badge ${room.status.toLowerCase()}`}>
+                        {room.status === 'WAITING' ? '等待中' :
+                         room.status === 'PLAYING' ? '播放中' : '已结束'}
+                      </span>
+                      <span className="admin-room-sub">创建者：{room.owner}</span>
+                    </div>
+
+                    <div className="public-room-actions">
+                      <input
+                        type="text"
+                        className="input public-room-pwd-input"
+                        placeholder="设置/重置放映密码（留空则清除并关闭通道）"
+                        value={screeningInputs[room.id] || ''}
+                        onChange={e => setScreeningInputs(prev => ({ ...prev, [room.id]: e.target.value }))}
+                      />
+                      <button
+                        className="btn btn-primary btn-sm"
+                        onClick={() => setScreeningPassword(room, screeningInputs[room.id] || '')}
+                      >
+                        保存密码
+                      </button>
+                      <button
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => setScreeningPassword(room, '')}
+                        title="清除放映密码：清除后放映通道对所有人关闭"
+                      >
+                        清除
+                      </button>
+                      <button
+                        className="btn btn-danger btn-sm"
+                        onClick={() => dissolvePublicRoom(room)}
+                        title="解散该公共房间：房间及成员记录将被彻底删除"
+                      >
+                        🗑️ 解散
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       ) : tab === 'users' ? (

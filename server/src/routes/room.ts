@@ -7,6 +7,7 @@ import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { dissolveRoom } from '../services/roomDissolve';
 import { getIO, KICK_BAN_DURATION_MS } from '../services/signaling';
 import { UPLOAD_DIR, safeUploadFilename, deleteUnreferencedImages } from '../services/roomImages';
+import { claimScreening, canScreen, canDissolve } from '../services/roomAccess';
 
 export const roomRouter = Router();
 
@@ -33,21 +34,42 @@ const ROOM_PUBLIC_SELECT = {
   createdAt: true,
   updatedAt: true,
   password: true, // 仅用于计算 hasPassword，不下发原值
+  // 【公共房间】同样只用于计算「放映通道是否已设密码」，**绝不**下发明文
+  screeningPassword: true,
 } as const;
 
 const ROOM_HOST_SELECT = {
   id: true,
   username: true,
   nickname: true,
+  isAdmin: true, // 用于判定公共房间（决定置顶 / 显示「公共放映厅」/ 加淡紫描边）
 } as const;
 
-/** 把 password 转成 hasPassword 布尔值后输出，绝不把明文密码发给客户端 */
-function publicRoom<T extends { password?: string | null }>(room: T): Omit<T, 'password'> & { hasPassword: boolean } {
-  const { password, ...rest } = room;
-  return { ...rest, hasPassword: Boolean(password) };
+/**
+ * 把 password / screeningPassword 转成布尔标记后输出，绝不把明文发给客户端。
+ *
+ * 【公共房间需求】公共房间**不向客户端暴露创建人昵称**：需求要求大厅显示
+ * 「公共放映厅」而非管理员昵称。这里直接把 host.nickname 换成占位符 ——
+ * 而不是「把真名发下去、让客户端约定不显示」，后者只要看一眼接口响应就能拿到真名。
+ */
+function publicRoom<T extends { password?: string | null; screeningPassword?: string | null; host?: any }>(
+  room: T
+): Omit<T, 'password' | 'screeningPassword'> & { hasPassword: boolean } {
+  const { password, screeningPassword, host, ...rest } = room as any;
+  const isPublic = host?.isAdmin === true;
+  return {
+    ...rest,
+    hasPassword: Boolean(password),
+    screeningAvailable: Boolean(screeningPassword),
+    host: host
+      ? (isPublic
+          ? { id: host.id, username: '', nickname: '公共放映厅', isAdmin: true }
+          : { id: host.id, username: host.username, nickname: host.nickname, isAdmin: false })
+      : undefined,
+  } as any;
 }
 
-function publicRooms<T extends { password?: string | null }>(rooms: T[]) {
+function publicRooms<T extends { password?: string | null; screeningPassword?: string | null; host?: any }>(rooms: T[]) {
   return rooms.map(publicRoom);
 }
 
@@ -296,22 +318,84 @@ roomRouter.get('/', async (req: AuthRequest, res: Response) => {
       ];
     }
 
-    const rooms = await prisma.room.findMany({
-      where,
-      select: {
-        ...ROOM_PUBLIC_SELECT,
-        host: { select: ROOM_HOST_SELECT },
-        _count: { select: { members: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      skip: (paging.page - 1) * paging.limit,
-      take: paging.limit,
-    });
+    // 【公共房间需求】公共房间（管理员创建）永远置顶。
+    //
+    // 采用「两次查询 + 拼接」：公共房间数量极少（管理员手动创建），先取全量 id 列表，
+    // 本页优先放公共房间，剩余位置用普通房间补足。比在数据库里按关联字段排序更简单可靠，
+    // 且分页语义清晰（公共房间占据最前面的若干位）。
+    const publicIdList = (await prisma.room.findMany({
+      where: { host: { isAdmin: true } },
+      select: { id: true },
+    })).map(r => r.id);
+    const publicIdSet = new Set(publicIdList);
+
+    const skip = (paging.page - 1) * paging.limit;
+
+    const ROOM_LIST_SELECT = {
+      ...ROOM_PUBLIC_SELECT,
+      hostId: true,
+      host: { select: ROOM_HOST_SELECT },
+      _count: { select: { members: true } },
+    } as const;
+
+    // 命中过滤条件的公共房间（按创建时间倒序）
+    const matchedPublic = publicIdList.length
+      ? await prisma.room.findMany({
+          where: { ...where, id: { in: publicIdList } },
+          select: ROOM_LIST_SELECT,
+          orderBy: { createdAt: 'desc' },
+        })
+      : [];
+
+    const publicOnThisPage = matchedPublic.slice(skip, skip + paging.limit);
+    const plainNeeded = paging.limit - publicOnThisPage.length;
+    // 公共房间排在最前，故普通房间的偏移要扣掉「前面页里已占位的公共房间数」
+    const plainSkip = Math.max(0, skip - matchedPublic.length);
+
+    const plainRooms = plainNeeded > 0
+      ? await prisma.room.findMany({
+          where: publicIdSet.size ? { ...where, id: { notIn: [...publicIdSet] } } : where,
+          select: ROOM_LIST_SELECT,
+          orderBy: { createdAt: 'desc' },
+          skip: plainSkip,
+          take: plainNeeded,
+        })
+      : [];
+
+    const rooms = [...publicOnThisPage, ...plainRooms];
 
     const total = await prisma.room.count({ where });
 
+    // 【公共房间需求】补两个客户端必需的信息：
+    //   isPublicRoom —— 是否公共房间（决定置顶/显示「公共放映厅」/加淡紫描边/点击弹双入口）
+    //   canScreen    —— 我此刻是否有放映权限（放映人身份只由服务端判定，客户端不自行推断）
+    const activeHosts = rooms.length
+      ? await prisma.roomScreeningHost.findMany({
+          where: { roomId: { in: rooms.map(r => r.id) } },
+          select: { roomId: true, userId: true, graceUntil: true },
+        })
+      : [];
+    const activeMap = new Map(
+      activeHosts
+        .filter(h => !h.graceUntil || h.graceUntil.getTime() > Date.now())
+        .map(h => [h.roomId, h.userId])
+    );
+    const me = req.user!;
+
+    // 公共房间不暴露创建人昵称（由 publicRoom 统一替换为「公共放映厅」）
+    const decorated = publicRooms(rooms).map((r: any) => {
+      const screenHostId = activeMap.get(r.id);
+      return {
+        ...r,
+        isPublicRoom: publicIdSet.has(r.id),
+        canScreen: me.isAdmin || r.hostId === me.id || screenHostId === me.id,
+        // 覆盖 publicRoom 里的同名值：还要把「已有人在放映」也算作通道可用
+        screeningAvailable: me.isAdmin || !!screenHostId || !!r.screeningAvailable,
+      };
+    });
+
     res.json({
-      rooms: publicRooms(rooms),
+      rooms: decorated,
       pagination: {
         page: paging.page,
         limit: paging.limit,
@@ -352,10 +436,82 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: '房间不存在' });
     }
 
-    res.json({ room: publicRoom(room) });
+    // 【公共房间需求】权限一律由服务端给出，客户端不自行推断：
+    //   canScreen  —— 可执行放映操作（真实房主 / 放映人 / 管理员）
+    //   canDissolve—— 可解散房间（真实房主 / 管理员；**放映人不可解散**）
+    const me = req.user!;
+    const [canScreenNow, canDissolveNow] = await Promise.all([
+      canScreen(req.params.id, me.id, me.isAdmin),
+      canDissolve(req.params.id, me.id, me.isAdmin),
+    ]);
+
+    res.json({
+      room: {
+        ...publicRoom(room),
+        canScreen: canScreenNow,
+        canDissolve: canDissolveNow,
+      }
+    });
   } catch (error) {
     console.error('Get room error:', error);
     res.status(500).json({ error: '获取房间详情失败' });
+  }
+});
+
+/**
+ * 【公共房间需求】通过「放映通道」进入公共房间，取得放映权限。
+ *
+ * 规则（与需求逐条对应）：
+ *   - 只有公共房间（管理员创建）才有放映通道，普通房间直接 400。
+ *   - 管理员：**免密**通过，且**不消耗**放映密码（否则管理员一次误点就把授权名额用掉了）。
+ *   - 非管理员：必须提供正确的放映密码；**密码用过即废**（立即置 null）。
+ *   - 未设置放映密码时，非管理员一律进不去（需求里的「绝对项」）——
+ *     这正是密码被消耗后的状态，因此必须与「密码错误」分开提示，
+ *     前端才能给出「请向管理员索要密码」的文案。
+ *
+ * 本接口只负责「发放入场券」；真正的进房仍走 POST /:id/join，由前端在拿到入场券后调用。
+ */
+roomRouter.post('/:id/screening', express.json(), async (req: AuthRequest, res: Response) => {
+  try {
+    const roomId = req.params.id;
+    const { password } = req.body || {};
+    const me = req.user!;
+
+    const exists = await prisma.room.findUnique({ where: { id: roomId }, select: { id: true } });
+    if (!exists) return res.status(404).json({ error: '房间不存在' });
+
+    const result = await claimScreening(roomId, me.id, password, me.isAdmin);
+    if (result.ok) {
+      return res.json({ ok: true, asAdmin: result.asAdmin, canScreen: true });
+    }
+
+    switch (result.reason) {
+      case 'not-public':
+        return res.status(400).json({ error: '该房间没有放映通道', code: 'SCREENING_NOT_PUBLIC' });
+      case 'no-pass':
+        return res.status(403).json({
+          error: '放映通道尚未开放，请向管理员索要放映密码',
+          code: 'SCREENING_NO_PASS'
+        });
+      case 'bad-pass':
+        return res.status(403).json({ error: '放映密码错误', code: 'SCREENING_BAD_PASS' });
+      case 'taken':
+      default:
+        return res.status(409).json({
+          error: '当前已有放映人，需等本场结束或对方掉线超过 3 分钟后才能接管',
+          code: 'SCREENING_TAKEN'
+        });
+    }
+  } catch (error: any) {
+    if (error?.appCode === 'SCREENING_PASS_RACE') {
+      // 并发下两人同时使用同一个一次性密码：只有一个能拿到
+      return res.status(409).json({
+        error: '放映密码刚刚已被其他用户使用',
+        code: 'SCREENING_TAKEN'
+      });
+    }
+    console.error('Screening channel error:', error);
+    res.status(500).json({ error: '进入放映通道失败' });
   }
 });
 
@@ -495,8 +651,18 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: '你不在该房间中' });
     }
 
-    // 如果是房主，解散房间（房主拥有随时解散权，包括放映途中）
-    if (member.role === 'HOST') {
+    // 解散房间的判定：**只有真实房主或管理员**（canDissolve）。
+    //
+    // 【公共房间需求】这里原本是 `if (member.role === 'HOST')` —— 极其危险：
+    // 放映人虽然拥有放映权限，但**绝不能解散房间**。而 role 字段是可以被写成 HOST 的，
+    // 一旦放映人的成员行落了 HOST，他退出就会把管理员精心维护的公共房间直接删掉。
+    // 因此改为按 roomAccess.canDissolve 判定（真实房主 / 管理员），与 role 字段解耦。
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { hostId: true }
+    });
+
+    if (room && (await canDissolve(roomId, userId, req.user!.isAdmin))) {
       const io = getIO();
       await dissolveRoom(roomId, { io });
       return res.json({ message: '房间已解散' });
@@ -523,13 +689,13 @@ roomRouter.patch('/:id/status', express.json(), async (req: AuthRequest, res: Re
     const { status, currentMovie } = req.body;
     const roomId = req.params.id;
 
-    // 验证是房主
+    // 验证有放映权限（真实房主 / 公共房间的放映人 / 管理员）
     const room = await prisma.room.findUnique({
       where: { id: roomId },
       select: { id: true, hostId: true, status: true, currentMovie: true }
     });
 
-    if (!room || room.hostId !== req.user!.id) {
+    if (!room || !(await canScreen(roomId, req.user!.id, req.user!.isAdmin))) {
       return res.status(403).json({ error: '只有房主可以操作' });
     }
 
@@ -571,7 +737,7 @@ roomRouter.put('/:id/images', express.json({ limit: '20mb' }), async (req: AuthR
     if (!room) {
       return res.status(404).json({ error: '房间不存在' });
     }
-    if (room.hostId !== req.user!.id) {
+    if (!(await canScreen(req.params.id, req.user!.id, req.user!.isAdmin))) {
       return res.status(403).json({ error: '只有房主可以修改房间图片' });
     }
 

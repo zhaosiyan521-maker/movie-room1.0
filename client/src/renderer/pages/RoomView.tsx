@@ -56,6 +56,12 @@ interface Room {
       nickname: string;
     };
   }>;
+  /** 【公共房间】我是否有放映权限（服务端判定：真实房主 / 放映人 / 管理员） */
+  canScreen?: boolean;
+  /** 【公共房间】我是否可以解散房间（放映人**不可**解散） */
+  canDissolve?: boolean;
+  /** 【公共房间】是否公共房间（管理员创建） */
+  isPublicRoom?: boolean;
 }
 
 interface ChatMessage {
@@ -150,6 +156,35 @@ function saveVoicePrefs(prefs: { voiceVolume: number; micVolume: number }): void
   }
 }
 
+/**
+ * 【新增需求】弹幕滚动速度的持久化（1~5 档，个人偏好，不同步给他人）。
+ * 需求原文：「用户的弹幕滚动速度的设置要记住，刷新后保留」。
+ * 与语音音量偏好一样存本地：这是纯客户端显示偏好，无需经过服务端。
+ */
+const DANMAKU_SPEED_KEY = 'movieRoom.danmakuSpeed.v1';
+const DANMAKU_SPEED_MIN = 1;
+const DANMAKU_SPEED_MAX = 5;
+
+function loadDanmakuSpeed(): number {
+  try {
+    const raw = localStorage.getItem(DANMAKU_SPEED_KEY);
+    if (!raw) return 3; // 默认中档，与改造前一致
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return 3;
+    return Math.max(DANMAKU_SPEED_MIN, Math.min(DANMAKU_SPEED_MAX, Math.round(n)));
+  } catch {
+    return 3;
+  }
+}
+
+function saveDanmakuSpeed(value: number): void {
+  try {
+    localStorage.setItem(DANMAKU_SPEED_KEY, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+
 // 用户头像纯色：按 userId 哈希到固定色板，同一用户恒定同色、不带文字。
 const AVATAR_COLORS = [
   '#F858AF', '#5B8DEF', '#F5A623', '#46C48A', '#9B6BF3',
@@ -205,6 +240,12 @@ export default function RoomView() {
   // 这里用一个回调 ref 把它挂载进组件展示区，切页时再移回 document.body 隐藏。
   const hostVideoMountRef = useRef<HTMLDivElement | null>(null);
   const [isHost, setIsHost] = useState(false);
+  /**
+   * 【公共房间需求】是否可以解散房间。
+   * 与 isHost（放映权限）**刻意分开**：放映人有放映权限但不能解散房间，
+   * 只有真实房主与管理员能解散。解散按钮据此显示。
+   */
+  const [canDissolve, setCanDissolve] = useState(false);
   // isHost 的同步镜像：setupWebSocket 在 doJoin（async，捕获旧闭包）里被调用时，
   // isHost state 可能尚未更新，故用 ref 同步记录，确保房主分支判断准确。
   const isHostRef = useRef(false);
@@ -275,7 +316,7 @@ export default function RoomView() {
   // 弹幕为「本地视角」呈现：不透明度 / 滚动速度 / 颜色均为用户个人偏好，不同步给他人。
   const [danmaku, setDanmaku] = useState<DanmakuItem[]>([]);
   const [danmakuOpacity, setDanmakuOpacity] = useState(1);
-  const [danmakuSpeed, setDanmakuSpeed] = useState(3); // 1~5 档，越大越快
+  const [danmakuSpeed, setDanmakuSpeed] = useState(loadDanmakuSpeed); // 1~5 档，越大越快（持久化）
   const [danmakuColor, setDanmakuColor] = useState('#ff4d4f'); // 红/黄/蓝/绿（默认红）
   const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
   const danmakuSeqRef = useRef(0);
@@ -687,6 +728,11 @@ export default function RoomView() {
     // 而推流会话存活这件事由 hostStreaming 单例与 session.joinedRoom 负责，与这些 UI 状态无关。
     setJoined(false);
     joinedRef.current = false;
+    // 【公共房间需求】权限同样必须复位：React Router 复用组件实例时，
+    // 若把上一个房间的放映/解散权限带进新房间，会出现「在普通房间里看到房主面板」。
+    setIsHost(false);
+    isHostRef.current = false;
+    setCanDissolve(false);
     setRoom(null);
     setMembers([]);
     setScreeningStarted(false);
@@ -694,8 +740,12 @@ export default function RoomView() {
     setUrlInput('');
     setPasswordInput('');
     setProgress({ current: 0, duration: 0 });
-    setDanmakuSpeed(3);
-    danmakuSpeedRef.current = 3;
+    // 【新增需求】弹幕速度已改为**持久化的个人偏好**，因此不再在清理时硬复位到 3 ——
+    // 旧实现每次都重置为默认档，刷新后用户的选择必然丢失，与需求直接冲突。
+    // 这里改为重新读一次本地偏好，保证切换房间/刷新后都保持用户设定的档位。
+    const savedSpeed = loadDanmakuSpeed();
+    setDanmakuSpeed(savedSpeed);
+    danmakuSpeedRef.current = savedSpeed;
     clearAllTimers();
   };
 
@@ -711,9 +761,13 @@ export default function RoomView() {
 
       const me = useAuthStore.getState().user;
       if (me) {
-        const hostFlag = r.hostId === me.id;
+        // 【公共房间需求】放映权限由服务端判定（真实房主 / 放映人 / 管理员），
+        // 客户端**不**自行用 hostId 推断 —— 否则放映人会被当成普通观众，
+        // 看不到房主控制面板，也就无法放映。
+        const hostFlag = r.canScreen === true || r.hostId === me.id;
         isHostRef.current = hostFlag;
         setIsHost(hostFlag);
+        setCanDissolve(r.canDissolve === true || r.hostId === me.id);
         const alreadyMember = r.members.some(m => m.user.id === me.id);
         if (alreadyMember) {
           doJoin();
@@ -728,9 +782,11 @@ export default function RoomView() {
 
   useEffect(() => {
     if (user && room && !joined) {
-      const hostFlag = room.hostId === user.id;
+      // 同上：以服务端给出的权限为准
+      const hostFlag = room.canScreen === true || room.hostId === user.id;
       isHostRef.current = hostFlag;
       setIsHost(hostFlag);
+      setCanDissolve(room.canDissolve === true || room.hostId === user.id);
       const alreadyMember = room.members.some(m => m.user.id === user.id);
       if (alreadyMember) {
         doJoin();
@@ -2125,10 +2181,14 @@ export default function RoomView() {
     }, duration * 1000 + 200);
   };
 
-  /** 【M8-1】弹幕速度同时写 state 与 ref，保证 socket 闭包读到的始终是最新档位 */
+  /**
+   * 【M8-1】弹幕速度同时写 state 与 ref，保证 socket 闭包读到的始终是最新档位。
+   * 【新增需求】同时持久化到 localStorage，刷新页面后保留用户的选择。
+   */
   const changeDanmakuSpeed = (value: number) => {
     danmakuSpeedRef.current = value;
     setDanmakuSpeed(value);
+    saveDanmakuSpeed(value);
   };
 
   const appendMessage = (msg: ChatMessage) => {
@@ -2648,6 +2708,12 @@ export default function RoomView() {
     getLiveSocket()?.emit('host-pause', { roomId: id });
     // 房间状态回到等待，房主可开始新电影或解散房间
     api.patch(`/rooms/${id}/status`, { status: 'WAITING' }).catch(() => {});
+    // 【公共房间需求】电影**自然播完**也算「本场结束」→ 放映权限必须立即作废。
+    // 这里用专门的 `host-screening-end` 事件，而**不是**复用 host-stop-play：
+    // 后者会连带清空播放源，会改变既有的「播完后重播同一部片」行为。
+    // 该事件只做一件事：清空放映人记录并保持放映密码为已作废状态，
+    // 让放映通道回到「未设密码」（需管理员重新设密码）。
+    getLiveSocket()?.emit('host-screening-end', { roomId: id });
     setEndedPrompt(true);
   };
 
@@ -3049,7 +3115,6 @@ export default function RoomView() {
                     />
                     <span className="voice-settings-val">{Math.round(voiceVolume * 100)}%</span>
                   </div>
-                  <p className="voice-settings-hint">听到别人说话的音量（不影响电影音量）</p>
 
                   <div className="voice-settings-row">
                     <label htmlFor="micVol">🎙️ 麦克风音量</label>
@@ -3063,7 +3128,6 @@ export default function RoomView() {
                     />
                     <span className="voice-settings-val">{Math.round(micVolume * 100)}%</span>
                   </div>
-                  <p className="voice-settings-hint">别人听到你说话的音量（不影响电影音量）</p>
 
                   <div className="voice-settings-foot">
                     <button
@@ -3134,13 +3198,17 @@ export default function RoomView() {
                   </button>
                 )}
 
-                {/* 房主随时可解散房间 */}
-                <button
-                  onClick={() => { if (confirm('确定要解散房间吗？房间将被彻底删除，所有观众将被请出。')) leaveRoom(); }}
-                  className="btn btn-danger"
-                >
-                  ❌ 解散房间
-                </button>
+                {/* 房主随时可解散房间。
+                    【公共房间需求】仅真实房主与管理员可见 —— 放映人有放映权限但**不可解散**，
+                    因此这里按 canDissolve 而非 isHost 渲染。 */}
+                {canDissolve && (
+                  <button
+                    onClick={() => { if (confirm('确定要解散房间吗？房间将被彻底删除，所有观众将被请出。')) leaveRoom(); }}
+                    className="btn btn-danger"
+                  >
+                    ❌ 解散房间
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -3241,9 +3309,12 @@ export default function RoomView() {
                   <button className="btn btn-secondary" onClick={() => setEndedPrompt(false)}>
                     否（保留房间）
                   </button>
-                  <button className="btn btn-danger" onClick={leaveRoom}>
-                    是（解散房间）
-                  </button>
+                  {/* 【公共房间需求】放映人没有解散权，此时只提供「否」 */}
+                  {canDissolve && (
+                    <button className="btn btn-danger" onClick={leaveRoom}>
+                      是（解散房间）
+                    </button>
+                  )}
                 </div>
                 <p className="chat-rules" style={{ marginTop: 10 }}>
                   保留的房间可随时进入开始新电影，或使用「❌ 解散房间」按钮解散。

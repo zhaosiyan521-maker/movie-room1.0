@@ -193,6 +193,79 @@
   background-color: rgba(229, 9, 20, 0.12);
 }
 
+/* ===== 【公共房间需求】后台「公共房间」面板 ===== */
+.public-room-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.public-room-intro {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.public-room-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid rgba(167, 139, 250, 0.35);
+  border-radius: 8px;
+  background-color: var(--bg-secondary);
+}
+
+.public-room-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.public-room-state {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.public-room-state-none {
+  background-color: rgba(125, 120, 160, 0.18);
+  color: var(--text-muted);
+}
+
+.public-room-state-ready {
+  background-color: rgba(70, 211, 105, 0.16);
+  color: #46d369;
+}
+
+.public-room-state-screening {
+  background-color: rgba(245, 197, 24, 0.18);
+  color: var(--warning-color);
+}
+
+.public-room-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.public-room-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.public-room-pwd-input {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
+
 /* 房间列表（聊天列表样式） */
 .admin-room-list {
   padding: 0;

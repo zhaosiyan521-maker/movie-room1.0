@@ -42,6 +42,7 @@ model User {
   rooms         Room[]   @relation("HostedRooms")
   memberships   RoomMember[]
   bans          RoomBan[]
+  screeningAs   RoomScreeningHost[]
   @@map("users")
 }
 
@@ -58,8 +59,21 @@ model Room {
   hostIp          String?
 
   // 房间设置
-  password        String?         // 密码保护（可选）
+  password        String?         // 密码保护（可选，可重复使用）
   maxViewers      Int             @default(30) // 最大观众数
+
+  // ===== 【公共房间】放映通道（一次性密码 + 放映人白名单）=====
+  //
+  // 管理员账号创建的房间即「公共房间」。它与普通房间的差别：
+  //   1) 大厅里永远置顶，创建人显示为「公共放映厅」，带淡紫描边；
+  //   2) 只能由管理员在后台解散，房间内无人也不会自动消失；
+  //   3) 额外提供一条「放映通道」，通过它进入的人获得放映权限（≈房主权限，但不可解散）。
+  //
+  // screeningPassword：放映通道密码。**一次性**——第一个非管理员用户用它进入后立即置 null。
+  // screeningUpdatedAt：放映密码的最近变更时间，仅用于后台展示。
+  // 字段命名刻意与 password 区分：房间普通密码与放映密码互不冲突、互不影响。
+  screeningPassword    String?
+  screeningUpdatedAt   DateTime?
 
   // 房间状态：WAITING, PLAYING, ENDED
   status          String          @default("WAITING")
@@ -84,7 +98,28 @@ model Room {
 
   members         RoomMember[]
   bans            RoomBan[]
+  screeningHosts  RoomScreeningHost[]
   @@map("rooms")
+}
+
+/// 公共房间的「放映人」记录（当前谁通过放映通道拿到了放映权限）。
+///
+/// 设计要点：
+///  - 每房间最多一条（roomId 唯一）：放映权限是排他的，同一时间只有一个人是放映人。
+///  - 掉线不立即删除，而是写入 graceUntil = now + 3 分钟：放映人刷新页面/网络抖动后
+///    仍能在宽限期内重新连回来继续放映（否则刷新一次就要管理员重设密码，体验太差）。
+///  - graceUntil 过期后由服务端清理，并把 screeningPassword 置 null、房间回到 WAITING，
+///    即「通道回到未设密码状态」，需要管理员重新设密码。
+model RoomScreeningHost {
+  id         String    @id @default(uuid())
+  roomId     String    @unique
+  room       Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  claimedAt  DateTime  @default(now())
+  /// 宽限截止时间。为 null 表示该放映人当前在线（连接正常）。
+  graceUntil DateTime?
+  @@map("room_screening_hosts")
 }
 
 model RoomMember {

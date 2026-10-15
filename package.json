@@ -25,7 +25,8 @@
     "verify:features": "node scripts/verify-features.js",
     "verify:socket-features": "node scripts/verify-socket-features.js",
     "verify:voice-isolation": "node scripts/verify-voice-isolation.js",
-    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation"
+    "verify:public-room": "node scripts/verify-public-room.js",
+    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation && npm run verify:public-room"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

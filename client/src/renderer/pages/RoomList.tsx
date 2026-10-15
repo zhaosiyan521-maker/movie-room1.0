@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../store/authStore';
 import './RoomList.css';
 
@@ -21,6 +21,12 @@ interface Room {
   _count: {
     members: number;
   };
+  /** 【公共房间】是否管理员创建的公共房间（决定置顶 / 描边 / 双入口） */
+  isPublicRoom?: boolean;
+  /** 【公共房间】我此刻是否已有放映权限 */
+  canScreen?: boolean;
+  /** 【公共房间】放映通道当前是否可用（管理员恒可用；否则需已有人占位或密码待用） */
+  screeningAvailable?: boolean;
 }
 
 interface SearchUser {
@@ -41,6 +47,7 @@ export function parseRoomImages(images?: string | null): string[] {
 }
 
 export default function RoomList() {
+  const navigate = useNavigate();
   const [rooms, setRooms] = useState<Room[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState('all');
@@ -125,6 +132,53 @@ export default function RoomList() {
     setKeyword('');
     setSelectedUser(null);
     setMatchedUsers([]);
+  };
+
+  // ===== 【公共房间需求】双入口选择 =====
+  //
+  // 公共房间点击卡片不再直接进入，而是先问用户走哪条路：
+  //   「加入房间」→ 与普通房间完全一致的既有流程（/room/:id + 房间密码）
+  //   「放映通道」→ 先向服务端换取放映权限，成功后再进房（进房后即显示房主控制面板）
+  const [pickerRoom, setPickerRoom] = useState<Room | null>(null);
+  const [screeningPass, setScreeningPass] = useState('');
+  const [screeningError, setScreeningError] = useState('');
+  const [screeningBusy, setScreeningBusy] = useState(false);
+
+  const openPicker = (room: Room) => {
+    setPickerRoom(room);
+    setScreeningPass('');
+    setScreeningError('');
+    setScreeningBusy(false);
+  };
+
+  const closePicker = () => {
+    if (screeningBusy) return;
+    setPickerRoom(null);
+    setScreeningPass('');
+    setScreeningError('');
+  };
+
+  /** 走放映通道：先拿放映权限，再跳转到房间页 */
+  const enterScreeningChannel = async () => {
+    if (!pickerRoom || screeningBusy) return;
+    setScreeningBusy(true);
+    setScreeningError('');
+    try {
+      const { data } = await api.post(`/rooms/${pickerRoom.id}/screening`, {
+        password: screeningPass
+      });
+      if (data?.canScreen) {
+        setPickerRoom(null);
+        setScreeningPass('');
+        navigate(`/room/${pickerRoom.id}`);
+        return;
+      }
+      setScreeningError('进入放映通道失败，请稍后重试');
+    } catch (e: any) {
+      setScreeningError(e?.response?.data?.error || '进入放映通道失败');
+    } finally {
+      setScreeningBusy(false);
+    }
   };
 
   return (
@@ -214,8 +268,11 @@ export default function RoomList() {
             <div className="room-grid">
               {rooms.map((room) => {
                 const images = parseRoomImages(room.images);
-                return (
-                  <Link to={`/room/${room.id}`} key={room.id} className="room-card card">
+                const isPublic = room.isPublicRoom === true;
+                const cardClass = `room-card card${isPublic ? ' room-card-public' : ''}`;
+                // 公共房间的卡片内容（与普通房间一致，仅创建人一栏与描边不同）
+                const inner = (
+                  <>
                     {images.length > 0 && (
                       <div className="room-card-cover">
                         <img src={images[0]} alt={room.name} loading="lazy" />
@@ -238,7 +295,8 @@ export default function RoomList() {
 
                     <div className="room-meta">
                       <span className="host-name">
-                        👤 {room.host.nickname || room.host.username}
+                        {/* 【公共房间需求】公共房间不显示创建人（管理员），统一显示「公共放映厅」 */}
+                        {isPublic ? '🏛️ 公共放映厅' : `👤 ${room.host.nickname || room.host.username}`}
                       </span>
                       <span className="viewer-count">
                         👥 {room._count.members}/{room.maxViewers}
@@ -249,6 +307,24 @@ export default function RoomList() {
                       {room.hasPassword && <span className="tag">🔒 需要密码</span>}
                       {room.currentMovie && <span className="tag">🎬 {room.currentMovie}</span>}
                     </div>
+                  </>
+                );
+
+                // 【公共房间需求】公共房间点击后弹「放映通道 / 加入房间」选择，不直接进入
+                return isPublic ? (
+                  <div
+                    key={room.id}
+                    className={cardClass}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => openPicker(room)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') openPicker(room); }}
+                  >
+                    {inner}
+                  </div>
+                ) : (
+                  <Link to={`/room/${room.id}`} key={room.id} className={cardClass}>
+                    {inner}
                   </Link>
                 );
               })}
@@ -256,6 +332,58 @@ export default function RoomList() {
           )}
         </div>
       </div>
+
+      {/* 【公共房间需求】双入口选择弹层 */}
+      {pickerRoom && (
+        <div className="modal-mask" onClick={closePicker}>
+          <div className="modal-card screening-picker" onClick={e => e.stopPropagation()}>
+            <h3 className="screening-title">🏛️ {pickerRoom.name}</h3>
+            <p className="screening-sub">请选择进入方式</p>
+
+            {/* 入口二：与普通房间完全一致的既有流程（房间普通密码仍由房间页处理） */}
+            <button
+              className="btn btn-secondary screening-option"
+              onClick={() => navigate(`/room/${pickerRoom.id}`)}
+            >
+              🚪 加入房间
+            </button>
+
+            <div className="screening-divider" />
+
+            {/* 入口一：放映通道 —— 通过后获得放映权限（≈房主，但不可解散房间） */}
+            <p className="screening-channel-label">🎬 放映通道（获得放映权限）</p>
+            <div className="screening-pass-row">
+              <input
+                type="password"
+                className="input"
+                placeholder="放映密码"
+                value={screeningPass}
+                onChange={e => setScreeningPass(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') enterScreeningChannel(); }}
+                disabled={screeningBusy}
+              />
+              <button
+                className="btn btn-primary"
+                onClick={enterScreeningChannel}
+                disabled={screeningBusy}
+              >
+                {screeningBusy ? '验证中…' : '进入'}
+              </button>
+            </div>
+
+            {screeningError && <p className="screening-error">{screeningError}</p>}
+            <p className="screening-hint">
+              放映密码为一次性密码，由管理员设置；管理员本人无需密码
+            </p>
+
+            <div className="screening-foot">
+              <button className="btn btn-secondary" onClick={closePicker} disabled={screeningBusy}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

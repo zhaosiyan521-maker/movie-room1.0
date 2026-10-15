@@ -171,6 +171,106 @@ adminRouter.post('/rooms/:id/dissolve', async (req: AuthRequest, res: Response) 
   }
 });
 
+// ===== 【公共房间需求】后台「公共房间」管理 =====
+
+/**
+ * 公共房间列表。
+ *
+ * 判定口径与需求一致：**管理员账号创建的房间**即公共房间（按 host.isAdmin 判定，
+ * 而不是靠房间上的标志位，避免标志位与实际创建者不符的脏数据）。
+ * 这里额外返回放映通道状态，便于后台一眼看清当前是「未设密码 / 密码待用 / 放映中」。
+ */
+adminRouter.get('/public-rooms', async (_req: AuthRequest, res: Response) => {
+  try {
+    const rooms = await prisma.room.findMany({
+      where: { host: { isAdmin: true } },
+      select: {
+        id: true,
+        name: true,
+        status: true,
+        // 只取「是否已设置」，绝不把明文放映密码下发给前端
+        screeningPassword: true,
+        screeningUpdatedAt: true,
+        createdAt: true,
+        host: { select: { id: true, username: true, nickname: true } },
+        _count: { select: { members: true } },
+        screeningHosts: {
+          select: { userId: true, graceUntil: true, user: { select: { nickname: true, username: true } } }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const now = Date.now();
+    res.json({
+      rooms: rooms.map(r => {
+        const host = r.screeningHosts[0];
+        const graceActive = !!host && (!host.graceUntil || host.graceUntil.getTime() > now);
+        return {
+          id: r.id,
+          name: r.name,
+          status: r.status,
+          createdAt: r.createdAt,
+          memberCount: r._count.members,
+          owner: r.host?.nickname || r.host?.username || '管理员',
+          // 放映通道状态：none=未设密码（通道关闭）/ ready=密码待用 / screening=放映中
+          channelState: graceActive ? 'screening' : (r.screeningPassword ? 'ready' : 'none'),
+          screeningUser: graceActive
+            ? (host!.user?.nickname || host!.user?.username || '未知用户')
+            : null,
+          screeningGraceUntil: graceActive ? (host!.graceUntil ?? null) : null,
+          screeningUpdatedAt: r.screeningUpdatedAt
+        };
+      })
+    });
+  } catch (error) {
+    console.error('Admin public rooms error:', error);
+    res.status(500).json({ error: '获取公共房间列表失败' });
+  }
+});
+
+/**
+ * 设置 / 重置某公共房间的放映通道密码。
+ * 传空字符串（或 null）表示清空密码 —— 清空后该房间的放映通道对所有人关闭
+ * （管理员除外，管理员始终免密可进）。
+ */
+adminRouter.post('/public-rooms/:id/screening-password', async (req: AuthRequest, res: Response) => {
+  try {
+    const { password } = req.body || {};
+    if (password !== null && password !== undefined && typeof password !== 'string') {
+      return res.status(400).json({ error: '放映密码格式无效' });
+    }
+    if (typeof password === 'string' && password.length > 64) {
+      return res.status(400).json({ error: '放映密码不能超过 64 个字符' });
+    }
+
+    const room = await prisma.room.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, name: true, host: { select: { isAdmin: true } } }
+    });
+    if (!room) return res.status(404).json({ error: '房间不存在或已被解散' });
+    if (room.host?.isAdmin !== true) {
+      return res.status(400).json({ error: '该房间不是公共房间' });
+    }
+
+    const next = (typeof password === 'string' && password.trim()) ? password.trim() : null;
+    await prisma.room.update({
+      where: { id: room.id },
+      data: { screeningPassword: next, screeningUpdatedAt: new Date() }
+    });
+
+    res.json({
+      message: next
+        ? `已为「${room.name}」设置放映密码（一次性，首位用户使用后立即作废）`
+        : `已清除「${room.name}」的放映密码，放映通道对所有人关闭`,
+      hasScreeningPassword: Boolean(next)
+    });
+  } catch (error) {
+    console.error('Admin set screening password error:', error);
+    res.status(500).json({ error: '设置放映密码失败' });
+  }
+});
+
 // 封禁用户（永久封禁账号 + IP + 邮箱）
 adminRouter.post('/users/:id/ban', async (req: AuthRequest, res: Response) => {
   try {
