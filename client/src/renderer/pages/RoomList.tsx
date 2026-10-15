@@ -32,6 +32,8 @@ interface Room {
   isPublicRoom?: boolean;
   /** 【公共房间】我此刻是否已有放映权限 */
   canScreen?: boolean;
+  /** 【新需求】我此刻是否就是本厅放映人（是则隐藏「加入房间」） */
+  isScreeningHost?: boolean;
   /** 【公共房间】放映通道当前是否可用（管理员恒可用；否则需已有人占位或密码待用） */
   screeningAvailable?: boolean;
 }
@@ -454,12 +456,16 @@ export default function RoomList() {
               <p>👥 观众：{pickerRoom._count.members}/{pickerRoom.maxViewers}</p>
             </div>
 
-            <button
-              className="btn btn-primary btn-block screening-option"
-              onClick={() => navigate(`/room/${pickerRoom.id}`)}
-            >
-              加入房间
-            </button>
+            {/* 【新需求】已经是本厅放映人时隐藏「加入房间」：
+                走那条路会被服务端拒绝，且他本来就该走放映通道恢复身份。 */}
+            {!pickerRoom.isScreeningHost && (
+              <button
+                className="btn btn-primary btn-block screening-option"
+                onClick={() => navigate(`/room/${pickerRoom.id}`)}
+              >
+                加入房间
+              </button>
+            )}
 
             <button
               className="btn btn-primary btn-block screening-option"

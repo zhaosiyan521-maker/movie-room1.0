@@ -248,6 +248,46 @@ const has = (text, s) => (text || '').includes(s);
       chk('弹窗③有不透明背景（不是透明弹窗）', !!bg3 && opaque(bg3.bg), `background=${bg3?.bg}`);
     }
 
+    // ---- 发光描边必须真的生效 ----
+    // 踩过的坑：`.room-card-public` 与 `.card` 同为单类选择器，而打包后 .card 排在后面，
+    // 单类写法会被 .card 完全覆盖 —— 描边样式写了等于没写（computed 仍是 .card 的灰色描边）。
+    // 因此这里直接读计算样式，要求描边是设计稿那种亮紫、且带发光阴影。
+    const cardStyle = JSON.parse(await evalJs(`
+      (() => {
+        const el = document.querySelector('.room-card-public');
+        if (!el) return 'null';
+        const s = getComputedStyle(el);
+        return JSON.stringify({ borderColor: s.borderTopColor, boxShadow: s.boxShadow });
+      })()
+    `) || 'null');
+    chk('公共房间卡片有发光描边（描边色已覆盖 .card 的默认色）',
+      !!cardStyle && !has(cardStyle.borderColor, '124, 77, 255'),
+      `borderColor=${cardStyle?.borderColor}`);
+    chk('公共房间卡片带发光阴影（box-shadow 生效）',
+      !!cardStyle && has(cardStyle.boxShadow, '168, 110, 255'),
+      `boxShadow=${cardStyle?.boxShadow}`);
+
+    // ---- 【新需求】已是放映人时不得再走「加入房间」 ----
+    // 服务端会拒绝，因此前端必须提前把该按钮藏掉，否则用户点了只会撞一个错误。
+    // 此时用户已在弹窗②那步通过放映通道成为放映人（服务端已记录）。
+    // 注意必须**重新加载页面**：大厅列表是进入页面时拉的，
+    // 若沿用旧数据，isScreeningHost 还是 false（那是服务端在授予放映权之前返回的）。
+    await send('Page.navigate', { url: `${PAGE}/` });
+    await sleep(7000);
+    await evalJs(`(() => { const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').trim()==='先用用看'); if(b)b.click(); return 'ok'; })()`);
+    await sleep(800);
+    await evalJs(`(() => { const c=document.querySelector('.room-card-public'); if(c)c.click(); return 'ok'; })()`);
+    await sleep(1200);
+    const afterClaimButtons = JSON.parse(await evalJs(`
+      (() => {
+        const el = document.querySelector('.screening-picker');
+        return JSON.stringify(el ? [...el.querySelectorAll('button')].map(b => (b.innerText||'').trim()) : []);
+      })()
+    `) || '[]');
+    chk('成为放映人后，弹窗里不再出现「加入房间」',
+      !afterClaimButtons.includes('加入房间') && afterClaimButtons.includes('放映通道'),
+      `buttons=${JSON.stringify(afterClaimButtons)}`);
+
     try { ws.close(); } catch { /* ignore */ }
   } finally {
     try { proxy?.kill(); } catch { /* ignore */ }

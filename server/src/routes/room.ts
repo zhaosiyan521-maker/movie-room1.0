@@ -390,6 +390,8 @@ roomRouter.get('/', async (req: AuthRequest, res: Response) => {
         ...r,
         isPublicRoom: publicIdSet.has(r.id),
         canScreen: me.isAdmin || r.hostId === me.id || screenHostId === me.id,
+        // 【新需求】大厅弹窗据此隐藏「加入房间」按钮
+        isScreeningHost: screenHostId === me.id,
         // 覆盖 publicRoom 里的同名值：还要把「已有人在放映」也算作通道可用
         screeningAvailable: me.isAdmin || !!screenHostId || !!r.screeningAvailable,
       };
@@ -441,12 +443,13 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
     //   canScreen  —— 可执行放映操作（真实房主 / 放映人 / 管理员）
     //   canDissolve—— 可解散房间（真实房主 / 管理员；**放映人不可解散**）
     const me = req.user!;
-    const [canScreenNow, canDissolveNow, hasEdited, isPublic] = await Promise.all([
+    const [canScreenNow, canDissolveNow, hasEdited, isPublic, activeScreenHost] = await Promise.all([
       canScreen(req.params.id, me.id, me.isAdmin),
       canDissolve(req.params.id, me.id, me.isAdmin),
       hasEditedThisSession(req.params.id, me.id),
       // 【新需求】房间页的加入卡片需要它来决定是否显示「放映通道」入口
       isPublicRoom(req.params.id),
+      getActiveScreeningHost(req.params.id),
     ]);
 
     res.json({
@@ -456,6 +459,9 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
         canDissolve: canDissolveNow,
         hasEditedThisSession: hasEdited,
         isPublicRoom: isPublic,
+        // 【新需求】我此刻是不是「放映人」。客户端据此隐藏「加入房间」
+        // （已经是放映人却点加入房间，会被服务端拒绝并提示走放映通道）。
+        isScreeningHost: activeScreenHost === me.id,
       }
     });
   } catch (error) {
@@ -587,6 +593,24 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
     // 验证密码（房主本人不需要密码）
     const isHost = room.hostId === userId;
 
+    // 【新需求】已经是「放映人」的人不得再从「加入房间」进入。
+    //
+    // 为什么必须拦：放映人走 加入房间 进来后，服务端仍按放映权限（canScreen）给他渲染
+    // 房主面板，但他这条路其实没走放映通道 —— 表现为「能点添加播放源、却又收到
+    // 只有房主可以进行该操作」，前后自相矛盾，用户完全无法理解。
+    // 因此这里直接拒绝，并明确告诉他改走放映通道（那条路会恢复放映身份）。
+    //
+    // 放行条件：确实从放映通道进入（客户端带 via='screening'）。
+    const activeScreenHost = await getActiveScreeningHost(roomId);
+    const isScreeningHost = activeScreenHost === userId;
+    const viaScreening = req.body?.via === 'screening';
+    if (isScreeningHost && !viaScreening) {
+      return res.status(403).json({
+        error: '当前你是本厅放映人，请点击放映通道进入',
+        code: 'USE_SCREENING_CHANNEL'
+      });
+    }
+
     // 密码仅在「传了值」时校验格式。
     // 无密码房间的客户端可能不传 password 字段（值为 undefined），
     // 若此处把非 string 一律判为无效，会导致无密码房间任何人都无法加入。
@@ -600,7 +624,6 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
     // 第 3 条是必须的：放映人正是设置这个密码的人（编辑房间信息时填的），
     // 若连他自己都被自己刚设的密码挡住，就出现「设完密码后自己被锁在门外」的荒谬情况。
     // 密码只用来拦「点加入房间的普通观众」。
-    const isScreeningHost = (await getActiveScreeningHost(roomId)) === userId;
     if (!isHost && !isScreeningHost && !req.user!.isAdmin && room.password && room.password !== password) {
       return res.status(403).json({ error: '房间密码错误' });
     }
@@ -624,8 +647,7 @@ roomRouter.post('/:id/join', express.json(), async (req: AuthRequest, res: Respo
           userId,
           // 放映人也按 HOST 落角色（与房主同权限档），但**解散判定不看 role**，
           // 而是走 roomAccess.canDissolve，因此不会出现「放映人解散房间」。
-          role: (isHost || isScreeningHost) ? 'HOST' : 'VIEWER'
-        }
+          role: (isHost || isScreeningHost) ? 'HOST' : 'VIEWER'        }
       });
     }).catch((err: any) => {
       if (err?.appCode === 'ROOM_FULL') return { roomFull: true as const };

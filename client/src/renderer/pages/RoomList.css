@@ -63,15 +63,31 @@
 }
 
 /* ===== 【公共房间需求】公共房间（管理员创建）的卡片样式 ===== */
-/* 1px 淡紫色描边，仅在大厅房间列表页生效（房间详情页另有样式，不受影响） */
-.room-card-public {
-  border: 1px solid rgba(167, 139, 250, 0.65);
-  box-shadow: 0 0 0 1px rgba(167, 139, 250, 0.12);
+/* 【新需求】公共房间卡片：紫色发光描边（仅大厅房间列表页生效，其它一律不变）。
+   做法是「亮边 + 内发光 + 多层外发光」：
+     - 内发光让描边内侧也发亮，看起来是"发光体"而不是一条死线；
+     - 两层外扩柔光形成图片里那种明显的辉光扩散。 */
+/* ⚠️ 必须用 `.room-card.room-card-public`（双类）而不是单独 `.room-card-public`：
+   元素上是 `room-card card room-card-public`，而 `.card`（global.css，定义 border 与 box-shadow）
+   与单类选择器权重相同，且打包后 `.card` 排在 RoomList.css **之后** →
+   单类写法会被 .card 完全覆盖（实测 computed border-color 仍是 .card 的 rgba(124,77,255,.14)、
+   box-shadow 仍是 .card 的阴影，发光一点都没生效）。
+   双类把权重提到 0-2-0，稳定压过 .card，也不必用 !important。 */
+.room-card.room-card-public {
+  border: 1.5px solid rgba(197, 158, 255, 1);
+  box-shadow:
+    inset 0 0 12px rgba(168, 110, 255, 0.55),
+    0 0 18px rgba(168, 110, 255, 0.85),
+    0 0 36px rgba(140, 90, 240, 0.5);
 }
 
-.room-card-public:hover {
-  border-color: rgba(196, 181, 253, 0.9);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(167, 139, 250, 0.25);
+.room-card.room-card-public:hover {
+  border-color: rgba(222, 196, 255, 1);
+  box-shadow:
+    inset 0 0 14px rgba(186, 138, 255, 0.65),
+    0 8px 24px rgba(0, 0, 0, 0.6),
+    0 0 22px rgba(186, 138, 255, 0.95),
+    0 0 46px rgba(150, 100, 245, 0.6);
 }
 
 /* ===== 【公共房间需求】三步弹窗 ===== */

@@ -66,6 +66,8 @@ interface Room {
   canDissolve?: boolean;
   /** 【公共房间】是否公共房间（管理员创建） */
   isPublicRoom?: boolean;
+  /** 【新需求】我此刻是不是本厅放映人（是则不允许走「加入房间」进入） */
+  isScreeningHost?: boolean;
 }
 
 interface ChatMessage {
@@ -791,12 +793,16 @@ export default function RoomView() {
         setCanDissolve(r.canDissolve === true || r.hostId === me.id);
         const alreadyMember = r.members.some(m => m.user.id === me.id);
         if (alreadyMember) {
-          doJoin();
+          // 已是成员：放映人必须带放映通道标记（服务端会拒绝放映人走「加入房间」）
+          doJoin(undefined, true, r.isScreeningHost ? 'screening' : undefined);
+        } else if (r.isScreeningHost) {
+          // 【新需求】放映人切页/刷新回来后，直接以放映通道身份恢复进入
+          doJoin(undefined, true, 'screening');
         } else if (hostFlag) {
           // 【公共房间需求 · 关键】通过放映通道进来的用户此时**还不是**成员，
           // 而界面渲染条件 `!joined ? 加入房间卡片 : 观影界面` 会把他挡在
           // 「加入房间」卡片前 —— 拿不到房主控制面板，放映权限形同虚设。
-          // 因此这里替他静默完成 /join（silent：失败不弹密码错误卡片）。
+          // 管理员/房主在此静默补一次 /join。
           doJoin(undefined, true);
         }
       }
@@ -816,9 +822,12 @@ export default function RoomView() {
       setCanDissolve(room.canDissolve === true || room.hostId === user.id);
       const alreadyMember = room.members.some(m => m.user.id === user.id);
       if (alreadyMember) {
-        doJoin();
+        doJoin(undefined, true, room.isScreeningHost ? 'screening' : undefined);
+      } else if (room.isScreeningHost) {
+        // 放映人：必须以放映通道身份加入（服务端会拒绝他人走「加入房间」）
+        doJoin(undefined, true, 'screening');
       } else if (hostFlag) {
-        // 同 fetchRoom：放映人/管理员即使不是成员也直接静默加入，直达放映界面
+        // 管理员/房主：即使不是成员也直接静默加入，直达放映界面
         doJoin(undefined, true);
       }
     }
@@ -827,13 +836,17 @@ export default function RoomView() {
   /**
    * 加入房间。
    *
-   * @param silent 自动加入（放映通道进入时）用：失败不写 error 卡片，
-   *               避免给放映人弹一个他根本不需要填的密码错误。
+   * @param password 房间密码（仅「加入房间」这条路径需要）
+   * @param silent   自动加入用：失败不写 error 卡片，避免给放映人弹无关的密码错误
+   * @param via      进入渠道。'screening' 表示确实是从放映通道进来的 ——
+   *                 服务端会拒绝「已是放映人却走加入房间」的请求，
+   *                 因此放映人的自动加入必须带上这个标记。
    */
-  const doJoin = async (password?: string, silent = false) => {
+  const doJoin = async (password?: string, silent = false, via?: 'screening') => {
     try {
       await api.post(`/rooms/${id}/join`, {
-        password: password || undefined
+        password: password || undefined,
+        ...(via ? { via } : {}),
       });
 
       setJoined(true);
@@ -880,8 +893,8 @@ export default function RoomView() {
       setShowScreeningPass(false);
       setScreeningPass('');
       if (data.hasEditedThisSession) {
-        // 本场已改过 → 跳过编辑弹窗，直接进房
-        await doJoin(undefined, true);
+        // 本场已改过 → 跳过编辑弹窗，直接以放映通道身份进房
+        await doJoin(undefined, true, 'screening');
         return;
       }
       // 弹编辑窗，预填房间当前信息
@@ -934,9 +947,9 @@ export default function RoomView() {
       await api.put(`/rooms/${id}/images`, { images: editImages });
 
       setEditRoomOpen(false);
-      // 刷新房间信息（名称/描述/图片/人数都可能已变），再正式加入
+      // 刷新房间信息（名称/描述/图片/人数都可能已变），再以放映通道身份正式加入
       await fetchRoom();
-      await doJoin(undefined, true);
+      await doJoin(undefined, true, 'screening');
     } catch (err: any) {
       setEditError(err?.response?.data?.error || '保存房间信息失败');
     } finally {
@@ -3048,20 +3061,24 @@ export default function RoomView() {
 
           {error && <div className="error-message">{error}</div>}
 
-          <button
-            onClick={handleJoin}
-            className="btn btn-primary btn-block"
-          >
-            加入房间
-          </button>
+          {/* 【新需求】已经是本厅放映人时，不再提供「加入房间」——
+              走那条路会被服务端拒绝（且用户也会困惑：明明能加播放源却报不是房主）。
+              只留「放映通道」，点一下即恢复放映身份（免密码、不再弹编辑弹窗）。 */}
+          {!room?.isScreeningHost && (
+            <button
+              onClick={handleJoin}
+              className="btn btn-primary btn-block"
+            >
+              加入房间
+            </button>
+          )}
 
-          {/* 【新需求】公共房间才显示「放映通道」入口，与大厅弹窗保持一致。
-              已具备放映权限的人（isHost）不会再看到卡片，因此无需额外判断。 */}
+          {/* 【新需求】公共房间才显示「放映通道」入口，与大厅弹窗保持一致 */}
           {room?.isPublicRoom && (
             <button
               onClick={openScreeningPass}
               className="btn btn-primary btn-block"
-              style={{ marginTop: '12px' }}
+              style={{ marginTop: room?.isScreeningHost ? 0 : '12px' }}
             >
               放映通道
             </button>

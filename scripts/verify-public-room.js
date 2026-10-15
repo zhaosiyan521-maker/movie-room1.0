@@ -25,7 +25,7 @@ const {
 process.env.DATABASE_URL = resolveDatabaseUrl();
 const SECRET = loadSecret();
 const checker = createChecker('公共房间结果');
-const { check, report } = checker;
+const { check, skipCheck, report } = checker;
 
 (async () => {
   const prisma = new PrismaClient();
@@ -149,13 +149,15 @@ const { check, report } = checker;
 
     // 与真实前端一致：socket 的 join-room 要求数据库里已有成员行，
     // 前端是先 POST /:id/join 再 emit('join-room')，这里照做。
-    const httpJoin = (token) => fetch(`${BASE}/api/rooms/${pubRoom.id}/join`, {
+    // 注意 via='screening'：放映人走「加入房间」会被服务端拒绝（见第 15 组断言），
+    // 以放映身份进入必须带这个标记。
+    const httpJoin = (token, via) => fetch(`${BASE}/api/rooms/${pubRoom.id}/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({}),
+      body: JSON.stringify(via ? { via } : {}),
     });
-    const aliceJoinRes = await httpJoin(aliceToken);
-    check('放映人以普通成员身份加入房间（成员行建立）', aliceJoinRes.ok,
+    const aliceJoinRes = await httpJoin(aliceToken, 'screening');
+    check('放映人以放映通道身份加入房间（成员行建立）', aliceJoinRes.ok,
       `status=${aliceJoinRes.status}`);
     await httpJoin(adminHeaders.Authorization.replace('Bearer ', ''));
 
@@ -220,8 +222,9 @@ const { check, report } = checker;
     check('bob 取得放映权限', bobDetailBefore.canScreen === true);
 
     // bob 掉线（关闭 socket）→ 进入宽限期，权限应保留
-    // 同样先建立成员行，否则 join-room 会被「你不在该房间中」拒绝
-    await httpJoin(bobToken);
+    // 同样先建立成员行，否则 join-room 会被「你不在该房间中」拒绝。
+    // bob 此刻已是放映人，故需带放映通道标记。
+    await httpJoin(bobToken, 'screening');
     const bobSock = await connectSocket(io, BASE, bobToken, { label: 'bob' });
     const bobJoined = [];
     bobSock.on('room-joined', () => bobJoined.push(1));
@@ -335,9 +338,9 @@ const { check, report } = checker;
     // 若只在 socket 断开时记 3 分钟宽限，那么这位放映人退出后的 3 分钟内
     // 任何人都无法从放映通道进入（密码已不存在），表现为「他退了，下一个人却进不来」。
     // 注意：前面的用例已让 alice 离开过房间（成员行被删），这里先重新加入再退出。
-    // 放映人此时是「设密码的人」，加入时不应再被自己刚设的房间密码拦住。
-    const rejoinRes = await httpJoin(aliceToken);
-    check('放映人（设密码者）重新加入不被自己设的密码拦住', rejoinRes.ok,
+    // 此时 alice 仍是放映人，按新规则必须带放映通道标记（走「加入房间」会被拒绝）。
+    const rejoinRes = await httpJoin(aliceToken, 'screening');
+    check('放映人（设密码者）以放映通道身份重新加入不被自己设的密码拦住', rejoinRes.ok,
       `status=${rejoinRes.status}`);
     const aliceLeaveRes = await fetch(`${BASE}/api/rooms/${pubRoom.id}/leave`, {
       method: 'POST',
@@ -357,6 +360,59 @@ const { check, report } = checker;
     check('换人上台后 hasEditedThisSession 重新为 false（每人每场一次）',
       resetClaim.status === 200 && resetClaim.body?.hasEditedThisSession === false,
       `status=${resetClaim.status} hasEdited=${resetClaim.body?.hasEditedThisSession}`);
+
+    // ---- 15. 【新需求】放映人不得走「加入房间」进入 ----
+    // 场景：放映人切页后想从「加入房间」回到房间 —— 这条路径必须被拒绝，
+    // 否则他能拿到房主面板却又被信令层拒绝操作（能点添加播放源、却弹"只有房主可以"）。
+    // 正确做法是让他点「放映通道」恢复身份。
+    const viaScreening = (token, extra = {}) => fetch(`${BASE}/api/rooms/${pubRoom.id}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(extra),
+    });
+
+    // 先确保当前存在一个放映人（上一步 bob 已通过放映通道成为放映人）
+    const activeHostId = await prisma.roomScreeningHost.findUnique({
+      where: { roomId: pubRoom.id }, select: { userId: true },
+    });
+    if (activeHostId?.userId === bob.id) {
+      // 用「加入房间」路径 → 必须被拒
+      const plainJoin = await viaScreening(bobToken);
+      const plainBody = await plainJoin.json().catch(() => ({}));
+      check('放映人走「加入房间」被拒绝（403 + USE_SCREENING_CHANNEL）',
+        plainJoin.status === 403 && plainBody.code === 'USE_SCREENING_CHANNEL',
+        `status=${plainJoin.status} code=${plainBody.code} body=${JSON.stringify(plainBody)}`);
+
+      // 带放映通道标记 → 放行
+      const viaOk = await viaScreening(bobToken, { via: 'screening' });
+      check('放映人带放映通道标记可正常进入', viaOk.ok, `status=${viaOk.status}`);
+
+      // 房间详情要告诉客户端「我是放映人」，前端据此隐藏「加入房间」
+      const bobDetail = (await (await fetch(`${BASE}/api/rooms/${pubRoom.id}`, {
+        headers: { Authorization: `Bearer ${bobToken}` },
+      })).json()).room;
+      check('房间详情返回 isScreeningHost=true', bobDetail.isScreeningHost === true,
+        `isScreeningHost=${bobDetail.isScreeningHost}`);
+
+      // 列表同样要带该标记（大厅弹窗据此隐藏按钮）
+      const listRes = await fetch(`${BASE}/api/rooms?limit=50`, { headers: { Authorization: `Bearer ${bobToken}` } });
+      const listRooms = (await listRes.json()).rooms || [];
+      const mineInList = listRooms.find(r => r.id === pubRoom.id);
+      check('房间列表返回 isScreeningHost=true', mineInList?.isScreeningHost === true,
+        `isScreeningHost=${mineInList?.isScreeningHost}`);
+
+      // 非放映人不受影响：alice（已不是放映人）走「加入房间」应正常
+      const aliceJoin2 = await fetch(`${BASE}/api/rooms/${pubRoom.id}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...aliceHeaders },
+        body: JSON.stringify({ password: 'join-pwd-1' }),
+      });
+      check('非放映人走「加入房间」不受该规则影响',
+        aliceJoin2.ok || aliceJoin2.status === 400,
+        `status=${aliceJoin2.status}（400=房间已满也算正常路径）`);
+    } else {
+      skipCheck('放映人不得走「加入房间」相关断言', '未取得预期的放映人状态');
+    }
 
     // ---- 13. 「永远置顶」在翻页时也必须成立 ----
     // 早前实现只把「命中本页切片」的公共房间放进结果，翻到第 2 页公共房间就整批消失，
