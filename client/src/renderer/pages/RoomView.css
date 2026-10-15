@@ -282,6 +282,83 @@
   font-weight: 600;
 }
 
+/* ===== 【需求2】语音音量设置 ===== */
+.voice-settings-btn {
+  min-width: 38px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.voice-settings-card {
+  flex-basis: 100%;
+  width: 100%;
+  margin-top: 6px;
+  padding: 12px 14px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* 弹层压在控制条之上，避免被下方房主面板遮挡 */
+  position: relative;
+  z-index: 20;
+}
+
+.voice-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.voice-settings-row label {
+  flex: 0 0 92px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.voice-settings-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 120px;
+  accent-color: #8b5cf6;
+  cursor: pointer;
+}
+
+.voice-settings-val {
+  flex: 0 0 44px;
+  text-align: right;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.voice-settings-hint {
+  margin: 0 0 6px 102px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.voice-settings-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* 窄屏下让 label 与滑块换行，避免滑块被压得过短 */
+@media (max-width: 560px) {
+  .voice-settings-row {
+    flex-wrap: wrap;
+  }
+  .voice-settings-row label {
+    flex-basis: auto;
+  }
+  .voice-settings-hint {
+    margin-left: 0;
+  }
+}
+
 .host-controls {
   display: flex;
   align-items: center;

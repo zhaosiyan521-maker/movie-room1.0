@@ -718,9 +718,30 @@ export function setupSocketHandlers(io: Server) {
 
     // ===== 语音聊天 =====
 
-    socket.on('voice-join', (roomId: unknown) => {
+    socket.on('voice-join', async (roomId: unknown) => {
       // 成员校验：防止向任意房间伪造「某人加入语音」
       if (!requireInRoom(socket, roomId)) return;
+
+      // 【V8 加固】requireInRoom 只证明「信令层加入了该 socket.io 房间」，本身已能
+      // 阻止跨房间串流（voice-state 只 socket.to(roomId) 广播）。这里再叠一层
+      // 「数据库里确实是该房间成员」的确认，作为纵深防御：
+      // 一旦将来信令层的房间加入逻辑被改坏（例如管理员隐身加入、或某个新入口忘了校验），
+      // 语音仍然不会漏给房间外的人——语音是隐私敏感能力，值得多这一道。
+      try {
+        const member = await prisma.roomMember.findFirst({
+          where: { roomId, userId: socket.userId },
+          select: { id: true }
+        });
+        if (!member) {
+          // 静默拒绝：不回执，避免把「你是否是成员」变成可探测信息
+          return;
+        }
+      } catch (error) {
+        // 查询异常时按拒绝处理：宁可让一次加入语音失败，也不要放进身份不明的会话
+        console.error('voice-join 成员校验失败:', error);
+        return;
+      }
+
       voiceStates.set(socket.id, true);
       socket.to(roomId).emit('voice-state', {
         socketId: socket.id,

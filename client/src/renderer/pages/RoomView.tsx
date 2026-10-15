@@ -110,6 +110,46 @@ function speakingColor(level: number): string {
   return `hsl(${Math.round(hue)}, 75%, 50%)`;
 }
 
+/**
+ * 【需求2】语音音量偏好（个人偏好，存本地，不同步给他人）。
+ *
+ * voiceVolume：我听到的「别人的语音」音量
+ * micVolume  ：别人听到的「我的麦克风」音量
+ *
+ * 【重点约束】这两个值**只作用于语音链路**，与电影音频完全无关：
+ *   - 电影音量归 <video> 的原生控制条管，本文件任何地方都不写 el.volume；
+ *   - 语音音量作用于远端语音 <audio> 的 GainNode；
+ *   - 麦克风音量作用于本地麦克风的 WebAudio GainNode（即上行增益）。
+ * 三者互不影响，不存在共用状态。
+ */
+const VOICE_PREFS_KEY = 'movieRoom.voicePrefs.v1';
+const MIC_MIN_GAIN = 0.02; // 留一点底：完全不发声音会让"关麦"和"音量拉到 0"无法区分
+
+function clamp01(v: unknown): number {
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(0, Math.min(1, n));
+}
+
+function loadVoicePrefs(): { voiceVolume: number; micVolume: number } {
+  try {
+    const raw = localStorage.getItem(VOICE_PREFS_KEY);
+    if (!raw) return { voiceVolume: 1, micVolume: 1 };
+    const p = JSON.parse(raw);
+    return { voiceVolume: clamp01(p?.voiceVolume), micVolume: clamp01(p?.micVolume) };
+  } catch {
+    return { voiceVolume: 1, micVolume: 1 };
+  }
+}
+
+function saveVoicePrefs(prefs: { voiceVolume: number; micVolume: number }): void {
+  try {
+    localStorage.setItem(VOICE_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* 隐私模式等场景下写入失败，忽略即可 */
+  }
+}
+
 // 用户头像纯色：按 userId 哈希到固定色板，同一用户恒定同色、不带文字。
 const AVATAR_COLORS = [
   '#F858AF', '#5B8DEF', '#F5A623', '#46C48A', '#9B6BF3',
@@ -214,6 +254,17 @@ export default function RoomView() {
   // 用户「关闭麦克风 → 重新打开」后检测函数里拿到的仍是最初的 true/false，
   // 导致重新打开麦克风后说话高亮永久失效。这里用 ref 同步镜像解决。
   const micOnRef = useRef(true);
+
+  // 【需求2】语音音量：初始值从 localStorage 读取（懒初始化，避免每次渲染都读磁盘）
+  const initialVoicePrefs = useRef(loadVoicePrefs());
+  const [voiceVolume, setVoiceVolume] = useState(initialVoicePrefs.current.voiceVolume);
+  const [micVolume, setMicVolume] = useState(initialVoicePrefs.current.micVolume);
+  const [showVoiceSettings, setShowVoiceSettings] = useState(false);
+  // 异步闭包（说话循环、addTrack、onnegotiationneeded）需要读最新值，故同步镜像
+  const voiceVolumeRef = useRef(initialVoicePrefs.current.voiceVolume);
+  const micVolumeRef = useRef(initialVoicePrefs.current.micVolume);
+  // 【V10】页面可见性：不可见时停止说话上报（后台定时器被降频，上报只会产生抖动与无意义流量）
+  const pageHiddenRef = useRef(false);
   const [chatInput, setChatInput] = useState('');
   const [chatCooldown, setChatCooldown] = useState(0);
   const [menuUserId, setMenuUserId] = useState<string | null>(null);
@@ -288,6 +339,34 @@ export default function RoomView() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const speakingRef = useRef(false);
   const cooldownTimerRef = useRef<any>(null);
+
+  /**
+   * 【需求1/需求2】麦克风上行链路（WebAudio 增益）。
+   *
+   * 为什么要单独一条链路：`getUserMedia` 拿到的原始流不能直接 addTrack —— 那样
+   * 麦克风音量就无从调节（MediaStreamTrack 本身没有音量概念）。这里把原始流接进
+   * WebAudio，用 GainNode 施加「麦克风音量」，输出到 MediaStreamAudioDestinationNode，
+   * 只把这个**处理后**的产物 addTrack 给 peer connection。
+   *
+   * 关键点：说话检测（AnalyserNode）接的是**原始流**，不接处理后流 ——
+   * 这样把麦克风音量调到很小甚至接近 0 时，说话高亮仍然按真实音量工作。
+   */
+  const micRawStreamRef = useRef<MediaStream | null>(null);
+  const micSendStreamRef = useRef<MediaStream | null>(null);
+  const micGainNodeRef = useRef<GainNode | null>(null);
+  /** 正在加入语音的标记，用于阻止重入（【V6】双击「加入语音聊天」会并发两次 getUserMedia） */
+  const joiningVoiceRef = useRef(false);
+  /** 【V10】visibilitychange 的绑定引用，用于卸载时移除监听 */
+  const visibilityHandlerRef = useRef<(() => void) | null>(null);
+  /** 远端语音音量的 GainNode：socketId → GainNode（【需求2】语音音量作用于这里） */
+  const voiceGainRefs = useRef<Map<string, GainNode>>(new Map());
+  /** 远端语音的 MediaStreamAudioSourceNode：socketId → node（换源/清理时用于 disconnect） */
+  const voiceSourceRefs = useRef<Map<string, MediaStreamAudioSourceNode>>(new Map());
+  /**
+   * 【需求2】语音播放专用的 AudioContext（与麦克风链路、与电影音频完全独立）。
+   * 用它而非 audioEl.volume，是因为 volume 上限为 1.0，无法把语音调大以盖过电影声。
+   */
+  const voiceAudioCtxRef = useRef<AudioContext | null>(null);
 
   /**
    * 【M8-6】统一登记本组件创建的所有定时器，卸载/切房时一次性清理。
@@ -388,6 +467,58 @@ export default function RoomView() {
     timersRef.current.clear();
   };
 
+  /**
+   * 【V1 修复】彻底拆除麦克风上行链路。
+   *
+   * 这是本次最关键的一处修复。旧实现把「远端音频元素 / 麦克风 / AudioContext」的清理
+   * 全放在 `!hasHostSession || shouldDisposeHost` 守卫**之内**，于是房主在语音中切页时
+   * 整块被跳过 —— 实测后果（Chrome 155 对着已部署服务器测出）：
+   *   - `track.stop()` 一次都没被调用，浏览器录音标识常亮；
+   *   - AudioContext 一直 running；
+   *   - 离开房间页 6 秒后 outbound-rtp.bytesSent 仍从 32 涨到 15839 字节（306 个包）
+   *     —— 麦克风仍在持续采集并上传给房间里的观众；
+   *   - 服务端 voiceStates 仍是 true，其他人永远看到一个假 🎤。
+   *
+   * 根因：守卫的**本意**是「他人声音的播放要跨页保留」（M3 的目标，正确），
+   * 但**自己的麦克风采集绝不能跨页保留**。两者被塞进同一个守卫就漏了。
+   * 因此这里把麦克风独立出来，无条件随组件生命周期结束。
+   */
+  const teardownMicPipeline = () => {
+    // 先让服务端与其他人知道「我已退出语音」，避免幽灵麦克风标记
+    if (id) {
+      try { getLiveSocket()?.emit('voice-leave', id); } catch { /* ignore */ }
+    }
+
+    // 作废说话检测循环（它跑在组件定时器表上，这里先行置位最保险）
+    speakingSessionRef.current += 1;
+    speakingRef.current = false;
+
+    const send = micSendStreamRef.current;
+    micSendStreamRef.current = null;
+    if (send) send.getTracks().forEach(t => { try { t.stop(); } catch { /* ignore */ } });
+
+    const raw = micRawStreamRef.current;
+    micRawStreamRef.current = null;
+    if (raw) raw.getTracks().forEach(t => { try { t.stop(); } catch { /* ignore */ } });
+
+    // 兼容旧字段：确保任何路径下 localMicRef 都已释放
+    if (localMicRef.current) {
+      localMicRef.current.getTracks().forEach(t => { try { t.stop(); } catch { /* ignore */ } });
+      localMicRef.current = null;
+    }
+
+    micGainNodeRef.current = null;
+
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+
+    setInVoice(false);
+    setMicOn(true);
+    micOnRef.current = true;
+  };
+
   const cleanupAll = (disposeHostSession = false) => {
     // 房主：切换页面（disposeHostSession=false）时保留推流会话（socket + 本地视频 + WebRTC peers 继续存活），
     // 只有观众或房主主动「解散/退出」（disposeHostSession=true）才彻底断开。
@@ -481,42 +612,51 @@ export default function RoomView() {
         setHostSessionReady(false);
       }
     }
-    // 【M3 修复】音频链路必须与 peers 同生共死。
+    // 【M3 + V1】远端音频元素的清理与麦克风清理，必须分开对待（这是两次修复的核心结论）。
     //
-    // 旧实现把「音频元素 / 麦克风轨道 / AudioContext」的清理放在守卫之外，而 peers 的
-    // 清理在 `!hasHostSession || shouldDisposeHost` 守卫之内。于是房主在语音中切页时：
-    // peer connection 仍然存活，但 Audio 元素被 pause + 置空、麦克风轨道被 stop。
-    // 由于 ontrack 不会为已接收的轨道再次触发，房主回来后**永远听不到已经在语音里的
-    // 观众**，观众也听不到房主；同时服务端 voiceStates 仍标记房主在语音
-    //（cleanupAll 从不发 voice-leave，而房主 socket 是故意保持连接的），
-    // 所有观众会一直看到一个假的 🎤 标记。
-    // 现在：保留会话时（房主切页）整块跳过；真正离开时先通知服务端退出语音再拆。
+    // M3 当年发现的问题：旧实现把「音频元素 / 麦克风轨道 / AudioContext」的清理放在守卫之外，
+    // 而 peers 的清理在守卫之内。房主在语音中切页时 peer connection 仍存活，但远端 Audio
+    // 元素被 pause + 置空 —— 而 ontrack 不会为已接收的轨道再次触发，于是房主回来后
+    // **永远听不到已经在语音里的观众**。M3 的修法是把整块移进守卫，方向正确。
+    //
+    // V1 发现的新问题：M3 把**自己的麦克风**也一起保护了，而麦克风恰恰最不该跨页保留。
+    // 实测（Chrome 155 对着已部署服务器）：房主切页后 track.stop() 一次都没被调用、
+    // AudioContext 持续 running、离开房间页 6 秒后 outbound-rtp.bytesSent 仍增长 15807 字节。
+    //
+    // 因此最终形态是：
+    //   - 远端音频元素（别人的声音）→ 留在守卫内，跨页保留（M3 的诉求）
+    //   - 自己的麦克风采集与 AudioContext → 移出守卫，无条件释放（V1 的诉求）
     if (!hasHostSession || shouldDisposeHost) {
-      // 先让服务端与其他客户端知道「我已退出语音」，避免幽灵麦克风标记
-      if (inVoice && id) {
-        try { getLiveSocket()?.emit('voice-leave', id); } catch { /* ignore */ }
-      }
       audioElsRef.current.forEach(el => {
         el.pause();
         el.srcObject = null;
       });
       audioElsRef.current.clear();
       remoteStreamsRef.current.clear();
-      if (localMicRef.current) {
-        localMicRef.current.getTracks().forEach(t => t.stop());
-        localMicRef.current = null;
-      }
-      if (audioCtxRef.current) {
-        audioCtxRef.current.close().catch(() => {});
-        audioCtxRef.current = null;
-      }
-      // 说话检测循环交给代际令牌退出（见 startSpeakingDetection）
-      speakingSessionRef.current += 1;
-      speakingRef.current = false;
-      setInVoice(false);
-      setMicOn(true);
-      micOnRef.current = true;
     }
+
+    // 【V1 修复】麦克风与 AudioContext 的清理**移出上面那个守卫**，无条件执行。
+    // 守卫保护的是「他人声音的播放」（该跨页保留），而自己的麦克风采集绝不该跨页保留：
+    // 否则房主一切页，浏览器录音标识常亮、音频持续上行、服务端 voiceStates 残留。
+    teardownMicPipeline();
+    joiningVoiceRef.current = false;
+    // 远端语音的增益节点随远端音频元素一起销毁（元素已在上面 pause 并置空）
+    voiceSourceRefs.current.forEach(n => { try { n.disconnect(); } catch { /* ignore */ } });
+    voiceSourceRefs.current.clear();
+    voiceGainRefs.current.forEach(g => { try { g.disconnect(); } catch { /* ignore */ } });
+    voiceGainRefs.current.clear();
+    // 语音播放专用 AudioContext 也一并关闭，避免跨页面长期占用音频设备
+    if (voiceAudioCtxRef.current) {
+      voiceAudioCtxRef.current.close().catch(() => {});
+      voiceAudioCtxRef.current = null;
+    }
+    // 【V10】移除可见性监听（组件卸载后不应再触发 setState）
+    if (visibilityHandlerRef.current) {
+      document.removeEventListener('visibilitychange', visibilityHandlerRef.current);
+      visibilityHandlerRef.current = null;
+    }
+    pageHiddenRef.current = false;
+
     if (cooldownTimerRef.current) clearInterval(cooldownTimerRef.current);
 
     // 重置房间相关状态，避免上一个房间的聊天与 UI 状态串到新房间
@@ -651,6 +791,14 @@ export default function RoomView() {
     // 防止重复初始化导致监听器叠加（聊天消息重复的根因）
     if (setupDoneRef.current) return;
     setupDoneRef.current = true;
+
+    // 【V10】页面可见性监听：不可见时停止说话上报（后台定时器被降频，上报既抖动又无意义）。
+    // 先在 setup 时同步一次当前状态，避免「加载时就在后台」的边界情况漏判。
+    pageHiddenRef.current = document.visibilityState === 'hidden';
+    if (!visibilityHandlerRef.current) {
+      visibilityHandlerRef.current = () => setPageHidden(document.visibilityState === 'hidden');
+      document.addEventListener('visibilitychange', visibilityHandlerRef.current);
+    }
 
     const token = localStorage.getItem('token');
 
@@ -1337,7 +1485,20 @@ export default function RoomView() {
     return pc;
   };
 
+  /**
+   * 把「本端要发送的」音轨加到 peer connection 上。
+   *
+   * 【需求2】这里必须优先用**处理后**的发送流（micSendStreamRef），而不是 getUserMedia
+   * 的原始流 —— 原始流没有经过麦克风音量 GainNode，直接 addTrack 会让「麦克风音量」
+   * 对已建立的连接完全失效（表现为滑块拖了没反应）。
+   * 回落到 localMicRef 只用于「拿到流但链路尚未建好」的极短窗口，保持旧行为兜底。
+   */
   const addLocalTracksTo = (pc: RTCPeerConnection) => {
+    const send = micSendStreamRef.current;
+    if (send) {
+      send.getAudioTracks().forEach(track => pc.addTrack(track, send));
+      return;
+    }
     if (localMicRef.current) {
       localMicRef.current.getTracks().forEach(track => {
         pc.addTrack(track, localMicRef.current!);
@@ -1481,6 +1642,33 @@ export default function RoomView() {
         audioElsRef.current.set(socketId, audioEl);
       }
       audioEl.srcObject = stream;
+
+      // 【需求2】给这条语音流挂上「语音音量」增益。
+      // 用 WebAudio GainNode 而不是 audioEl.volume：后者上限被规范钉死在 1.0，
+      // 无法把别人的语音调得比原始更大（而「让语音盖过电影声」正需要这个能力）。
+      // 注意这是**语音专用**的独立 AudioContext，与麦克风链路、与电影音频都无关。
+      try {
+        if (!voiceAudioCtxRef.current || voiceAudioCtxRef.current.state === 'closed') {
+          voiceAudioCtxRef.current = new AudioContext();
+        }
+        const vctx = voiceAudioCtxRef.current;
+        vctx.resume?.().catch(() => {});
+        // 换源/重入时先拆掉旧的图，避免同一元素被接两次
+        voiceSourceRefs.current.get(socketId)?.disconnect();
+        voiceGainRefs.current.get(socketId)?.disconnect();
+
+        const src = vctx.createMediaStreamSource(stream);
+        const gain = vctx.createGain();
+        gain.gain.value = voiceVolumeRef.current;
+        src.connect(gain);
+        // 必须接到 destination 才出声
+        gain.connect(vctx.destination);
+        voiceSourceRefs.current.set(socketId, src);
+        voiceGainRefs.current.set(socketId, gain);
+      } catch (err) {
+        console.error('语音音量处理初始化失败，退化为原始音量:', err);
+      }
+
       audioEl.play().catch(() => {});
     }
   };
@@ -1514,6 +1702,11 @@ export default function RoomView() {
     remoteStreamsRef.current.delete(socketId);
     pendingCandidatesRef.current.delete(socketId);
     iceRestartAttemptsRef.current.delete(socketId);
+    // 【需求2】同步拆掉该 peer 的语音增益图，避免 disconnect 后仍占着音频图
+    voiceSourceRefs.current.get(socketId)?.disconnect();
+    voiceSourceRefs.current.delete(socketId);
+    voiceGainRefs.current.get(socketId)?.disconnect();
+    voiceGainRefs.current.delete(socketId);
     releaseAudioEl(socketId);
   };
 
@@ -1606,8 +1799,68 @@ export default function RoomView() {
   };
 
   // ===== 语音聊天 =====
+  //
+  // 【重点】电影音频与语音音频是两条完全独立的链路，不共享任何状态：
+  //   电影音频：<video> 本地播放（直链/HLS）→ 音量归原生控制条，本模块从不触碰它，
+  //             且永远不进入 WebRTC（captureStream 已随本地文件播放系统一并删除）。
+  //   语音音频：麦克风 → WebAudio 增益 → WebRTC ↔ 远端 <audio> + GainNode。
+  // 因此本模块内不会出现任何对 video 元素的 volume/muted 操作。
+
+  /** 【需求2】把所有远端语音的增益统一刷成最新值（拖动滑块时调用） */
+  const applyVoiceGainToAll = (vol: number) => {
+    voiceGainRefs.current.forEach(g => { g.gain.value = vol; });
+  };
+
+  /** 【需求2】把最新音量写入 localStorage（语音音量 + 麦克风音量一起存） */
+  const persistVoicePrefs = (patch: Partial<{ voiceVolume: number; micVolume: number }>) => {
+    saveVoicePrefs({
+      voiceVolume: patch.voiceVolume ?? voiceVolumeRef.current,
+      micVolume: patch.micVolume ?? micVolumeRef.current
+    });
+  };
+
+  const changeVoiceVolume = (v: number) => {
+    const val = clamp01(v);
+    voiceVolumeRef.current = val;
+    setVoiceVolume(val);
+    applyVoiceGainToAll(val);
+    persistVoicePrefs({ voiceVolume: val });
+  };
+
+  const changeMicVolume = (v: number) => {
+    const val = clamp01(v);
+    micVolumeRef.current = val;
+    setMicVolume(val);
+    // 当前麦克风增益节点：立即生效（不影响电影音量，也不影响说话检测）
+    if (micGainNodeRef.current) {
+      micGainNodeRef.current.gain.value = Math.max(MIC_MIN_GAIN, val);
+    }
+    persistVoicePrefs({ micVolume: val });
+  };
+
+  /**
+   * 【需求1 + 需求2】建立麦克风上行链路。
+   *
+   * 原始流 → GainNode(麦克风音量) → MediaStreamAudioDestinationNode → 只把该产物 addTrack。
+   * 说话检测接的是**原始流**，所以麦克风音量调到很小也不会影响说话高亮。
+   */
+  const buildMicPipeline = (raw: MediaStream, ctx: AudioContext): MediaStream => {
+    const source = ctx.createMediaStreamSource(raw);
+    const gain = ctx.createGain();
+    // 留一点底噪下限：完全不发声音会让「关麦」与「音量拉到 0」两种状态无法区分
+    gain.gain.value = Math.max(MIC_MIN_GAIN, micVolumeRef.current);
+    const dest = ctx.createMediaStreamDestination();
+    source.connect(gain);
+    gain.connect(dest);
+    micGainNodeRef.current = gain;
+    return dest.stream;
+  };
 
   const joinVoice = async () => {
+    // 【V6】重入守卫：joinVoice 是 async，双击会让两次 getUserMedia 并发，
+    // 后一次覆盖 localMicRef，前一条流失去引用后其麦克风轨道不再被 stop。
+    if (joiningVoiceRef.current) return;
+    joiningVoiceRef.current = true;
     try {
       // 安全上下文检查：getUserMedia 在公网 HTTP（非 localhost / 非 HTTPS）下会被浏览器拒绝。
       // 提前给出明确提示，避免「点击无反应」。
@@ -1616,21 +1869,57 @@ export default function RoomView() {
         return;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      localMicRef.current = stream;
+      // 【V3】复用同一个 AudioContext，而不是每次 join 都 new 一个：
+      // 否则「快速退出→重进」会留下永不关闭的孤儿 AudioContext（持续占用音频设备）。
+      let ctx = audioCtxRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new AudioContext();
+        audioCtxRef.current = ctx;
+      }
+      ctx.resume?.().catch(() => {});
+
+      // 【需求1】开启浏览器回声消除：外放看电影时，电影声会被麦克风物理拾取，
+      // 只有 AEC 能把它从上行信号里减掉。三个参数都是为此服务：
+      //   echoCancellation —— 消掉扬声器回授（电影声 + 别人的语音）
+      //   noiseSuppression —— 抑制环境噪声
+      //   autoGainControl  —— 自动增益，避免忽大忽小
+      const raw = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
+        video: false
+      });
+      micRawStreamRef.current = raw;
+      // 兼容既有逻辑（cleanupAll / teardownMicPipeline 都会兜底释放它）
+      localMicRef.current = raw;
+
+      const sendStream = buildMicPipeline(raw, ctx);
+      micSendStreamRef.current = sendStream;
+      const sendTrack = sendStream.getAudioTracks()[0];
+
       setInVoice(true);
       setMicOn(true);
       micOnRef.current = true;
 
+      // 只把「处理后」的音轨交给 peer connection：麦克风音量才真实可调
       peersRef.current.forEach(pc => {
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        if (sendTrack) pc.addTrack(sendTrack, sendStream);
       });
 
       // 【M1】统一用 getLiveSocket()，避免房主切页时事件发不出去
       getLiveSocket()?.emit('voice-join', id);
-      startSpeakingDetection(stream);
+      // 【需求2】说话检测接原始流（不受麦克风音量影响）
+      startSpeakingDetection(raw, ctx);
     } catch (error: any) {
       console.error('获取麦克风失败:', error);
+      // 失败时不要留下半成品状态（V3：已创建的 AudioContext 要留待下次复用，不在此关闭）
+      if (micRawStreamRef.current) {
+        micRawStreamRef.current.getTracks().forEach(t => { try { t.stop(); } catch { /* ignore */ } });
+        micRawStreamRef.current = null;
+      }
+      localMicRef.current = null;
       const name = error?.name || '';
       if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
         alert('麦克风权限被拒绝，请在浏览器地址栏允许麦克风访问后重试。');
@@ -1643,34 +1932,26 @@ export default function RoomView() {
       } else {
         alert('无法访问麦克风，请检查浏览器权限设置。');
       }
+    } finally {
+      joiningVoiceRef.current = false;
     }
   };
 
   const leaveVoice = () => {
     // 先记录麦克风轨道 id：下方移除 sender 时只能拔麦克风轨，
-    // 不能用 kind==='audio' 无差别移除——否则会把房主推流的电影声音轨（WebAudio 分流）
-    // 一并从所有 PC 拔掉，房主「加入语音→退出语音」后观众将永久失去电影声音。
-    const micTrackIds = new Set((localMicRef.current?.getTracks() || []).map(t => t.id));
-    if (localMicRef.current) {
-      localMicRef.current.getTracks().forEach(t => t.stop());
-      localMicRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {});
-      audioCtxRef.current = null;
-    }
-    speakingRef.current = false;
-    // 【M8-7】作废当前说话检测循环，避免它继续跑在已关闭的 AudioContext 上
-    speakingSessionRef.current += 1;
-    setInVoice(false);
+    // 不能用 kind==='audio' 无差别移除——避免误拔他人音轨。
+    const micTrackIds = new Set((micSendStreamRef.current?.getTracks() || []).map(t => t.id));
+    (micRawStreamRef.current?.getTracks() || []).forEach(t => micTrackIds.add(t.id));
+    (localMicRef.current?.getTracks() || []).forEach(t => micTrackIds.add(t.id));
+
     setSpeakingUserIds(prev => {
       const me = useAuthStore.getState().user;
       const next = new Set(prev);
       if (me) next.delete(me.id);
       return next;
     });
-    // 【M1】用 getLiveSocket()：房主切页时组件 socket 引用为空，但会话 socket 仍在线
-    getLiveSocket()?.emit('voice-leave', id);
+
+    // 从各 PC 上摘掉麦克风轨（AudioContext 保留复用，避免 V3 的反复创建）
     peersRef.current.forEach((pc) => {
       pc.getSenders().forEach(sender => {
         if (sender.track && micTrackIds.has(sender.track.id)) {
@@ -1678,12 +1959,20 @@ export default function RoomView() {
         }
       });
     });
+
+    teardownMicPipeline();
   };
 
   const toggleMic = () => {
-    if (!localMicRef.current) return;
+    if (!micRawStreamRef.current && !localMicRef.current) return;
     const next = !micOn;
-    localMicRef.current.getAudioTracks().forEach(t => { t.enabled = next; });
+    // 静音用「原始轨的 enabled」而非增益：enabled=false 会发出真正的静音，
+    // 且说话检测处的 micOnRef 判断能立刻生效。
+    const tracks = [
+      ...(micRawStreamRef.current?.getAudioTracks() || []),
+      ...(localMicRef.current?.getAudioTracks() || [])
+    ];
+    tracks.forEach(t => { t.enabled = next; });
     setMicOn(next);
     // 【C4】同步更新 ref：说话检测循环读的是 ref 而不是 state，否则「关麦 → 再开麦」后
     // 检测函数里的 micOn 永远是进入语音那一刻的旧值，说话高亮永久失效。
@@ -1693,16 +1982,38 @@ export default function RoomView() {
     }
   };
 
-  const startSpeakingDetection = (stream: MediaStream) => {
+  /**
+   * 【V10】页面不可见时停止说话上报。
+   * 后台标签页的定时器会被浏览器降频到约 1 次/秒，此时上报既有抖动又无意义
+   * （对方也看不到你的高亮变化）。隐藏时主动上报一次「未说话」并停发，可见后恢复。
+   */
+  const setPageHidden = (hidden: boolean) => {
+    pageHiddenRef.current = hidden;
+    if (hidden) {
+      if (speakingRef.current) {
+        speakingRef.current = false;
+        emitSpeaking(false);
+      }
+    }
+  };
+
+  /**
+   * 【需求2】说话检测。
+   *
+   * `raw` 是 getUserMedia 的**原始**流（不是施加了麦克风音量的处理后流）——
+   * 这样麦克风音量调得再小，说话高亮仍按真实音量工作。
+   * `ctx` 由 joinVoice 复用/创建后传入（V3：不再每次自己 new 一个）。
+   *
+   * 【V4】采样间隔改为 300ms，与服务端 SPEAKING_MIN_INTERVAL_MS 对齐：
+   * 旧值 200ms < 300ms，约 1/3 的上报会被服务端直接丢弃（纯浪费）。
+   */
+  const startSpeakingDetection = (raw: MediaStream, ctx: AudioContext) => {
     try {
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
       // 【M8-7】本次检测的代际令牌。循环只认自己这一代：
       // 快速「离开语音 → 立刻重进」时，旧循环下一次 tick 会发现代际已变而自行退出，
-      // 不会再跑在已 close 的 AudioContext / 已 stop 的流上（旧实现在 ≤200ms 窗口内
-      // 重进会让两条循环同时上报说话状态，并留下永不退出的孤儿循环）。
+      // 不会再跑在已销毁的 analyser / 已 stop 的流上。
       const session = ++speakingSessionRef.current;
-      const source = ctx.createMediaStreamSource(stream);
+      const source = ctx.createMediaStreamSource(raw);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       source.connect(analyser);
@@ -1722,7 +2033,8 @@ export default function RoomView() {
         const avg = data.reduce((a, b) => a + b, 0) / data.length;
         // 【C4】读 micOnRef 而非 micOn。check() 通过 setTimeout 永久自递归，
         // 闭包只捕获进入语音那一刻的渲染快照，读 state 会导致开关麦克风后判定失效。
-        const speaking = micOnRef.current && avg > 12;
+        // 【V10】页面不可见时判定为「未说话」，不再产生无意义上报。
+        const speaking = micOnRef.current && !pageHiddenRef.current && avg > 12;
         // 归一化音量到 0~1（用于头像按音量着色：绿→黄→红）
         const level = Math.max(0, Math.min(1, avg / 80));
         if (speaking !== speakingRef.current) {
@@ -1733,7 +2045,7 @@ export default function RoomView() {
           emitSpeaking(true, level);
         }
         // 【M8-6】登记到统一定时器表，组件卸载后不再继续空转
-        later(check, 200);
+        later(check, 300);
       };
       check();
     } catch (error) {
@@ -1742,6 +2054,8 @@ export default function RoomView() {
   };
 
   const emitSpeaking = (speaking: boolean, level = 0) => {
+    // 【V10】页面不可见期间除「收尾的未说话」外不再上报
+    if (pageHiddenRef.current && speaking) return;
     // 【M1】统一用 getLiveSocket()：房主切页后 socketRef 为空但会话 socket 仍在线
     getLiveSocket()?.emit('speaking', { roomId: id, speaking, level });
     const me = useAuthStore.getState().user;
@@ -2701,7 +3015,7 @@ export default function RoomView() {
                 </>
               ) : (
                 <>
-                  <span className="voice-status">未加入语音</span>
+                  {/* 【需求2】「未加入语音」提示已按需求删除：此处不再显示任何状态文字，只留按钮 */}
                   <button onClick={joinVoice} className="btn btn-primary voice-action-btn">
                     🎤 加入语音聊天
                   </button>
@@ -2711,6 +3025,58 @@ export default function RoomView() {
                     </button>
                   )}
                 </>
+              )}
+              {/* 【需求2】音量设置：加入语音前后都可调（未加入时先调好，加入即生效） */}
+              <button
+                className="btn btn-secondary btn-sm voice-settings-btn"
+                onClick={() => setShowVoiceSettings(v => !v)}
+                title="语音音量设置"
+                aria-label="语音音量设置"
+              >
+                ⚙️
+              </button>
+              {showVoiceSettings && (
+                <div className="voice-settings-card" role="dialog" aria-label="语音音量设置">
+                  <div className="voice-settings-row">
+                    <label htmlFor="voiceVol">🔊 语音音量</label>
+                    <input
+                      id="voiceVol"
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round(voiceVolume * 100)}
+                      onChange={e => changeVoiceVolume(Number(e.target.value) / 100)}
+                    />
+                    <span className="voice-settings-val">{Math.round(voiceVolume * 100)}%</span>
+                  </div>
+                  <p className="voice-settings-hint">听到别人说话的音量（不影响电影音量）</p>
+
+                  <div className="voice-settings-row">
+                    <label htmlFor="micVol">🎙️ 麦克风音量</label>
+                    <input
+                      id="micVol"
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={Math.round(micVolume * 100)}
+                      onChange={e => changeMicVolume(Number(e.target.value) / 100)}
+                    />
+                    <span className="voice-settings-val">{Math.round(micVolume * 100)}%</span>
+                  </div>
+                  <p className="voice-settings-hint">别人听到你说话的音量（不影响电影音量）</p>
+
+                  <div className="voice-settings-foot">
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => { changeVoiceVolume(1); changeMicVolume(1); }}
+                    >
+                      恢复默认
+                    </button>
+                    <button className="btn btn-primary btn-sm" onClick={() => setShowVoiceSettings(false)}>
+                      完成
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
 

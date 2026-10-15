@@ -24,7 +24,8 @@
     "verify:socket": "node scripts/verify-socket.js",
     "verify:features": "node scripts/verify-features.js",
     "verify:socket-features": "node scripts/verify-socket-features.js",
-    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features"
+    "verify:voice-isolation": "node scripts/verify-voice-isolation.js",
+    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

@@ -6,7 +6,7 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
-const { loadSecret, resolveDatabaseUrl, createChecker, api } = require('./verify-common');
+const { BASE, loadSecret, resolveDatabaseUrl, createChecker, api } = require('./verify-common');
 
 process.env.DATABASE_URL = resolveDatabaseUrl();
 const SECRET = loadSecret();
