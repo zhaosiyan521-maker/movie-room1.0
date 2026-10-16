@@ -213,9 +213,11 @@ function pruneAndInspect(roomId: string, forUserId?: string) {
 }
 
 /**
- * 【BUG-02 修复】把 socket 的 userId 登记到房间的用户集合。
- * 管理员隐身（不进 roomUsers），但这里**仍要登记** —— 下文
- * isLastUserSocket 需要能回答「这个用户还有没有别的 socket 在房间」。
+ * 【BUG-02 修复】把 socket 的 userId 登记到房间的用户集合（用户维度去重）。
+ *
+ * 调用点位于 `if (!isAdmin)` 分支内 —— 管理员隐身，不进 roomUsers/roomUserIds。
+ * 集合里只回答「这个房间有哪些用户」，配合 roomUsers 的活跃 socket 一起用于
+ * 判断某用户是否还有别的标签页在房间（多标签页只算一个用户、只占一个名额）。
  */
 function trackUserSocket(roomId: string, userId: string | undefined): void {
   if (!userId) return;
