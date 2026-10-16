@@ -46,6 +46,24 @@ model User {
   @@map("users")
 }
 
+/// 【BUG-01 修复】服务实例心跳表。
+///
+/// 解决什么问题：进程启动时会「回收上次残留的房间成员行」，原本是无条件
+/// roomMember.deleteMany({})。单实例下重启后内存映射确实是权威空态，清空是对的；
+/// 但一旦跑多个副本，某个副本启动就会把**仍在其他副本上看电影的人**从名单里删掉 ——
+/// 大厅人数变少、名额被凭空释放。
+///
+/// 「是否有别的副本在跑」这个信息必须跨进程且跨重启可得（重启后正是要判断它），
+/// 进程内变量不够用，因此落一张极小的表：每个进程启动时插入一行并周期性更新
+/// heartbeatAt；判断「是否有别的活跃实例」就是看有没有 heartbeatAt 足够新的其他行。
+model ServiceInstance {
+  id          String   @id
+  bootedAt    DateTime @default(now())
+  heartbeatAt DateTime @default(now())
+
+  @@map("service_instances")
+}
+
 model Room {
   id              String    @id @default(uuid())
   name            String

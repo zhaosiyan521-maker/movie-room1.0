@@ -14,6 +14,16 @@ import {
 
 // 存储房间和用户的映射
 const roomUsers = new Map<string, Set<string>>(); // roomId -> Set of socketIds
+/**
+ * 【BUG-02 修复】roomId -> Set of userId（同一账号的多个标签页只算一个用户）。
+ *
+ * 为什么要单独维护：`roomUsers` 是 socketId 集合，同一账号开两个标签页会有两个
+ * socketId。而「成员」在业务上是**用户**维度（成员行 unique(roomId,userId)、
+ * 房间列表人数、满员判定都按用户算）。之前没有任何地方能回答
+ * 「这个用户还有别的标签页在这个房间吗」，于是任一标签页离开就把用户整行删掉，
+ * 造成人数少 1、凭空腾出名额，而另一个标签页其实还在房间里。
+ */
+const roomUserIds = new Map<string, Set<string>>(); // roomId -> Set of userIds
 const userRooms = new Map<string, string>(); // socketId -> roomId
 // 房间内语音状态：socketId -> 是否已加入语音
 const voiceStates = new Map<string, boolean>();
@@ -162,15 +172,235 @@ async function reapStaleRoomMembers(): Promise<void> {
   }
 }
 
+/**
+ * 【BUG-02 修复】取出房间内「仍然真实存在」的 socketId，并顺手剔除幽灵 id。
+ *
+ * 为什么必须剔除：`roomUsers` 里可能残留已被销毁的 socketId（例如 socket 已断开、
+ * 但某条清理路径没走到，或断开与离开并发交错）。这类 id 在
+ * `io.sockets.sockets.get(sid)` 上取不到对象 —— 如果照旧用
+ * `若取不到就当作 userId 不匹配` 的写法，它们会被当成「别人的 socket」永久占位，
+ * 结果是**成员行再也删不掉**（实测就是这个现象：members 里混着两个已死的 id，
+ * 导致判断「该用户是否还有别的标签页」恒为真）。
+ *
+ * 因此：取不到对象的一律视为已失效并清除；同时把「集合里还有 userId 相同的活跃 socket」
+ * 与「集合里还有任何活跃 socket」一并算出来，供调用方使用。
+ */
+function pruneAndInspect(roomId: string, forUserId?: string) {
+  const sids = roomUsers.get(roomId);
+  if (!sids) return { liveUserIds: new Set<string>(), liveCount: 0 };
+  const liveUserIds = new Set<string>();
+  let liveCount = 0;
+  for (const sid of Array.from(sids)) {
+    const s = ioRef?.sockets?.sockets?.get(sid) as AuthenticatedSocket | undefined;
+    if (!s) {
+      sids.delete(sid); // 幽灵：socket 已不存在
+      continue;
+    }
+    liveCount++;
+    if (s.userId) liveUserIds.add(s.userId);
+  }
+  if (sids.size === 0) {
+    roomUsers.delete(roomId);
+    roomUserIds.delete(roomId);
+  } else if (forUserId && !liveUserIds.has(forUserId)) {
+    const ids = roomUserIds.get(roomId);
+    if (ids) {
+      ids.delete(forUserId);
+      if (ids.size === 0) roomUserIds.delete(roomId);
+    }
+  }
+  return { liveUserIds, liveCount };
+}
+
+/**
+ * 【BUG-02 修复】把 socket 的 userId 登记到房间的用户集合。
+ * 管理员隐身（不进 roomUsers），但这里**仍要登记** —— 下文
+ * isLastUserSocket 需要能回答「这个用户还有没有别的 socket 在房间」。
+ */
+function trackUserSocket(roomId: string, userId: string | undefined): void {
+  if (!userId) return;
+  let ids = roomUserIds.get(roomId);
+  if (!ids) {
+    ids = new Set();
+    roomUserIds.set(roomId, ids);
+  }
+  ids.add(userId);
+}
+
+/**
+ * 【BUG-02 修复】移除某 socket 在房间内的登记，返回「这是否是该用户在本房间的最后一个 socket」。
+ *
+ * 判定依据是**活跃** socket（先剔除幽灵 id 再比较 userId），
+ * 否则被销毁 socket 的残留 id 会让判定永远为「还有别人」，成员行永远删不掉。
+ */
+function untrackUserSocket(roomId: string, socketId: string, userId: string | undefined): boolean {
+  const sids = roomUsers.get(roomId);
+  if (sids) sids.delete(socketId);
+
+  if (!userId) {
+    // 管理员（隐身）不参与用户集合；退化为「房间内已无活跃 socket」
+    return pruneAndInspect(roomId).liveCount === 0;
+  }
+
+  const { liveUserIds } = pruneAndInspect(roomId, userId);
+  const stillThere = liveUserIds.has(userId);
+  if (!stillThere) {
+    const ids = roomUserIds.get(roomId);
+    if (ids) {
+      ids.delete(userId);
+      if (ids.size === 0) roomUserIds.delete(roomId);
+    }
+  }
+  return !stillThere;
+}
+
+/** 房间内当前的不同用户数（管理员隐身，不计入） */
+export function roomDistinctUserCount(roomId: string): number {
+  return roomUserIds.get(roomId)?.size || 0;
+}
+
+/**
+ * 【BUG-02 修复】该用户在本房间是否还有**其他** socket 在线（多标签页）。
+ *
+ * 供 HTTP /leave 复用：客户端调 /leave 时它自己的 socket 通常还连着，
+ * 因此不能用「集合里还有没有这个用户」来判（会恒为真），必须排除已知的 socketId。
+ *
+ * @param exceptSocketId 调用方自身的 socketId（未知时传 null，则任意一个在线即算）
+ */
+export function userHasOtherSocketInRoom(
+  roomId: string,
+  userId: string,
+  exceptSocketId: string | null = null
+): boolean {
+  if (!userId) return false;
+  const sids = roomUsers.get(roomId);
+  if (!sids) return false;
+  let found = false;
+  for (const sid of Array.from(sids)) {
+    const s = ioRef?.sockets?.sockets?.get(sid) as AuthenticatedSocket | undefined;
+    if (!s) {
+      // 幽灵 id（socket 已不存在）：清除，且绝不能算作「另一个标签页」
+      sids.delete(sid);
+      continue;
+    }
+    if (sid !== exceptSocketId && s.userId === userId) found = true;
+  }
+  if (sids.size === 0) {
+    roomUsers.delete(roomId);
+    roomUserIds.delete(roomId);
+  }
+  return found;
+}
+
+/** 供 HTTP /leave 复用：把指定 socket 真正移出房间（含成员行、user-left 广播、
+ *  房主宽限/解散判定）。返回是否找到了该 socket。 */
+export async function leaveRoomBySocketId(roomId: string, socketId: string): Promise<boolean> {
+  const s = ioRef?.sockets?.sockets?.get(socketId) as AuthenticatedSocket | undefined;
+  if (!s) return false;
+  const io = ioRef!;
+  // 手动离开（voluntary=true）：房主此时应彻底解散而非进入宽限期
+  await leaveRoom(s, roomId, io, true);
+  return true;
+}
+
+/** 供 HTTP /leave 复用：通知房间内其他人该用户已离开 */
+export function emitUserLeftForSocket(roomId: string, socketId: string): void {
+  const s = ioRef?.sockets?.sockets?.get(socketId) as AuthenticatedSocket | undefined;
+  if (!s) return;
+  s.to(roomId).emit('user-left', {
+    userId: s.userId,
+    username: s.username,
+    nickname: s.nickname,
+    socketId: s.id,
+  });
+}
+
+/**
+ * 【BUG-01 修复】判断「当前是否还有别的服务实例在跑」。
+ *
+ * 判定依据：service_instances 表里存在**其他**行，且其 heartbeatAt 足够新
+ * （在 INSTANCE_STALE_MS 之内）。心跳由每个实例每 15 秒更新一次。
+ *
+ * 为什么必须落库而不是用进程内变量：这段判断发生在**进程启动时**，
+ * 要回答的正是「上一次运行的实例是否还活着」——重启后进程内变量必然是空的，
+ * 唯有持久化的心跳能区分「单实例重启（旧实例已死）」与「多副本并存（旧实例仍活着）」。
+ */
+const INSTANCE_STALE_MS = 45 * 1000; // 45s 内无心跳视为已死（心跳间隔 15s，留 3 倍余量）
+
+async function hasOtherLiveInstance(): Promise<boolean> {
+  try {
+    const alive = await prisma.serviceInstance.findFirst({
+      where: {
+        id: { not: currentInstanceId },
+        heartbeatAt: { gte: new Date(Date.now() - INSTANCE_STALE_MS) }
+      },
+      select: { id: true }
+    });
+    return !!alive;
+  } catch (error) {
+    // 查询失败时保守处理：按「有别的实例」对待，宁可不清成员行（残留只是占名额，
+    // 而误删会把正在观影的人踢出名单）
+    console.error('检查其他服务实例失败（按「存在其他实例」保守处理）:', error);
+    return true;
+  }
+}
+
+/** 本进程的实例 id（启动时生成一次，用于心跳表与自身排除） */
+const currentInstanceId = `inst-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+let instanceHeartbeatTimer: NodeJS.Timeout | null = null;
+
+/** 注册本实例并开始心跳（幂等） */
+async function registerInstance(): Promise<void> {
+  try {
+    await prisma.serviceInstance.upsert({
+      where: { id: currentInstanceId },
+      create: { id: currentInstanceId },
+      update: { heartbeatAt: new Date() }
+    });
+    // 顺手清理早已死掉的历史实例行，避免表无限增长
+    await prisma.serviceInstance.deleteMany({
+      where: { heartbeatAt: { lt: new Date(Date.now() - 24 * 60 * 60 * 1000) } }
+    });
+  } catch (error) {
+    console.error('注册服务实例心跳失败（不影响主流程）:', error);
+  }
+}
+
 export function setupSocketHandlers(io: Server) {
   ioRef = io;
 
-  // 【P2】启动即回收上次运行残留的成员行（不 await，避免阻塞连接建立）
-  void reapStaleRoomMembers();
+  // 【BUG-01】先注册本实例心跳，再据此决定启动清理的范围。
+  // 注册与清理必须串行：清理要用到「是否还有其他活跃实例」这一判断结果。
+  void (async () => {
+    await registerInstance();
 
-  // 【公共房间需求】启动即清理宽限期已过的放映位（上次运行残留的「放映中」不应继续占位），
-  // 之后每 30 秒巡检一次：放映人掉线超 3 分钟未回，就把通道释放回「未设密码」状态。
-  void reapScreeningHosts();
+    const multiInstance = await hasOtherLiveInstance();
+    if (multiInstance) {
+      // 多副本并存：绝不能做全表清理，否则会把其他副本上正在观影的用户删掉
+      console.warn(
+        '⚠️ 检测到其他活跃服务实例：跳过房间成员行的启动清理。' +
+        '（多副本部署时全表清理会误删其他实例上正在观看的用户）'
+      );
+      console.warn(
+        '⚠️ 注意：本项目的 Socket.IO 使用内存适配器、状态保存在进程内，' +
+        '多副本下观众收不到跨副本的进度/语音/成员事件；数据库为 SQLite，' +
+        '并发写入也存在锁冲突风险。多副本部署需先完成状态外置与数据库替换。'
+      );
+    } else {
+      void reapStaleRoomMembers();
+      void reapScreeningHosts();
+    }
+
+    if (!instanceHeartbeatTimer) {
+      instanceHeartbeatTimer = setInterval(() => { void registerInstance(); }, 15 * 1000);
+      instanceHeartbeatTimer.unref?.();
+    }
+  })();
+
+  // 【公共房间需求】放映位巡检：每 30 秒一次，把宽限期已过的放映位释放。
+  // 之所以放在这里（而不是上面那个 async 块里）：
+  //   1) 巡检必须持续运行，与「启动清理是否执行」无关；
+  //   2) 启动时的一次性清理已在上面的多实例判断之后执行，不要重复。
   if (!screeningReaperTimer) {
     screeningReaperTimer = setInterval(() => { void reapScreeningHosts(); }, 30 * 1000);
     // 不阻止进程退出（pm2 restart / 测试脚本结束时能正常收尾）
@@ -318,8 +548,16 @@ export function setupSocketHandlers(io: Server) {
         });
 
         if (!member) {
-          socket.emit('error', { message: '你不在该房间中' });
-          return;
+          // 【BUG-02 修复】该用户本房间可能已经在线（另一个标签页仍是成员行）。
+          // 之前的顺序会让第二个标签页在这里被拒；而 BUG-02 修复后成员行只在
+          // 「该用户最后一个 socket 离开」时才删，这里再补一道兜底：
+          // 只要该用户在本房间仍有活跃 socket，就允许其加入，不依赖成员行。
+          const onlineUserIds = roomUserIds.get(roomIdStr);
+          const userAlreadyOnline = !!socket.userId && !!onlineUserIds?.has(socket.userId);
+          if (!userAlreadyOnline) {
+            socket.emit('error', { message: '你不在该房间中' });
+            return;
+          }
         }
 
         // 离开之前的房间
@@ -341,6 +579,16 @@ export function setupSocketHandlers(io: Server) {
         // 与 user-joined 广播上。
         const isAdmin = socket.isAdmin === true;
 
+        // 【BUG-03 修复】同一 socket 重复 join-room 时不再重复广播 user-joined。
+        //
+        // 触发场景：前端在 socket 已连接时会「补发一次 join-room」（房主切页回来复用
+        // 已连接的持久 socket，见 RoomView 的 setupWebSocket），
+        // 于是同一 socket 会把 user-joined 重复广播给房间内其他人 ——
+        // 别人反复看到「同一个人加入」，也可能重复触发建连逻辑。
+        // 这里记住「本次之前是否已在该房间」，只对**首次**加入广播。
+        // 注意仍然要下发 room-joined 快照：补发 join-room 的目的正是为了拿最新播放状态。
+        const alreadyInThisRoom = userRooms.get(socket.id) === roomIdStr;
+
         userRooms.set(socket.id, roomIdStr);
 
         if (!isAdmin) {
@@ -348,14 +596,18 @@ export function setupSocketHandlers(io: Server) {
             roomUsers.set(roomIdStr, new Set());
           }
           roomUsers.get(roomIdStr)!.add(socket.id);
+          // 用户维度去重登记（多标签页只算一个用户）
+          trackUserSocket(roomIdStr, socket.userId);
 
-          // 通知房间内其他用户
-          socket.to(roomIdStr).emit('user-joined', {
-            userId: socket.userId,
-            username: socket.username,
-            nickname: socket.nickname,
-            socketId: socket.id
-          });
+          // 通知房间内其他用户（仅首次加入时广播）
+          if (!alreadyInThisRoom) {
+            socket.to(roomIdStr).emit('user-joined', {
+              userId: socket.userId,
+              username: socket.username,
+              nickname: socket.nickname,
+              socketId: socket.id
+            });
+          }
         }
 
         // 发送当前房间内的用户列表给新加入的用户
@@ -429,7 +681,7 @@ export function setupSocketHandlers(io: Server) {
         socket.emit('room-joined', {
           roomId: roomIdStr,
           users: usersInRoom,
-          userCount: roomUsers.get(roomIdStr)?.size || 0,
+          userCount: roomDistinctUserCount(roomIdStr),
           selfSocketId: socket.id,
           playbackState,
           savedSource,
@@ -924,8 +1176,7 @@ export function setupSocketHandlers(io: Server) {
     socket.on('leave-room', (roomId: unknown) => {
       if (!requireInRoom(socket, roomId)) return;
       leaveRoom(socket, roomId, io, true);
-    });
-  });
+    });  });
 }
 
 /**
@@ -979,7 +1230,16 @@ async function applyKick(
 async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server, voluntary = false) {
   socket.leave(roomId);
 
-  // 【P2 修复】释放数据库成员行。
+  // 【BUG-02 修复】先判断「这是不是该用户在本房间的最后一个 socket」，再决定是否真正离开。
+  //
+  // 旧实现无条件按 (roomId, userId) 删成员行，而同一账号开两个标签页时两行合一
+  // （unique(roomId,userId)，第二个标签页 /join 返回 alreadyMember）。
+  // 于是**任一标签页离开就把整个用户删掉**：大厅人数少 1、凭空腾出一个名额，
+  // 而另一个标签页其实还在房间里（信令层 roomUsers 仍有它）。
+  // 现在改为：只有当该用户在本房间再无其他 socket 时，才删除成员行并广播 user-left。
+  const isLastUserSocket = untrackUserSocket(roomId, socket.id, socket.userId);
+
+  // 【P2】释放数据库成员行（仅在最后一个人离开时）。
   //
   // 旧实现只清理内存映射，**从不删除 room_members 行**。成员行仅在「房主主动离开 /
   // 被踢 / 房间解散」时被删，因此普通观众关闭页面、断网、服务重启后行会永久残留，
@@ -990,11 +1250,15 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   // 这里在离开/断连时删除该用户的成员行，使「成员行 == 当前真正在房间内的人」。
   // 注意：房主行同样删除；房主刷新页面会在宽限期内重新 join-room 并重新插入，
   // 而房间解散判定（dissolveRoom）本身是按 roomId 删除全部剩余行的，不受影响。
-  try {
-    await prisma.roomMember.deleteMany({ where: { roomId, userId: socket.userId } });
-  } catch (error) {
-    // 删除失败会导致名额泄漏，必须留下日志便于排查
-    console.error(`释放房间成员行失败（roomId=${roomId}）:`, error);
+  if (isLastUserSocket) {
+    try {
+      await prisma.roomMember.deleteMany({ where: { roomId, userId: socket.userId } });
+    } catch (error) {
+      // 删除失败会导致名额泄漏，必须留下日志便于排查
+      console.error(`释放房间成员行失败（roomId=${roomId}）:`, error);
+    }
+  } else {
+    dbg(`${socket.username} 仍有其他标签页在房间 ${roomId}，保留成员行`);
   }
 
   // 语音状态与内存名单一并复位（原先依赖 voiceStates 在 911 行被删，
@@ -1022,8 +1286,15 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
     if (room && isPublic) {
       // 放映人掉线只记宽限截止时间（3 分钟内连回来仍是放映人）；
       // 若掉线的不是放映人，markScreeningGrace 内部会自行忽略。
-      await markScreeningGrace(roomId, socket.userId!);
-    } else if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
+      // 注意同样是「最后一个 socket」才记宽限：房主/放映人开着两个标签页时，
+      // 关掉其中一个不应让别人以为放映人掉线了。
+      if (isLastUserSocket) {
+        await markScreeningGrace(roomId, socket.userId!);
+      }
+    } else if (isLastUserSocket && room && room.status === 'PLAYING' && room.hostId === socket.userId) {
+      // 【BUG-02 修复】房主的宽限/解散判定也必须以「最后一个 socket 离开」为准。
+      // 否则房主开两个标签页时，关掉一个就会走「房主断线 → 宽限期 → 解散房间」，
+      // 而房主其实还在另一个标签页里看 —— 整场放映会被误解散。
       if (voluntary) {
         // 放映途中房主主动解散（HTTP 接口已放行房主随时解散，此处为 socket 兜底）：直接解散
         await dissolveRoom(roomId, { io }).catch(() => {});
@@ -1032,7 +1303,7 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
         hostAbrupt = true;
         scheduleHostLeave(roomId, io, socket.userId!, 'abrupt');
       }
-    } else if (room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
+    } else if (isLastUserSocket && room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
       if (voluntary) {
         // 房主主动退出（含放映已结束的房间）：彻底解散并清除房间，不留历史记录
         await dissolveRoom(roomId, { io }).catch(() => {});
@@ -1046,9 +1317,11 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   }
 
   if (roomUsers.has(roomId)) {
-    roomUsers.get(roomId)!.delete(socket.id);
-    if (roomUsers.get(roomId)!.size === 0) {
+    const sids = roomUsers.get(roomId)!;
+    sids.delete(socket.id);
+    if (sids.size === 0) {
       roomUsers.delete(roomId);
+      roomUserIds.delete(roomId);
       // 【需求1】此处**不再**清空播放状态缓存。
       // 旧实现在房间内人数归零时 delete，导致房主刷新页面的那一瞬间（房间只剩他一人）
       // 播放源就被丢弃，新观众加入后拿不到直链。播放源只在房主「结束放映」
@@ -1063,7 +1336,11 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   lastSpeakingAt.delete(socket.id);
 
   // 通知房间内其他用户（管理员隐身，不广播 user-left，与其从未广播 user-joined 对称）
-  if (!socket.isAdmin) {
+  //
+  // 【BUG-02 修复】仅当该用户在本房间**已无其他 socket** 时才广播 user-left。
+  // 否则一个标签页离开会让所有人以为这个用户离线了（成员栏少人、说话标记消失），
+  // 而他在另一个标签页里其实还在看。
+  if (!socket.isAdmin && isLastUserSocket) {
     socket.to(roomId).emit('user-left', {
       userId: socket.userId,
       username: socket.username,
@@ -1092,6 +1369,7 @@ export function purgeRoomSignalingState(roomId: string): void {
     }
   }
   roomUsers.delete(roomId);
+  roomUserIds.delete(roomId);
   kickQuotaUsed.delete(roomId);
   roomPlaybackStates.delete(roomId);
   lastPositionPersistAt.delete(roomId);

@@ -27,7 +27,8 @@
     "verify:voice-isolation": "node scripts/verify-voice-isolation.js",
     "verify:public-room": "node scripts/verify-public-room.js",
     "verify:public-room-ui": "node scripts/verify-public-room-ui.js",
-    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation && npm run verify:public-room"
+    "verify:multitab": "node scripts/verify-multitab.js",
+    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation && npm run verify:public-room && npm run verify:multitab"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

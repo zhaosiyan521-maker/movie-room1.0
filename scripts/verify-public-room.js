@@ -182,9 +182,20 @@ const { check, skipCheck, report } = checker;
       `error=${aliceHostError}`);
 
     // 放映人不能解散房间：HTTP leave 走 canDissolve 判定，房间应当仍存在
+    //
+    // 真实前端的退出顺序（见 RoomView.leaveRoom）：
+    //   1) emit('leave-room')  2) 断开 socket  3) POST /leave（带上自己的 socketId）
+    // 这里照做。BUG-02 修复后，只要调用者的 socket 仍在房间，
+    // /leave 会判定「还有别的标签页」而保留席位，只调 HTTP 测不到解散逻辑。
+    const aliceSocketId = aliceSock.id;
+    aliceSock.emit('leave-room', pubRoom.id);
+    await sleep(400);
+    aliceSock.close();
+    await sleep(400);
     const aliceLeave = await fetch(`${BASE}/api/rooms/${pubRoom.id}/leave`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...aliceHeaders },
+      body: JSON.stringify({ socketId: aliceSocketId }),
     });
     const leaveBody = await aliceLeave.json().catch(() => ({}));
     const stillThere = await prisma.room.findUnique({ where: { id: pubRoom.id }, select: { id: true } });

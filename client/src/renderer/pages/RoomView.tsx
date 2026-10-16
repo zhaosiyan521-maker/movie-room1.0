@@ -2836,6 +2836,13 @@ export default function RoomView() {
     if (socketRef.current) {
       socketRef.current.emit('leave-room', id);
     }
+    // 【BUG-02 修复】必须在 cleanupAll 断开连接**之前**记下自己的 socketId。
+    // 服务端要用它来排除「调用者自己」，从而判断该用户是否还有别的标签页在房间
+    // （还有 → 保留成员行，不广播 user-left）。
+    // 一旦 cleanupAll 把 socket 断掉，服务端 session 映射里就查不到这个 id 了，
+    // 于是会把「自己」当成另一个标签页，成员行永远删不掉。
+    const mySocketId = socketRef.current?.id ?? null;
+
     // 房主主动离开：彻底销毁推流会话（socket + 本地视频 + WebRTC peers + captureStream）。
     // 注意顺序：先 emit leave-room 再销毁，确保服务端收到离开信号。
     if (isHost) {
@@ -2845,7 +2852,7 @@ export default function RoomView() {
     cleanupAll(true);
 
     try {
-      await api.post(`/rooms/${id}/leave`);
+      await api.post(`/rooms/${id}/leave`, mySocketId ? { socketId: mySocketId } : undefined);
     } catch (error: any) {
       console.error('离开房间失败:', error);
       // 【M7-1】失败也必须离开本页。

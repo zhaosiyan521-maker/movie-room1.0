@@ -5,7 +5,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { prisma } from '../config/database';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { dissolveRoom } from '../services/roomDissolve';
-import { getIO, KICK_BAN_DURATION_MS } from '../services/signaling';
+import {
+  getIO,
+  KICK_BAN_DURATION_MS,
+  // 【BUG-02 修复】判断该用户是否还有别的标签页在房间内（决定是否真的离开）
+  userHasOtherSocketInRoom,
+  leaveRoomBySocketId,
+  emitUserLeftForSocket,
+} from '../services/signaling';
 import { UPLOAD_DIR, safeUploadFilename, deleteUnreferencedImages } from '../services/roomImages';
 import { claimScreening, canScreen, canDissolve, hasEditedThisSession, markRoomEdited, isPublicRoom, getActiveScreeningHost, releaseScreening } from '../services/roomAccess';
 
@@ -13,6 +20,19 @@ export const roomRouter = Router();
 
 // 所有房间路由都需要认证
 roomRouter.use(authMiddleware);
+
+// 【BUG-02 修复】JSON body 解析放在**路由器级**，而不是逐路由挂载。
+//
+// 本项目没有全局 express.json()，其它路由文件（admin/auth/user）都用了
+// `router.use(express.json())`，只有本文件是逐路由手写 —— 于是新增/修改路由时
+// 极容易漏掉。实测踩坑：/leave 漏了 express.json()，导致 req.body 恒为 undefined，
+// 客户端传的 socketId 根本读不到，「该用户是否还有别的标签页」永远判不出来，
+// 多标签页保护整体失效（且不报错，只是静默不生效，非常难发现）。
+//
+// 放在这里后：任何本文件下的写路由都会自动解析 JSON。
+// 注意 / 与 /:id/images 上的 express.json({ limit: '20mb' }) 仍然保留 ——
+// 它们需要更大的体积上限（房间图片），路由器级这里是默认 100kb。
+roomRouter.use(express.json());
 
 const MAX_IMAGES = 5;
 
@@ -679,7 +699,14 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
     const roomId = req.params.id;
     const userId = req.user!.id;
 
-    // 检查是否在房间中
+    // 检查是否在房间中。
+    //
+    // 【BUG-02 修复】这里不再直接 400。
+    //
+    // 客户端退出顺序是「emit leave-room → 断开 socket → POST /leave」，而服务端在
+    // 断开时（handleDisconnect → leaveRoom）就已经把成员行删掉了。于是 /leave 到达时
+    // 成员行往往已不存在，旧写法会回 400「你不在该房间中」—— 对用户而言这明明是成功退出，
+    // 却收到一个错误。既然「不在房间」与「已离开」是同一个终态，这里按幂等成功处理。
     const member = await prisma.roomMember.findUnique({
       where: {
         roomId_userId: { roomId, userId }
@@ -687,7 +714,16 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
     });
 
     if (!member) {
-      return res.status(400).json({ error: '你不在该房间中' });
+      // 放映人若已由断开路径释放过，这里 releaseScreening 是幂等的空操作；
+      // 若还没释放（socket 先断、行已被删但放映位仍在宽限期），这里立即释放，
+      // 避免「主动退出后还要等 3 分钟宽限」。
+      if (await isPublicRoom(roomId)) {
+        const activeHost = await getActiveScreeningHost(roomId);
+        if (activeHost === userId) {
+          await releaseScreening(roomId);
+        }
+      }
+      return res.json({ message: '已离开房间', alreadyLeft: true });
     }
 
     // 解散房间的判定：**只有真实房主或管理员**（canDissolve）。
@@ -707,6 +743,43 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
       return res.json({ message: '房间已解散' });
     }
 
+    // 【BUG-02 修复】同一账号可能开着多个标签页，而成员行是「用户」维度的（一行）。
+    //
+    // 关键顺序问题：客户端是「先 emit leave-room、再断开、最后 POST /leave」，
+    // 因此到这里时调用者的 socket 往往已经不在映射里了。不能用「映射里还能不能查到它」
+    // 来判断，否则会把「自己已消失」误当成「还有别的标签页」，导致成员行永远删不掉。
+    //
+    // 因此改为两段式：
+    //   1) 若**确实还有别的** socket 属于该用户 → 保留席位，直接返回；
+    //   2) 否则把这个 socket 真正移出房间（走 leaveRoom：删成员行 + 广播 user-left +
+    //      房主宽限/解散判定），socket 已消失时退化为直接删行。
+    const callerSocketId = (typeof req.body?.socketId === 'string' ? req.body.socketId : null);
+
+    const othersPresent = userHasOtherSocketInRoom(roomId, userId, callerSocketId);
+    if (othersPresent) {
+      // 仍有别的标签页：保留席位，不删成员行、不广播 user-left。
+      // 但放映位要照常释放 —— 放映人主动退出就该让出通道，与标签页数量无关。
+      if (await isPublicRoom(roomId)) {
+        const activeHost = await getActiveScreeningHost(roomId);
+        if (activeHost === userId) {
+          await releaseScreening(roomId);
+        }
+      }
+      return res.json({ message: '仍在其他标签页中，已保留房间席位', keptMembership: true });
+    }
+
+    // 让信令层执行完整离开（它在「该用户已无其他 socket」时才删成员行并广播）
+    const leftViaSignaling = callerSocketId
+      ? await leaveRoomBySocketId(roomId, callerSocketId)
+      : false;
+
+    if (!leftViaSignaling) {
+      // socket 已断开（或客户端没带 socketId）：信令层无从处理，这里直接收尾。
+      // 幂等：即使行已不存在也不会报错。
+      await prisma.roomMember.deleteMany({ where: { roomId, userId } });
+      if (callerSocketId) emitUserLeftForSocket(roomId, callerSocketId);
+    }
+
     // 【公共房间需求】放映人主动「退出房间」时，**立即**释放放映位。
     //
     // 为什么必须在这里做：公开的退出路径是「客户端先调本接口，再断开 socket」。
@@ -720,11 +793,6 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
         await releaseScreening(roomId);
       }
     }
-
-    // 普通成员离开
-    await prisma.roomMember.delete({
-      where: { id: member.id }
-    });
 
     res.json({ message: '已离开房间' });
   } catch (error) {
