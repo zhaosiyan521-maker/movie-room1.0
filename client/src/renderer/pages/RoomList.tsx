@@ -461,7 +461,10 @@ export default function RoomList() {
             {!pickerRoom.isScreeningHost && (
               <button
                 className="btn btn-primary btn-block screening-option"
-                onClick={() => navigate(`/room/${pickerRoom.id}`)}
+                /* 带上 autoJoin 意图：用户在弹窗里已经明确点了「加入房间」，
+                   房间页不应再渲染一次同样三个按钮的加入卡片让他点第二遍
+                   （那会让用户以为"又弹出了加入房间弹窗"）。 */
+                onClick={() => navigate(`/room/${pickerRoom.id}`, { state: { autoJoin: true } })}
               >
                 加入房间
               </button>

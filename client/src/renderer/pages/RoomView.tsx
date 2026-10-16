@@ -1,5 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, useAuthStore } from '../store/authStore';
 import { getAbsoluteApiBase, toProxiedUrl } from '../store/apiBase';
 import { getOrCreateHostSession, getHostSession, destroyHostSession, HostSession } from '../store/hostStreaming';
@@ -214,6 +214,7 @@ function avatarColor(userId: string): string {
 
 export default function RoomView() {
   const { id } = useParams<{ id: string }>();
+  const location = useLocation();
   const navigate = useNavigate();
   const { user, fetchUser } = useAuthStore();
 
@@ -821,6 +822,23 @@ export default function RoomView() {
       setIsHost(hostFlag);
       setCanDissolve(room.canDissolve === true || room.hostId === user.id);
       const alreadyMember = room.members.some(m => m.user.id === user.id);
+
+      // 【bugfix】大厅弹窗里点过「加入房间」→ 这里静默完成加入，不再让用户点第二遍。
+      // 现象：从大厅弹窗点「加入房间」跳转过来后，本页又渲染一次同样三个按钮的加入卡片，
+      // 看起来就像"又弹出了加入房间弹窗"，用户必须再点一次才能进房。
+      // 手动刷新（无该 state）或直接输 URL 时不自动加入，避免在用户没表达意图时发生 403。
+      const intentAutoJoin = (location.state as any)?.autoJoin === true;
+      if (intentAutoJoin) {
+        // 清掉该 state，避免后续 re-render / 刷新重复触发
+        navigate('.', { replace: true, state: {} });
+      }
+
+      if (intentAutoJoin && !alreadyMember) {
+        // 房间若设了密码而该用户无权跳过，doJoin 会失败并展示错误卡片（那是正确的下一步引导）
+        doJoin(undefined, alreadyMember);
+        return;
+      }
+
       if (alreadyMember) {
         doJoin(undefined, true, room.isScreeningHost ? 'screening' : undefined);
       } else if (room.isScreeningHost) {

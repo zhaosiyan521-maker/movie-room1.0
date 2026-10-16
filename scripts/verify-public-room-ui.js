@@ -45,6 +45,8 @@ const SECRET = env.match(/JWT_SECRET="?([^"\r\n]+)"?/)[1].trim();
 const sign = (u) => jwt.sign({ userId: u.id, tv: u.tokenVersion }, SECRET, { expiresIn: '1h' });
 
 let pass = 0, fail = 0;
+/** 【bugfix 回归】为了复现「大厅点加入房间后又出现加入卡片」，临时创建的全新用户 id */
+let freshUserId = null;
 const chk = (m, cond, extra = '') => {
   if (cond) { console.log('  ✅ ' + m); pass++; }
   else { console.log('  ❌ ' + m + (extra ? ' → ' + extra : '')); fail++; }
@@ -288,6 +290,76 @@ const has = (text, s) => (text || '').includes(s);
       !afterClaimButtons.includes('加入房间') && afterClaimButtons.includes('放映通道'),
       `buttons=${JSON.stringify(afterClaimButtons)}`);
 
+    // ---- 【bugfix 回归】大厅弹窗点「加入房间」→ 必须直达观影界面，不得再出现加入卡片 ----
+    // 原缺陷：从大厅弹窗点「加入房间」只是 navigate，房间页又渲染一次同样三个按钮的加入卡片
+    // （房名 + 房主/观众 + 加入房间/放映通道/返回列表），看起来像"又弹出了加入房间弹窗"，
+    // 用户必须再点一次才能进房。
+    // 用**全新用户**（还不是成员、也不是放映人）复现 —— 放在最后执行，
+    // 因为它会切换登录身份并离开当前页面，不能打断前面的弹窗断言。
+    {
+      const freshName = 'uifresh' + String(Date.now()).slice(-5);
+      const freshUser = await prisma.user.create({
+        data: {
+          username: freshName,
+          email: freshName + '@e.com',
+          passwordHash: await bcrypt.hash('probe12345', 10),
+          nickname: 'UIFRESH',
+        },
+      });
+      freshUserId = freshUser.id;
+
+      // 先把该房间的放映密码清掉（前面的用例已把它用掉），确保不影响本场景
+      await fetch(`${API}/api/admin/public-rooms/${roomId}/screening-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + adminToken },
+        body: JSON.stringify({ password: null }),
+      });
+
+      await send('Page.addScriptToEvaluateOnNewDocument', {
+        source: `try{localStorage.setItem('token', ${JSON.stringify(sign(freshUser))});}catch(e){}`
+      });
+      await send('Page.navigate', { url: `${PAGE}/` });
+      await sleep(7000);
+      await evalJs(`(() => { const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').trim()==='先用用看'); if(b)b.click(); return 'ok'; })()`);
+      await sleep(800);
+      await evalJs(`(() => { const c=document.querySelector('.room-card-public'); if(c)c.click(); return 'ok'; })()`);
+      await sleep(1200);
+      const clickedJoin = await evalJs(`
+        (() => {
+          const el = document.querySelector('.screening-picker');
+          if (!el) return 'no-picker';
+          const b = [...el.querySelectorAll('button')].find(x => (x.innerText||'').trim() === '加入房间');
+          if (!b) return 'no-button';
+          b.click();
+          return 'clicked';
+        })()
+      `);
+      chk('全新用户：大厅弹窗里点得到「加入房间」', clickedJoin === 'clicked', `result=${clickedJoin}`);
+
+      await sleep(4000);
+      const after = JSON.parse(await evalJs(`
+        (() => {
+          const jc = document.querySelector('.join-room-card');
+          return JSON.stringify({
+            path: location.pathname,
+            onRoomPage: location.pathname.startsWith('/room/'),
+            joinCard: !!jc,
+            joinCardBtns: jc ? [...jc.querySelectorAll('button')].map(b => (b.innerText||'').trim()) : [],
+            viewing: !!document.querySelector('.viewing-room'),
+          });
+        })()
+      `));
+      chk('点「加入房间」后已跳到房间页', after.onRoomPage === true, `path=${after.path}`);
+      chk('**不再出现第二次「加入房间」卡片**（修复要点）', after.joinCard === false,
+        `joinCardBtns=${JSON.stringify(after.joinCardBtns)}`);
+      chk('直接进入观影界面（无需再点一次）', after.viewing === true);
+
+      const memberRow = await prisma.roomMember.findUnique({
+        where: { roomId_userId: { roomId, userId: freshUser.id } },
+      });
+      chk('服务端已产生该用户的成员行', !!memberRow);
+    }
+
     try { ws.close(); } catch { /* ignore */ }
   } finally {
     try { proxy?.kill(); } catch { /* ignore */ }
@@ -300,7 +372,7 @@ const has = (text, s) => (text || '').includes(s);
       await prisma.roomBan.deleteMany({ where: { roomId } });
       await prisma.room.delete({ where: { id: roomId } }).catch(() => {});
     }
-    await prisma.user.deleteMany({ where: { id: { in: [admin.id, user.id] } } });
+    await prisma.user.deleteMany({ where: { id: { in: [admin.id, user.id, ...(freshUserId ? [freshUserId] : [])] } } });
     await prisma.$disconnect();
   }
 
