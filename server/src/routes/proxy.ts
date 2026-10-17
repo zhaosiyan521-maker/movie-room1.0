@@ -659,15 +659,30 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
     // 注意：Node 20 没有全局 WebSocket（本地用 Node 24 开发没暴露这个问题，
     // 部署到服务器的 Node 20 后 sniffWithBrowser 直接 ReferenceError）。
     // 这里用 undici 的 WebSocket（项目已有该依赖），不额外引入 ws。
+    // 关键：undici WebSocket 用 addEventListener 语义（属性赋值 onopen/onmessage
+    // 在 undici 下不可靠），且 ev.data 可能是字符串或 Blob，需归一化。
     const ws = new UndiciWebSocket(target.webSocketDebuggerUrl);
-    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+    const wsDataToString = (d: any): string => {
+      if (typeof d === 'string') return d;
+      if (d && typeof d.text === 'function') return ''; // Blob：异步，CDP 场景不会出现
+      return String(d ?? '');
+    };
+
+    await new Promise<void>((res, rej) => {
+      const t = setTimeout(() => rej(new Error('CDP 连接超时')), 10_000);
+      ws.addEventListener('open', () => { clearTimeout(t); res(); });
+      ws.addEventListener('error', (e: any) => { clearTimeout(t); rej(new Error('CDP 连接失败: ' + (e?.message || 'unknown'))); });
+    });
 
     let id = 0;
     const pending = new Map<number, (v: any) => void>();
     let sendFn: (method: string, params?: any) => Promise<any>;
 
-    ws.onmessage = (ev: any) => {
-      const m = JSON.parse(ev.data as string);
+    ws.addEventListener('message', (ev: any) => {
+      const raw = wsDataToString(ev.data);
+      if (!raw) return;
+      let m: any;
+      try { m = JSON.parse(raw); } catch { return; }
       if (m.id && pending.has(m.id)) {
         pending.get(m.id)!(m);
         pending.delete(m.id);
@@ -691,21 +706,33 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
           })
           .catch(() => { /* 流式媒体等拿不到 body 的正常失败 */ });
       }
-    };
+    });
 
     sendFn = (method: string, params: any = {}) =>
-      new Promise((res) => {
+      new Promise((res, rej) => {
         const i = ++id;
         pending.set(i, res);
-        ws.send(JSON.stringify({ id: i, method, params }));
+        try {
+          ws.send(JSON.stringify({ id: i, method, params }));
+        } catch (e) {
+          pending.delete(i);
+          rej(e);
+        }
+        // 单条命令 10s 超时保护，避免某条 CDP 命令挂死整个嗅探
+        setTimeout(() => {
+          if (pending.has(i)) { pending.delete(i); rej(new Error('CDP 命令超时')); }
+        }, 10_000);
       });
 
-    await sendFn('Network.enable');
-    await sendFn('Page.enable');
-    await sendFn('Runtime.enable');
-
-    // 导航到目标页
-    await sendFn('Page.navigate', { url: startUrl });
+    try {
+      await sendFn('Network.enable');
+      await sendFn('Page.enable');
+      await sendFn('Runtime.enable');
+      await sendFn('Page.navigate', { url: startUrl });
+    } catch (e) {
+      // CDP 命令失败/超时：不挂死，返回已收集到的（可能为空）
+      console.error('[sniff] CDP 命令失败:', (e as Error)?.message);
+    }
 
     // 观察一段时间（等 JS 执行 + 播放器发起请求/接口响应）
     while (Date.now() < deadline && foundUrls.size === 0) {
