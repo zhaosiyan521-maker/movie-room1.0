@@ -556,6 +556,17 @@ function findBox(buf: Buffer, type: string): Buffer | null {
 }
 
 /**
+ * 「解析页 / 包装地址」：真实地址被塞在查询参数里，形如
+ *   https://www.2222dy.com/jiexi/?url=https://cdn/.../index.m3u8
+ * 结尾看着像直链（能通过扩展名判定），实际返回 HTML，选中必黑屏。
+ *
+ * 这是纯字符串判断，不发请求 —— 放在前面先剔掉，避免为它多花一次网络请求。
+ */
+function isWrapperUrl(u: string): boolean {
+  return /[?&](url|u|v|src|target|link|playurl)=https?(?:%3A|:)/i.test(u);
+}
+
+/**
  * 校验候选地址**真的是媒体**，而不是「长得像直链的网页」。
  *
  * 典型反例（实测）：
@@ -573,7 +584,7 @@ function findBox(buf: Buffer, type: string): Buffer | null {
  */
 async function verifyMediaUrl(url: string, pageUrl?: string): Promise<boolean> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const timer = setTimeout(() => ctrl.abort(), 3000);
   try {
     const parsed = new URL(url);
     // Referer 用**来源页面**的 origin：很多 CDN 的防盗链校验的是页面来源，
@@ -886,7 +897,7 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
   // 输入本身就是媒体直链：**先校验内容确实是媒体**再直接返回。
   // 像 `https://x.com/jiexi/?url=.../index.m3u8` 这种解析页地址结尾也是 .m3u8，
   // 但返回的是 HTML；直接返回会让用户选中后黑屏。校验不通过就继续按页面抓取。
-  if (isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString(), parsed.toString())) {
+  if (!isWrapperUrl(parsed.toString()) && isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString(), parsed.toString())) {
     const d = await probeDuration(parsed.toString());
     return res.json({
       urls: [{ url: parsed.toString(), duration: d }],
@@ -919,12 +930,21 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
       // 媒体请求捕获到，但绝不是可播放的直链）
       .filter((u) => !/\.d\.ts(\?|$)/i.test(u) && isMediaUrl(u))
       .map(async (url) => {
+        // 解析页地址直接剔除：纯字符串判断，不发请求
+        if (isWrapperUrl(url)) return { url, duration: null, ok: false };
+
         const duration = await probeDuration(url);
         // 能算出时长 = 已经确认是媒体，不必再校验；
-        // 算不出时长的（可能是解析页/接口）必须过内容校验，
-        // 否则会把返回 HTML 的「解析页地址」当直链给出去，选中即黑屏。
         if (duration != null) return { url, duration, ok: true };
-        // 用「来源页面」作为 Referer：防盗链 CDN 校验的是页面来源
+
+        // 路径本身就以媒体扩展名结尾 → 可信，不必再花一次请求
+        let pathLikeMedia = false;
+        try {
+          pathLikeMedia = /\.(m3u8?|mp4|flv|mpd|mkv|m4s|ts|webm|mov|avi)$/i.test(new URL(url).pathname);
+        } catch { /* 解析失败按不可信处理 */ }
+        if (pathLikeMedia) return { url, duration, ok: true };
+
+        // 其余（无时长、路径也不像媒体）才做内容校验，避免把能播的链接误杀
         return { url, duration, ok: await verifyMediaUrl(url, parsed.toString()) };
       })
   );
