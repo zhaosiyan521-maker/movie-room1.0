@@ -864,6 +864,47 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
 }
 
 // =====================================================================
+// 直链嗅探：一次请求、立即返回（与加无头浏览器之前的版本一致）
+// =====================================================================
+
+/**
+ * 从页面 HTML/JS 文本中提取媒体直链（.m3u8 / .mp4 / .webm / .flv）。
+ *
+ * 与老版本一致：只认这四种扩展名，查询串原样保留（带签名的直链不受影响）。
+ * 保留两处小改进：
+ *   - 先反解 \uXXXX / \xXX / \/ 等 JS 转义（中文路径才能还原）；
+ *   - 剔除「解析页/包装地址」（?url=http... 这类返回 HTML 的地址），避免选中后黑屏。
+ */
+function extractMediaUrls(html: string, base: URL): string[] {
+  const found = new Set<string>();
+  const unescaped = unescapeJsText(html);
+
+  // 绝对 URL（含查询串），去掉末尾可能的引号/逗号/反斜杠等噪声
+  const absRe = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|webm|flv)(?:\?[^\s"'<>\\]*)?/gi;
+  for (const m of unescaped.match(absRe) || []) {
+    const cleaned = m.replace(/[\\'",;)\]]+$/, '');
+    if (!cleaned || isWrapperUrl(cleaned)) continue;
+    try {
+      const p = new URL(cleaned);
+      if (p.protocol === 'http:' || p.protocol === 'https:') found.add(p.toString());
+    } catch { /* ignore */ }
+  }
+
+  // 引号包裹的路径形式（相对或裸路径），用 base 解析为绝对地址
+  const relRe = /(?:"|')([^"']*?\.(?:m3u8|mp4|webm|flv)(?:\?[^"']*)?)(?:"|')/gi;
+  let mm: RegExpExecArray | null;
+  while ((mm = relRe.exec(unescaped))) {
+    const candidate = mm[1];
+    try {
+      const abs = new URL(candidate, base).toString();
+      if (/^https?:/i.test(abs) && !isWrapperUrl(abs)) found.add(abs);
+    } catch { /* 忽略无法解析的路径 */ }
+  }
+
+  return Array.from(found);
+}
+
+// =====================================================================
 // 嗅探主接口
 // =====================================================================
 proxyRouter.get('/sniff', async (req, res: Response) => {
@@ -894,76 +935,40 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
     return res.status(400).json({ error: '禁止访问内网地址' });
   }
 
-  // 输入本身就是媒体直链：**先校验内容确实是媒体**再直接返回。
-  // 像 `https://x.com/jiexi/?url=.../index.m3u8` 这种解析页地址结尾也是 .m3u8，
-  // 但返回的是 HTML；直接返回会让用户选中后黑屏。校验不通过就继续按页面抓取。
-  if (!isWrapperUrl(parsed.toString()) && isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString(), parsed.toString())) {
-    const d = await probeDuration(parsed.toString());
-    return res.json({
-      urls: [{ url: parsed.toString(), duration: d }],
-      title: '',
-      usedBrowser: false,
-    });
+  // 输入本身就是媒体直链：直接原样返回（与老版本一致）
+  if (/\.(m3u8|mp4|webm|flv)(\?|$)/i.test(parsed.pathname)) {
+    return res.json({ urls: [parsed.toString()], title: '' });
   }
 
-  // 第一档：轻量抓取（主页面 + iframe）
-  const light = await sniffLightweight(parsed.toString());
+  const headers: Record<string, string> = {
+    'User-Agent': BROWSER_UA,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    Referer: parsed.origin + '/',
+  };
 
-  // 第二档：轻量没抓到就上无头浏览器
-  let finalUrls = light.urls;
-  let title = light.title;
-  let usedBrowser = false;
-
-  if (finalUrls.length === 0) {
-    const browser = await sniffWithBrowser(parsed.toString());
-    if (browser.urls.length > 0) {
-      finalUrls = browser.urls;
-      title = browser.title || title;
-      usedBrowser = browser.usedBrowser;
-    }
+  let upstream: Awaited<ReturnType<typeof fetch>>;
+  try {
+    upstream = await fetch(parsed.toString(), {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      dispatcher,
+    } as any);
+  } catch (err) {
+    console.error('[sniff] 抓取失败:', (err as Error)?.message);
+    return res.status(502).json({ error: '无法获取目标页面' });
   }
 
-  // 时长分析（后台并行，单条失败不影响整体）
-  const analysed = await Promise.all(
-    finalUrls
-      // 最后一道兜底过滤：剔除 .d.ts 等静态声明文件（它们在浏览器里会被当作
-      // 媒体请求捕获到，但绝不是可播放的直链）
-      .filter((u) => !/\.d\.ts(\?|$)/i.test(u) && isMediaUrl(u))
-      .map(async (url) => {
-        // 解析页地址直接剔除：纯字符串判断，不发请求
-        if (isWrapperUrl(url)) return { url, duration: null, ok: false };
+  if (!upstream.ok) {
+    return res.status(upstream.status || 502).json({ error: `上游返回 ${upstream.status}` });
+  }
 
-        const duration = await probeDuration(url);
-        // 能算出时长 = 已经确认是媒体，不必再校验；
-        if (duration != null) return { url, duration, ok: true };
+  const html = await upstream.text();
+  const urls = extractMediaUrls(html, parsed);
 
-        // 路径本身就以媒体扩展名结尾 → 可信，不必再花一次请求
-        let pathLikeMedia = false;
-        try {
-          pathLikeMedia = /\.(m3u8?|mp4|flv|mpd|mkv|m4s|ts|webm|mov|avi)$/i.test(new URL(url).pathname);
-        } catch { /* 解析失败按不可信处理 */ }
-        if (pathLikeMedia) return { url, duration, ok: true };
+  let title = '';
+  const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
+  if (titleMatch) title = titleMatch[1].trim();
 
-        // 其余（无时长、路径也不像媒体）才做内容校验，避免把能播的链接误杀
-        return { url, duration, ok: await verifyMediaUrl(url, parsed.toString()) };
-      })
-  );
-
-  // 排序：>15 分钟的排最前（按时长降序），其次是有时长的，最后是未知时长的
-  const MIN_DURATION = 15 * 60;
-  const withDuration = analysed.filter((x) => x.ok);
-  withDuration.sort((a, b) => {
-    const aLong = a.duration != null && a.duration >= MIN_DURATION;
-    const bLong = b.duration != null && b.duration >= MIN_DURATION;
-    if (aLong !== bLong) return aLong ? -1 : 1;
-    const da = a.duration ?? -1;
-    const db = b.duration ?? -1;
-    return db - da;
-  });
-
-  res.json({
-    urls: withDuration.map(({ url, duration }) => ({ url, duration })),
-    title,
-    usedBrowser,
-  });
+  res.json({ urls, title });
 });
