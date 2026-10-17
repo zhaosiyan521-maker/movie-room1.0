@@ -563,15 +563,26 @@ function findBox(buf: Buffer, type: string): Buffer | null {
  * 结尾是 `.m3u8`（因此能通过 isMediaUrl 的扩展名判定），但返回的是 text/html，
  * 客户端按 HLS 解析必然黑屏。这类「解析页地址」不能当直链返回。
  *
- * 放行条件：响应体以 #EXTM3U（HLS 清单）开头、或为 ISO BMFF（mp4 的 ftyp），
- * 或 content-type 是 mpegurl / video/* / audio/* / octet-stream / mp2t。
- * 网络异常、超时一律**放行**：宁可多给一条，也不要因为一次抖动把真链接丢掉。
+ * 判据刻意**只拒绝「明确是网页」的情况**，其余一律放行：
+ *   - 非 2xx（403 防盗链 / 401 / 404 / 5xx）→ 放行（这类链接浏览器里往往能播）；
+ *   - 内容以 #EXTM3U 或 ISO BMFF(ftyp) 开头 → 媒体；
+ *   - content-type 为 mpegurl / video/* / audio/* / octet-stream / mp2t → 媒体；
+ *   - content-type 为 text/html / application/json|xml → 非媒体（解析页）；
+ *   - 其它未知类型 → 放行。
+ * 网络异常、超时同样放行。宁可多给一条，也不能把能播的链接误杀。
  */
-async function verifyMediaUrl(url: string): Promise<boolean> {
+async function verifyMediaUrl(url: string, pageUrl?: string): Promise<boolean> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
   try {
     const parsed = new URL(url);
+    // Referer 用**来源页面**的 origin：很多 CDN 的防盗链校验的是页面来源，
+    // 而不是 CDN 自己的域名。拿不到页面地址时退回 CDN origin。
+    let referer = parsed.origin + '/';
+    try {
+      if (pageUrl) referer = new URL(pageUrl).origin + '/';
+    } catch { /* 用默认值 */ }
+
     const res = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
@@ -579,11 +590,17 @@ async function verifyMediaUrl(url: string): Promise<boolean> {
       headers: {
         'User-Agent': BROWSER_UA,
         Accept: '*/*',
-        Referer: parsed.origin + '/',
+        Referer: referer,
         Range: 'bytes=0-4095',
       },
       dispatcher,
     } as any);
+
+    // 非 2xx：不能据此判死（防盗链、临时过期等），放行
+    if (res.status >= 400) {
+      try { await readHeadBytes(res, 1); } catch { /* ignore */ }
+      return true;
+    }
 
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const head = await readHeadBytes(res, 4096);
@@ -598,12 +615,11 @@ async function verifyMediaUrl(url: string): Promise<boolean> {
     // 2) content-type 明确是媒体
     if (/mpegurl|video\/|audio\/|octet-stream|mp2t/.test(ct)) return true;
 
-    // 3) 明确是网页 / 接口 / 纯文本 → 不是媒体
-    //    （text/plain 的 m3u8 已被上面的 #EXTM3U 内容判定兜住）
-    if (/^text\/html|^application\/(json|xml|xhtml)|^text\/plain/.test(ct)) return false;
+    // 3) 明确是网页 / 接口 → 不是媒体（解析页就是这一类）
+    if (/^text\/html|^application\/(json|xml|xhtml)/.test(ct)) return false;
 
-    // 4) 其余（无 content-type、奇怪的类型）：内容没命中就判否
-    return false;
+    // 4) 其余（无 content-type、未知类型）→ 放行，避免误杀
+    return true;
   } catch {
     return true;
   } finally {
@@ -870,7 +886,7 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
   // 输入本身就是媒体直链：**先校验内容确实是媒体**再直接返回。
   // 像 `https://x.com/jiexi/?url=.../index.m3u8` 这种解析页地址结尾也是 .m3u8，
   // 但返回的是 HTML；直接返回会让用户选中后黑屏。校验不通过就继续按页面抓取。
-  if (isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString())) {
+  if (isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString(), parsed.toString())) {
     const d = await probeDuration(parsed.toString());
     return res.json({
       urls: [{ url: parsed.toString(), duration: d }],
@@ -908,7 +924,8 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
         // 算不出时长的（可能是解析页/接口）必须过内容校验，
         // 否则会把返回 HTML 的「解析页地址」当直链给出去，选中即黑屏。
         if (duration != null) return { url, duration, ok: true };
-        return { url, duration, ok: await verifyMediaUrl(url) };
+        // 用「来源页面」作为 Referer：防盗链 CDN 校验的是页面来源
+        return { url, duration, ok: await verifyMediaUrl(url, parsed.toString()) };
       })
   );
 
