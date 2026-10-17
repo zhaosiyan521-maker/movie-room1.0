@@ -276,7 +276,7 @@ function isMediaUrl(url: string): boolean {
   const ul = u.toLowerCase();
 
   // 拒绝明显是代码碎片/伪 URL 的噪声（含 JS 语句字符、模板、超长拼接等）
-  if (/[\s;{}()<>`=]/.test(u)) return false;
+  if (/[\s;{}()<>`]/.test(u)) return false;
 
   // 明确媒体扩展名 → 一定是媒体（但排除 .d.ts 类型声明文件）
   if (/\.d\.ts(\?|$)/i.test(ul)) return false;
