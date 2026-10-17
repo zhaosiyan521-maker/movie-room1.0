@@ -605,6 +605,25 @@
   -webkit-box-orient: vertical;
 }
 
+/* 直链时长标签：>15 分钟的用醒目色 */
+.sniff-duration {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: rgba(124, 77, 255, 0.1);
+  border: 1px solid rgba(124, 77, 255, 0.2);
+  vertical-align: middle;
+}
+.sniff-duration.long {
+  color: #22c55e;
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.35);
+  font-weight: 600;
+}
+
 .sniff-result-item .btn {
   flex-shrink: 0;
   padding: 6px 12px;

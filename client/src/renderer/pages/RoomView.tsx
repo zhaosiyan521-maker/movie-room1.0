@@ -384,7 +384,8 @@ export default function RoomView() {
   const [sniffError, setSniffError] = useState('');            // 错误提示
   const [showSniffResult, setShowSniffResult] = useState(false); // 结果弹窗
   const [sniffTitle, setSniffTitle] = useState('');            // 页面标题
-  const [sniffUrls, setSniffUrls] = useState<string[]>([]);    // 捕获到的直链列表
+  // 捕获到的直链列表：{ url, duration? }。duration 为秒，由服务端后台分析。
+  const [sniffUrls, setSniffUrls] = useState<{ url: string; duration?: number | null }[]>([]);
   // 已被「选择」设为播放源的那条直链（用于把该行显示为「✅ 已选择」）
   const [selectedSniffUrl, setSelectedSniffUrl] = useState<string | null>(null);
 
@@ -1954,7 +1955,15 @@ export default function RoomView() {
     setSniffLoading(true);
     try {
       const { data } = await api.get('/sniff', { params: { url } });
-      const urls: string[] = Array.isArray(data?.urls) ? data.urls : [];
+      // 服务端返回 { urls: [{url, duration}], title, usedBrowser }
+      const rawUrls: any[] = Array.isArray(data?.urls) ? data.urls : [];
+      const urls = rawUrls.map((u) => {
+        if (typeof u === 'string') return { url: u, duration: null };
+        return {
+          url: typeof u?.url === 'string' ? u.url : '',
+          duration: typeof u?.duration === 'number' ? u.duration : null,
+        };
+      }).filter((u) => u.url);
       setSniffUrls(urls);
       setSniffTitle(typeof data?.title === 'string' ? data.title : '');
       setSelectedSniffUrl(null);
@@ -1971,6 +1980,22 @@ export default function RoomView() {
   const closeSniffResult = () => {
     setShowSniffResult(false);
     setSniffUrls([]);
+  };
+
+  /** 把秒数格式化成可读时长（用于直链列表标签） */
+  const formatDuration = (sec?: number | null): string | null => {
+    if (typeof sec !== 'number' || !Number.isFinite(sec) || sec <= 0) return null;
+    if (sec >= 3600) {
+      const h = Math.floor(sec / 3600);
+      const m = Math.round((sec % 3600) / 60);
+      return m > 0 ? `${h}小时${m}分` : `${h}小时`;
+    }
+    if (sec >= 60) {
+      const m = Math.floor(sec / 60);
+      const s = Math.round(sec % 60);
+      return s > 0 ? `${m}分${s}秒` : `${m}分钟`;
+    }
+    return `${Math.round(sec)}秒`;
   };
 
   /**
@@ -2726,7 +2751,7 @@ export default function RoomView() {
 
   /** 【直链-3】优先使用「🔗 直链获取」抓到的页面标题，否则回落到 URL 推导 */
   const resolveRemoteMovieName = (url: string): string => {
-    if (sniffTitle && sniffUrls.includes(url)) return sniffTitle.slice(0, 200);
+    if (sniffTitle && sniffUrls.some((item) => item.url === url)) return sniffTitle.slice(0, 200);
     return deriveMovieName(url);
   };
 
@@ -3703,18 +3728,30 @@ export default function RoomView() {
                   </p>
                 ) : (
                   <div className="sniff-result-list">
-                    {sniffUrls.map((u, idx) => (
-                      <div className="sniff-result-item" key={u}>
-                        <span className="sniff-index">{idx + 1}.</span>
-                        <span className="sniff-url" title={u}>{u}</span>
-                        <button
-                          className={`btn btn-sm ${selectedSniffUrl === u ? 'btn-success' : 'btn-primary'}`}
-                          onClick={() => selectSniffUrl(u)}
-                        >
-                          {selectedSniffUrl === u ? '✅ 已选择' : '选择'}
-                        </button>
-                      </div>
-                    ))}
+                    {sniffUrls.map((item, idx) => {
+                      const u = item.url;
+                      const durText = formatDuration(item.duration);
+                      const isLong = item.duration != null && item.duration >= 15 * 60;
+                      return (
+                        <div className="sniff-result-item" key={u}>
+                          <span className="sniff-index">{idx + 1}.</span>
+                          <span className="sniff-url" title={u}>
+                            {u}
+                            {durText && (
+                              <span className={isLong ? 'sniff-duration long' : 'sniff-duration'}>
+                                {isLong ? '⏱️ ' : ''}{durText}
+                              </span>
+                            )}
+                          </span>
+                          <button
+                            className={`btn btn-sm ${selectedSniffUrl === u ? 'btn-success' : 'btn-primary'}`}
+                            onClick={() => selectSniffUrl(u)}
+                          >
+                            {selectedSniffUrl === u ? '✅ 已选择' : '选择'}
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
                 <div className="modal-actions" style={{ marginTop: 16 }}>
