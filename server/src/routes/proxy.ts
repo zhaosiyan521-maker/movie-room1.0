@@ -718,7 +718,11 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
   const path = require('path');
 
   const port = 9300 + Math.floor(Math.random() * 500);
-  const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sniff-chrome-'));
+  // 【持久 profile】复用 cookie：不少站点第一次访问只给跳转/校验页，
+  // 带上 cookie 的第二次访问才返回真页面（91zxdy 实测如此）。
+  // 以前每次 mkdtemp 建全新 profile，永远过不去这类站。
+  const profileDir = path.join(os.tmpdir(), 'movie-room-sniff-profile');
+  try { fs.mkdirSync(profileDir, { recursive: true }); } catch { /* ignore */ }
   const foundUrls = new Set<string>();
   const seenRequestIds = new Set<string>();
   let title = '';
@@ -736,6 +740,7 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
     '--remote-allow-origins=*',
     '--mute-audio',
     '--autoplay-policy=no-user-gesture-required',
+    `--user-agent=${BROWSER_UA}`,
     'about:blank',
   ], { stdio: 'ignore' });
 
@@ -781,44 +786,14 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
 
     let id = 0;
     const pending = new Map<number, (v: any) => void>();
-    let sendFn: (method: string, params?: any) => Promise<any>;
-
-    ws.addEventListener('message', (ev: any) => {
-      const raw = wsDataToString(ev.data);
-      if (!raw) return;
-      let m: any;
-      try { m = JSON.parse(raw); } catch { return; }
-      if (m.id && pending.has(m.id)) {
-        pending.get(m.id)!(m);
-        pending.delete(m.id);
-      }
-      // 1) 请求阶段：直接媒体请求
-      if (m.method === 'Network.requestWillBeSent') {
-        const u = m.params?.request?.url;
-        if (u && isMediaUrl(u)) foundUrls.add(u);
-      }
-      // 2) 响应完成：读响应体抽媒体 URL（XHR/fetch 返回 JSON 的情况）
-      if (m.method === 'Network.loadingFinished') {
-        const rid = m.params?.requestId;
-        if (!rid || seenRequestIds.has(rid)) return;
-        seenRequestIds.add(rid);
-        sendFn('Network.getResponseBody', { requestId: rid })
-          .then((r) => {
-            const body = r?.result?.body;
-            if (typeof body === 'string' && body.length > 0 && body.length < 5_000_000) {
-              extractFromText(body, new URL(startUrl), foundUrls);
-            }
-          })
-          .catch(() => { /* 流式媒体等拿不到 body 的正常失败 */ });
-      }
-    });
-
-    sendFn = (method: string, params: any = {}) =>
+    const sendFn = (method: string, params: any = {}, sessionId?: string): Promise<any> =>
       new Promise((res, rej) => {
         const i = ++id;
         pending.set(i, res);
         try {
-          ws.send(JSON.stringify({ id: i, method, params }));
+          const msg: any = { id: i, method, params };
+          if (sessionId) msg.sessionId = sessionId;
+          ws.send(JSON.stringify(msg));
         } catch (e) {
           pending.delete(i);
           rej(e);
@@ -829,22 +804,137 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
         }, 10_000);
       });
 
+    /**
+     * 给子 target（跨域 iframe / Worker）挂上同样的网络监听。
+     * 播放器几乎都跑在 iframe 里，只监听主页面会漏掉真正的播放请求。
+     */
+    const attachSession = async (sessionId: string) => {
+      try {
+        await sendFn('Network.enable', {}, sessionId);
+        await sendFn('Network.setBypassServiceWorker', { bypass: true }, sessionId);
+        await sendFn('Network.setUserAgentOverride', {
+          userAgent: BROWSER_UA,
+          acceptLanguage: 'zh-CN,zh;q=0.9',
+          platform: 'Win32',
+        }, sessionId);
+        await sendFn('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, sessionId);
+      } catch { /* 子 target 可能已销毁，忽略 */ }
+    };
+
+    ws.addEventListener('message', (ev: any) => {
+      const raw = wsDataToString(ev.data);
+      if (!raw) return;
+      let m: any;
+      try { m = JSON.parse(raw); } catch { return; }
+      if (m.id && pending.has(m.id)) {
+        pending.get(m.id)!(m);
+        pending.delete(m.id);
+        return;
+      }
+      // 新出现的 target（跨域 iframe / Worker）：立即挂上网络监听
+      if (m.method === 'Target.attachedToTarget') {
+        const sid = m.params?.sessionId;
+        if (sid) void attachSession(sid);
+        return;
+      }
+      // 1) 请求阶段：直接媒体请求（任何 target 的请求都会到这里）
+      if (m.method === 'Network.requestWillBeSent') {
+        const u = m.params?.request?.url;
+        if (u && isMediaUrl(u)) foundUrls.add(u);
+      }
+      // 2) 响应完成：读响应体抽媒体 URL（XHR/fetch 返回 JSON 的情况）
+      if (m.method === 'Network.loadingFinished') {
+        const rid = m.params?.requestId;
+        if (!rid) return;
+        const key = `${m.sessionId || ''}:${rid}`;
+        if (seenRequestIds.has(key)) return;
+        seenRequestIds.add(key);
+        sendFn('Network.getResponseBody', { requestId: rid }, m.sessionId)
+          .then((r) => {
+            const body = r?.result?.body;
+            if (typeof body === 'string' && body.length > 0 && body.length < 5_000_000) {
+              extractFromText(body, new URL(startUrl), foundUrls);
+            }
+          })
+          .catch(() => { /* 流式媒体等拿不到 body 的正常失败 */ });
+      }
+    });
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const waitForFound = async (ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end && foundUrls.size === 0) await sleep(200);
+    };
+
+    /** 播放器常要求用户手势（点一下）才发请求，这里模拟点击 + 调用 video.play() */
+    const triggerPlay = async () => {
+      try {
+        await sendFn('Runtime.evaluate', {
+          expression: `(() => {
+            const sels = ['#player-start', '.vjs-big-play-button', '.dplayer-play-icon', '[class*=play]', 'video'];
+            for (const s of sels) {
+              const el = document.querySelector(s);
+              if (el && el !== document.body) { try { el.click(); } catch (e) {} }
+            }
+            document.querySelectorAll('video').forEach(v => { try { v.muted = true; v.play(); } catch (e) {} });
+            return document.querySelectorAll('video').length;
+          })()`,
+          returnByValue: true,
+        });
+      } catch { /* ignore */ }
+    };
+
     try {
       await sendFn('Network.enable');
       await sendFn('Page.enable');
       await sendFn('Runtime.enable');
+      await sendFn('Network.setBypassServiceWorker', { bypass: true });
+      await sendFn('Network.setUserAgentOverride', {
+        userAgent: BROWSER_UA,
+        acceptLanguage: 'zh-CN,zh;q=0.9',
+        platform: 'Win32',
+      });
+      // 跨域 iframe / Worker 也要监听
+      await sendFn('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
       await sendFn('Page.navigate', { url: startUrl });
     } catch (e) {
       // CDP 命令失败/超时：不挂死，返回已收集到的（可能为空）
       console.error('[sniff] CDP 命令失败:', (e as Error)?.message);
     }
 
-    // 观察一段时间（等 JS 执行 + 播放器发起请求/接口响应）
-    while (Date.now() < deadline && foundUrls.size === 0) {
-      await new Promise((r) => setTimeout(r, 300));
+    // 第一轮：等页面自己发起播放请求
+    await waitForFound(10_000);
+
+    // 没抓到就模拟点击播放，再等一会儿
+    if (foundUrls.size === 0) {
+      await triggerPlay();
+      await waitForFound(5_000);
     }
-    // 命中后多等一小会儿收集更多候选（清晰度等）
-    await new Promise((r) => setTimeout(r, 2500));
+
+    // 还不行：有些站第一次访问只给跳转/校验页，带上持久 profile 的 cookie 再来一次
+    if (foundUrls.size === 0) {
+      try { await sendFn('Page.navigate', { url: startUrl }); } catch { /* ignore */ }
+      await waitForFound(8_000);
+      if (foundUrls.size === 0) {
+        await triggerPlay();
+        await waitForFound(5_000);
+      }
+    }
+
+    // 最后从 DOM 源码里再抽一遍（有些站的直链写在页面源码里但没有发起请求）
+    try {
+      const dom = await sendFn('Runtime.evaluate', {
+        expression: 'document.documentElement.outerHTML',
+        returnByValue: true,
+      });
+      const html = dom?.result?.result?.value;
+      if (typeof html === 'string' && html.length > 0) {
+        for (const u of extractMediaUrls(html, new URL(startUrl))) foundUrls.add(u);
+      }
+    } catch { /* ignore */ }
+
+    // 命中后多等一小会儿收集更多候选（不同清晰度等）
+    if (foundUrls.size > 0) await sleep(1200);
 
     // 拿标题
     try {
@@ -859,7 +949,7 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
     return { urls: Array.from(foundUrls), title, usedBrowser: true };
   } finally {
     try { chrome.kill(); } catch { /* ignore */ }
-    try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    // 持久 profile 不删除：下次嗅探继续复用其中的 cookie
   }
 }
 
@@ -964,11 +1054,20 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
   }
 
   const html = await upstream.text();
-  const urls = extractMediaUrls(html, parsed);
+  let urls = extractMediaUrls(html, parsed);
 
   let title = '';
   const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
   if (titleMatch) title = titleMatch[1].trim();
 
-  res.json({ urls, title });
+  // 第一档没抓到（页面靠 JS 动态请求）→ 用真实浏览器跑一遍，拦截实际播放请求
+  let usedBrowser = false;
+  if (urls.length === 0) {
+    const browser = await sniffWithBrowser(parsed.toString());
+    usedBrowser = browser.usedBrowser;
+    if (browser.urls.length > 0) urls = browser.urls;
+    if (!title && browser.title) title = browser.title;
+  }
+
+  res.json({ urls, title, usedBrowser });
 });
