@@ -4,6 +4,7 @@ import { api } from '../store/authStore';
 import {
   MAX_ROOM_IMAGES as MAX_IMAGES,
   compressImageFiles,
+  ROOM_IMAGE_UPLOAD_ENABLED,
 } from '../utils/roomImages';
 import './CreateRoom.css';
 
@@ -118,7 +119,11 @@ export default function CreateRoom() {
               />
             </div>
 
-            <div className="form-group">
+            {/* 【临时隐藏】房间图片上传入口，说明见 ROOM_IMAGE_UPLOAD_ENABLED */}
+            <div
+              className="form-group"
+              style={{ display: ROOM_IMAGE_UPLOAD_ENABLED ? undefined : 'none' }}
+            >
               <label className="label">房间图片（最多 {MAX_IMAGES} 张，观众在房间外可见）</label>
               <input
                 ref={fileInputRef}

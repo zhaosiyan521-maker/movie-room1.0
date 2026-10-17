@@ -7,6 +7,7 @@ import { speedToScrollDuration } from '../utils/danmakuSpeed';
 import {
   MAX_ROOM_IMAGES,
   compressImageFiles,
+  ROOM_IMAGE_UPLOAD_ENABLED,
 } from '../utils/roomImages';
 import { io, Socket } from 'socket.io-client';
 import Hls from 'hls.js';
@@ -2992,7 +2993,11 @@ export default function RoomView() {
                 />
               </div>
 
-              <div className="form-group">
+              {/* 【临时隐藏】房间图片上传入口，说明见 ROOM_IMAGE_UPLOAD_ENABLED */}
+              <div
+                className="form-group"
+                style={{ display: ROOM_IMAGE_UPLOAD_ENABLED ? undefined : 'none' }}
+              >
                 <label className="label">房间图片（最多 {MAX_ROOM_IMAGES} 张，观众在房间外可见）</label>
                 <input
                   ref={editFileRef}

@@ -12,6 +12,19 @@
  */
 
 export const MAX_ROOM_IMAGES = 5;
+
+/**
+ * 【临时开关】是否显示「房间图片」上传入口。
+ *
+ * 目前置为 false：服务端在房间路由上挂了路由器级 `express.json()`（默认 100KB 上限），
+ * 它排在路由自己的 `express.json({ limit: '20mb' })` **之前**，压缩后的照片
+ * （base64 通常 130–400KB）会先被 413 拒绝，添加图片必然失败。
+ * 在服务端上限问题修复之前先隐藏入口，避免用户反复上传失败。
+ *
+ * 恢复方式：服务端修好后改回 true 即可，UI 与上传逻辑都保持原样未删。
+ */
+export const ROOM_IMAGE_UPLOAD_ENABLED: boolean = false;
+
 /** 单张图片体积上限（读取前拦截，避免 base64 膨胀拖垮进程） */
 export const MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024;
 /**
