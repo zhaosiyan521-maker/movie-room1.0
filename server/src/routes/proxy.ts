@@ -555,6 +555,84 @@ function findBox(buf: Buffer, type: string): Buffer | null {
   return null;
 }
 
+/**
+ * 校验候选地址**真的是媒体**，而不是「长得像直链的网页」。
+ *
+ * 典型反例（实测）：
+ *   https://www.2222dy.com/jiexi/?url=https://cdn/.../index.m3u8
+ * 结尾是 `.m3u8`（因此能通过 isMediaUrl 的扩展名判定），但返回的是 text/html，
+ * 客户端按 HLS 解析必然黑屏。这类「解析页地址」不能当直链返回。
+ *
+ * 放行条件：响应体以 #EXTM3U（HLS 清单）开头、或为 ISO BMFF（mp4 的 ftyp），
+ * 或 content-type 是 mpegurl / video/* / audio/* / octet-stream / mp2t。
+ * 网络异常、超时一律**放行**：宁可多给一条，也不要因为一次抖动把真链接丢掉。
+ */
+async function verifyMediaUrl(url: string): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const parsed = new URL(url);
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: ctrl.signal,
+      headers: {
+        'User-Agent': BROWSER_UA,
+        Accept: '*/*',
+        Referer: parsed.origin + '/',
+        Range: 'bytes=0-4095',
+      },
+      dispatcher,
+    } as any);
+
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const head = await readHeadBytes(res, 4096);
+
+    // 1) 内容优先：HLS 清单 / MP4 文件头
+    if (head.length > 0) {
+      const headText = head.toString('utf8').replace(/^\uFEFF/, '').trimStart();
+      if (headText.startsWith('#EXTM3U')) return true;
+      if (head.length >= 12 && head.toString('latin1', 4, 8) === 'ftyp') return true;
+    }
+
+    // 2) content-type 明确是媒体
+    if (/mpegurl|video\/|audio\/|octet-stream|mp2t/.test(ct)) return true;
+
+    // 3) 明确是网页 / 接口 / 纯文本 → 不是媒体
+    //    （text/plain 的 m3u8 已被上面的 #EXTM3U 内容判定兜住）
+    if (/^text\/html|^application\/(json|xml|xhtml)|^text\/plain/.test(ct)) return false;
+
+    // 4) 其余（无 content-type、奇怪的类型）：内容没命中就判否
+    return false;
+  } catch {
+    return true;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 只读响应体前 N 字节（避免把整部电影拉下来），读完立即取消。
+ *  参数用 any：本文件里的 `Response` 是 express 的同名类型（HTTP 响应对象），不是 fetch 的。 */
+async function readHeadBytes(res: any, maxBytes: number): Promise<Buffer> {
+  const reader = res?.body?.getReader?.();
+  if (!reader) return Buffer.alloc(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      chunks.push(value);
+      total += value.length;
+    }
+  } catch {
+    /* 读取中断：用已读到的部分继续判断 */
+  } finally {
+    try { await reader.cancel(); } catch { /* ignore */ }
+  }
+  return Buffer.concat(chunks).subarray(0, maxBytes);
+}
+
 // =====================================================================
 // 无头浏览器兜底：SPA 页面只有执行 JS 后才会发起媒体请求，
 // 服务端抓 HTML 拿不到。这里用 CDP 起一个真实浏览器拦截网络请求。
@@ -789,8 +867,10 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
     return res.status(400).json({ error: '禁止访问内网地址' });
   }
 
-  // 输入本身就是媒体直链：直接返回（时长照常分析）
-  if (isMediaUrl(parsed.toString())) {
+  // 输入本身就是媒体直链：**先校验内容确实是媒体**再直接返回。
+  // 像 `https://x.com/jiexi/?url=.../index.m3u8` 这种解析页地址结尾也是 .m3u8，
+  // 但返回的是 HTML；直接返回会让用户选中后黑屏。校验不通过就继续按页面抓取。
+  if (isMediaUrl(parsed.toString()) && await verifyMediaUrl(parsed.toString())) {
     const d = await probeDuration(parsed.toString());
     return res.json({
       urls: [{ url: parsed.toString(), duration: d }],
@@ -817,19 +897,24 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
   }
 
   // 时长分析（后台并行，单条失败不影响整体）
-  const withDuration = await Promise.all(
+  const analysed = await Promise.all(
     finalUrls
       // 最后一道兜底过滤：剔除 .d.ts 等静态声明文件（它们在浏览器里会被当作
       // 媒体请求捕获到，但绝不是可播放的直链）
       .filter((u) => !/\.d\.ts(\?|$)/i.test(u) && isMediaUrl(u))
       .map(async (url) => {
         const duration = await probeDuration(url);
-        return { url, duration };
+        // 能算出时长 = 已经确认是媒体，不必再校验；
+        // 算不出时长的（可能是解析页/接口）必须过内容校验，
+        // 否则会把返回 HTML 的「解析页地址」当直链给出去，选中即黑屏。
+        if (duration != null) return { url, duration, ok: true };
+        return { url, duration, ok: await verifyMediaUrl(url) };
       })
   );
 
   // 排序：>15 分钟的排最前（按时长降序），其次是有时长的，最后是未知时长的
   const MIN_DURATION = 15 * 60;
+  const withDuration = analysed.filter((x) => x.ok);
   withDuration.sort((a, b) => {
     const aLong = a.duration != null && a.duration >= MIN_DURATION;
     const bLong = b.duration != null && b.duration >= MIN_DURATION;
@@ -839,5 +924,9 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
     return db - da;
   });
 
-  res.json({ urls: withDuration, title, usedBrowser });
+  res.json({
+    urls: withDuration.map(({ url, duration }) => ({ url, duration })),
+    title,
+    usedBrowser,
+  });
 });
