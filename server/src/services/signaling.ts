@@ -1293,23 +1293,29 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
       if (isLastUserSocket) {
         await markScreeningGrace(roomId, socket.userId!);
       }
-    } else if (isLastUserSocket && room && room.status === 'PLAYING' && room.hostId === socket.userId) {
-      // 【BUG-02 修复】房主的宽限/解散判定也必须以「最后一个 socket 离开」为准。
-      // 否则房主开两个标签页时，关掉一个就会走「房主断线 → 宽限期 → 解散房间」，
-      // 而房主其实还在另一个标签页里看 —— 整场放映会被误解散。
+    } else if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
+      // 【关键】区分「主动解散」与「意外断线」，不能一律用 isLastUserSocket 拦。
+      //
+      // voluntary=true 表示用户**明确点了**「解散房间」（客户端 leave-room 或 HTTP /leave），
+      // 此时必须无条件解散 —— 否则只要房主还有第二个连接在线（例如切页留下的持久房主会话、
+      // 或另一个标签页），isLastUserSocket 就是 false，解散会被静默跳过，
+      // 表现就是「点击解散房间没反应、房间还在」。（这正是本回归的成因。）
+      //
+      // voluntary=false 才是「关掉网页/网络抖动」，这种必须有 isLastUserSocket 保护：
+      // 房主开着两个标签页时关掉一个，不应进入宽限期甚至误解散整场放映。
       if (voluntary) {
-        // 放映途中房主主动解散（HTTP 接口已放行房主随时解散，此处为 socket 兜底）：直接解散
+        // 放映途中房主主动解散：直接解散
         await dissolveRoom(roomId, { io }).catch(() => {});
-      } else {
+      } else if (isLastUserSocket) {
         // 强行关闭网页导致放映中断：进入宽限期，房主快速重连（如刷新页面）则取消
         hostAbrupt = true;
         scheduleHostLeave(roomId, io, socket.userId!, 'abrupt');
       }
-    } else if (isLastUserSocket && room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
+    } else if (room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
       if (voluntary) {
         // 房主主动退出（含放映已结束的房间）：彻底解散并清除房间，不留历史记录
         await dissolveRoom(roomId, { io }).catch(() => {});
-      } else {
+      } else if (isLastUserSocket) {
         // 断线（刷新页面/网络抖动）：宽限期内房主重连则取消解散
         scheduleHostLeave(roomId, io, socket.userId!, 'dissolve');
       }

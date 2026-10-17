@@ -699,6 +699,36 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
     const roomId = req.params.id;
     const userId = req.user!.id;
 
+    // 【重要】解散房间的判定必须放在最前面，**不能**放在「是否仍是成员」之后。
+    //
+    // 为什么：房主点「解散房间」时，客户端的动作顺序是
+    //   1) emit('leave-room')  2) 断开 socket  3) POST /leave
+    // 第 1、2 步会让服务端的断开路径（handleDisconnect → leaveRoom）先删掉该用户的
+    // 成员行。于是 POST 到达时「成员行已不存在」——若先做成员校验并按幂等提前返回，
+    // 解散逻辑就被整段跳过，表现为「点了解散房间没反应、房间还在」。
+    // （这正是 BUG-02 修复把删行移入 leaveRoom 后引入的回归。）
+    //
+    // canDissolve 只看 room.hostId / isAdmin，不依赖成员行，因此可以安全前置。
+    // 只在用户**主动**调用本接口时才会走到这里（关闭标签页只发 socket 事件、
+    // 不调本接口），所以「房主关掉一个标签页误解散房间」不会由此发生
+    // —— 那条路径由 signaling.leaveRoom 的 isLastUserSocket 兜住。
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { hostId: true }
+    });
+
+    // 解散判定：**只有真实房主或管理员**（canDissolve）。
+    //
+    // 【公共房间需求】这里原本是 `if (member.role === 'HOST')` —— 极其危险：
+    // 放映人虽然拥有放映权限，但**绝不能解散房间**。而 role 字段是可以被写成 HOST 的，
+    // 一旦放映人的成员行落了 HOST，他退出就会把管理员精心维护的公共房间直接删掉。
+    // 因此改为按 roomAccess.canDissolve 判定（真实房主 / 管理员），与 role 字段解耦。
+    if (room && (await canDissolve(roomId, userId, req.user!.isAdmin))) {
+      const io = getIO();
+      await dissolveRoom(roomId, { io });
+      return res.json({ message: '房间已解散' });
+    }
+
     // 检查是否在房间中。
     //
     // 【BUG-02 修复】这里不再直接 400。
@@ -724,23 +754,6 @@ roomRouter.post('/:id/leave', async (req: AuthRequest, res: Response) => {
         }
       }
       return res.json({ message: '已离开房间', alreadyLeft: true });
-    }
-
-    // 解散房间的判定：**只有真实房主或管理员**（canDissolve）。
-    //
-    // 【公共房间需求】这里原本是 `if (member.role === 'HOST')` —— 极其危险：
-    // 放映人虽然拥有放映权限，但**绝不能解散房间**。而 role 字段是可以被写成 HOST 的，
-    // 一旦放映人的成员行落了 HOST，他退出就会把管理员精心维护的公共房间直接删掉。
-    // 因此改为按 roomAccess.canDissolve 判定（真实房主 / 管理员），与 role 字段解耦。
-    const room = await prisma.room.findUnique({
-      where: { id: roomId },
-      select: { hostId: true }
-    });
-
-    if (room && (await canDissolve(roomId, userId, req.user!.isAdmin))) {
-      const io = getIO();
-      await dissolveRoom(roomId, { io });
-      return res.json({ message: '房间已解散' });
     }
 
     // 【BUG-02 修复】同一账号可能开着多个标签页，而成员行是「用户」维度的（一行）。
