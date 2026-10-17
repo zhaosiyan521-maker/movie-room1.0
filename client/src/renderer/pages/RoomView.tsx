@@ -385,6 +385,7 @@ export default function RoomView() {
   const [sniffError, setSniffError] = useState('');            // 错误提示
   const [showSniffResult, setShowSniffResult] = useState(false); // 结果弹窗
   const [sniffTitle, setSniffTitle] = useState('');            // 页面标题
+  const [sniffNote, setSniffNote] = useState('');              // 嗅探备注（如"已穿透反爬盾"）
   // 捕获到的直链列表：{ url, duration? }。duration 为秒，由服务端后台分析。
   const [sniffUrls, setSniffUrls] = useState<{ url: string; duration?: number | null }[]>([]);
   // 已被「选择」设为播放源的那条直链（用于把该行显示为「✅ 已选择」）
@@ -1967,6 +1968,7 @@ export default function RoomView() {
       }).filter((u) => u.url);
       setSniffUrls(urls);
       setSniffTitle(typeof data?.title === 'string' ? data.title : '');
+      setSniffNote(typeof data?.note === 'string' ? data.note : '');
       setSelectedSniffUrl(null);
       // 关闭输入弹窗，弹出结果弹窗
       setShowSniffInput(false);
@@ -1981,6 +1983,7 @@ export default function RoomView() {
   const closeSniffResult = () => {
     setShowSniffResult(false);
     setSniffUrls([]);
+    setSniffNote('');
   };
 
   /** 把秒数格式化成可读时长（用于直链列表标签） */
@@ -3727,6 +3730,7 @@ export default function RoomView() {
               <div className="modal-card card" onClick={(e) => e.stopPropagation()}>
                 <h3>🎯 捕获到的直链</h3>
                 {sniffTitle && <p className="sniff-title">{sniffTitle}</p>}
+                {sniffNote && <p className="sniff-note" style={{ fontSize: 12, color: '#888', margin: '4px 0 8px' }}>💡 {sniffNote}</p>}
                 {sniffUrls.length === 0 ? (
                   <p className="empty-text" style={{ margin: '16px 0' }}>
                     未捕获到任何视频直链。该页面可能使用了动态/加密加载，或直链不在源码中。

@@ -1,8 +1,10 @@
 import express, { Router, Response } from 'express';
 import dns from 'dns';
+import crypto from 'crypto';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { Agent } from 'undici';
+import puppeteer, { Browser } from 'puppeteer';
 
 export const proxyRouter = Router();
 
@@ -290,6 +292,20 @@ function extractMediaUrls(html: string, base: URL): string[] {
     } catch { /* 忽略无法解析的路径 */ }
   }
 
+  // player_aaaa 兼容：MacCMS 等模板的 url 字段常做 base64(encodeURIComponent(url)) 双重编码
+  for (const m of unescaped.match(/"url"\s*:\s*"([^"]+)"/gi) || []) {
+    const raw = m.replace(/^"url"\s*:\s*"/i, '').replace(/"$/, '');
+    try {
+      // 尝试 base64 解码 → URL decode → 取 http 链接
+      const b64 = Buffer.from(raw, 'base64').toString('utf-8');
+      const decoded = decodeURIComponent(b64);
+      const mediaRe = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|webm|flv)(?:\?[^\s"'<>\\]*)?/gi;
+      for (const dm of decoded.match(mediaRe) || []) {
+        found.add(dm.replace(/[\\'",;)\]]+$/, ''));
+      }
+    } catch { /* 非 base64 或解码失败，跳过 */ }
+  }
+
   return Array.from(found).filter((u) => {
     try {
       const p = new URL(u);
@@ -298,6 +314,181 @@ function extractMediaUrls(html: string, base: URL): string[] {
       return false;
     }
   });
+}
+
+/**
+ * PoW 盾穿透：检测并绕过基于 MD5 前导零的 JavaScript 工作量证明盾。
+ *
+ * 典型特征：页面只有几 KB，内含 md5 函数 + 枚举循环，要求计算 md5(C+":"+n) 前 D 位等于 P，
+ * 然后种 __vgp cookie 并刷新。常见于某些资源站（如 91zxdy.com）。
+ *
+ * @returns 若检测到并成功穿透，返回真实页面 HTML；否则返回 null。
+ */
+async function bypassPowShield(url: string, html: string): Promise<string | null> {
+  // 检测 PoW 盾特征：md5 函数 + C/D/P 变量 + 枚举循环
+  if (!html.includes('md5') || !html.includes('__vgp')) return null;
+
+  const cMatch = html.match(/C\s*=\s*"([^"]+)"/);
+  const dMatch = html.match(/D\s*=\s*(\d+)/);
+  const pMatch = html.match(/P\s*=\s*"([^"]+)"/);
+  if (!cMatch || !dMatch || !pMatch) return null;
+
+  const C = cMatch[1];
+  const D = parseInt(dMatch[1], 10);
+  const P = pMatch[1];
+  if (isNaN(D) || D < 1 || D > 8) return null; // 限制难度上限，防止恶意 DoS
+
+  // 暴力枚举 n
+  let n = -1;
+  const maxIter = 20_000_000;
+  for (let i = 0; i < maxIter; i++) {
+    const hash = crypto.createHash('md5').update(`${C}:${i}`).digest('hex');
+    if (hash.slice(0, D) === P) {
+      n = i;
+      break;
+    }
+  }
+  if (n < 0) return null;
+
+  // 种 cookie 重抓
+  const cookieVal = `${C.split('.')[0]}.${n}`;
+  const parsed = new URL(url);
+  const headers: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    Referer: parsed.origin + '/',
+    Cookie: `__vgp=${cookieVal}`,
+  };
+
+  try {
+    const upstream = await fetch(url, {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      dispatcher,
+    } as any);
+    if (!upstream.ok) return null;
+    return await upstream.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 检测并跟随页面中的 iframe，递归嗅探内层页面。
+ * 常见于「主页面 → iframe 播放器 → 真实视频地址」的嵌套结构。
+ */
+async function sniffIframes(html: string, base: URL, depth: number): Promise<string[]> {
+  if (depth <= 0) return [];
+  const iframes = html.match(/<iframe[^>]+src=["']([^"']+)["']/gi) || [];
+  const found: string[] = [];
+
+  for (const m of iframes.slice(0, 5)) { // 最多跟 5 个 iframe
+    const src = m.match(/src=["']([^"']+)["']/i)?.[1];
+    if (!src) continue;
+    try {
+      const iframeUrl = new URL(src, base).toString();
+      if (!isHttpUrl(iframeUrl)) continue;
+      const resp = await fetch(iframeUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          Referer: base.origin + '/',
+        },
+        dispatcher,
+      } as any);
+      if (!resp.ok) continue;
+      const iframeHtml = await resp.text();
+      const iframeBase = new URL(iframeUrl);
+      // 先提取当前 iframe 页面的媒体
+      found.push(...extractMediaUrls(iframeHtml, iframeBase));
+      // 递归跟随内层 iframe
+      if (found.length === 0) {
+        found.push(...await sniffIframes(iframeHtml, iframeBase, depth - 1));
+      }
+    } catch { /* 忽略单个 iframe 失败 */ }
+  }
+
+  return [...new Set(found)];
+}
+
+/**
+ * 无头浏览器嗅探：用于 SPA / 加密站 / 动态加载站。
+ *
+ * 策略：
+ *  1. 启动无头 Chromium，拦截所有请求，收集 .m3u8/.mp4/.webm/.flv 地址；
+ *  2. 等待页面加载 + 额外 3 秒让播放器完成初始化；
+ *  3. 从 DOM 中的 video/source 标签再兜底提取一遍；
+ *  4. 关闭浏览器，返回去重后的直链列表。
+ *
+ * 资源管理：每次调用独立启动/关闭浏览器实例，避免内存泄漏。
+ * 超时保护：总时长不超过 25 秒，防止个别站点卡死。
+ */
+async function sniffWithBrowser(url: string): Promise<{ urls: string[]; title: string }> {
+  const found = new Set<string>();
+  let browser: Browser | null = null;
+
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--autoplay-policy=no-user-gesture-required',
+      ],
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 720 });
+
+    // 拦截请求，收集媒体地址
+    await page.setRequestInterception(true);
+    page.on('request', (req: any) => {
+      const reqUrl = req.url();
+      if (/\.(m3u8|mp4|webm|flv)(\?|$)/i.test(reqUrl)) {
+        found.add(reqUrl);
+      }
+      req.continue();
+    });
+
+    // 拦截响应，从 content-type 或重定向中再捞一遍
+    page.on('response', (resp: any) => {
+      const respUrl = resp.url();
+      const ct = resp.headers()['content-type'] || '';
+      if (/\.(m3u8|mp4|webm|flv)(\?|$)/i.test(respUrl) || /mpegurl|video\/mp4|video\/webm/i.test(ct)) {
+        found.add(respUrl);
+      }
+    });
+
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+    // 额外等待播放器初始化
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // 从 DOM 兜底提取（page.evaluate 内是浏览器环境，有 document）
+    const domUrls: string[] = await page.evaluate(() => {
+      const urls: string[] = [];
+      // @ts-ignore - evaluate 运行在浏览器上下文，document 存在
+      const elements = document.querySelectorAll('video, source');
+      elements.forEach((el: any) => {
+        if (el.src) urls.push(el.src);
+        if (el.currentSrc) urls.push(el.currentSrc);
+      });
+      return urls;
+    });
+    domUrls.forEach((u: string) => {
+      if (/\.(m3u8|mp4|webm|flv)(\?|$)/i.test(u)) found.add(u);
+    });
+
+    const title = await page.title();
+    return { urls: Array.from(found), title };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 /**
@@ -367,11 +558,63 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
   }
 
   const html = await upstream.text();
-  const urls = extractMediaUrls(html, parsed);
 
   let title = '';
   const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
   if (titleMatch) title = titleMatch[1].trim();
 
-  res.json({ urls, title });
+  // 第一遍：直接提取
+  let urls = extractMediaUrls(html, parsed);
+  let note = '';
+
+  // 第二遍：PoW 盾穿透（91zxdy 等站）
+  if (urls.length === 0) {
+    const realHtml = await bypassPowShield(parsed.toString(), html);
+    if (realHtml) {
+      urls = extractMediaUrls(realHtml, parsed);
+      if (urls.length > 0) note = '已穿透反爬盾';
+    }
+  }
+
+  // 第三遍：跟随 iframe（主页面 → iframe 播放器 → 真实地址）
+  if (urls.length === 0) {
+    const iframeUrls = await sniffIframes(html, parsed, 2);
+    if (iframeUrls.length > 0) {
+      urls = iframeUrls;
+      note = '已从 iframe 播放器中提取';
+    }
+  }
+
+  // SPA 检测：页面几乎为空但含大量 script 标签，或含明显 SPA 特征
+  let isSpa = false;
+  if (urls.length === 0) {
+    const scriptCount = (html.match(/<script[^>]*src=/gi) || []).length;
+    const bodyText = html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+    const hasSpaRoot = /id=["'](root|app|__next)["']/i.test(html);
+    const hasLazyChunk = /assets\/[a-z0-9-]+\.js/gi.test(html);
+    if ((scriptCount >= 2 && bodyText.length < 500) || hasSpaRoot || hasLazyChunk) {
+      isSpa = true;
+    }
+  }
+
+  // 无头浏览器兜底：SPA 或前面都未抓到时启用
+  if (urls.length === 0 || isSpa) {
+    try {
+      const browserResult = await sniffWithBrowser(parsed.toString());
+      if (browserResult.urls.length > 0) {
+        urls = browserResult.urls;
+        note = note || '已通过无头浏览器提取';
+        if (!title && browserResult.title) title = browserResult.title;
+      } else if (isSpa) {
+        note = '该页面为纯 JS 渲染的 SPA，无头浏览器未能捕获到直链。可尝试在浏览器中手动播放后复制地址。';
+      }
+    } catch (e: any) {
+      console.error('[sniff] 无头浏览器失败:', e?.message);
+      if (isSpa) {
+        note = '无头浏览器执行失败，该站点可能有强反爬或需要登录。';
+      }
+    }
+  }
+
+  res.json({ urls, title, note });
 });
