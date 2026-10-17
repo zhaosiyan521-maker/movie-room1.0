@@ -330,7 +330,7 @@ function extractFromText(text: string, base: URL, out: Set<string>): void {
   const absRe = /https?:\/\/[^\s"'<>\\]+/gi;
   for (const m of t.match(absRe) || []) {
     const cleaned = m.replace(/[\\'",;)\]}>]+$/, '');
-    if (cleaned && isMediaUrl(cleaned)) {
+    if (cleaned && isMediaUrl(cleaned) && !isWrapperUrl(cleaned)) {
       try {
         const p = new URL(cleaned);
         if (p.protocol === 'http:' || p.protocol === 'https:') out.add(p.toString());
@@ -840,7 +840,7 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
       // 1) 请求阶段：直接媒体请求（任何 target 的请求都会到这里）
       if (m.method === 'Network.requestWillBeSent') {
         const u = m.params?.request?.url;
-        if (u && isMediaUrl(u)) foundUrls.add(u);
+        if (u && isMediaUrl(u) && !isWrapperUrl(u)) foundUrls.add(u);
       }
       // 2) 响应完成：读响应体抽媒体 URL（XHR/fetch 返回 JSON 的情况）
       if (m.method === 'Network.loadingFinished') {
@@ -1036,7 +1036,8 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
     Referer: parsed.origin + '/',
   };
 
-  let upstream: Awaited<ReturnType<typeof fetch>>;
+  let upstream: Awaited<ReturnType<typeof fetch>> | null = null;
+  let html = '';
   try {
     upstream = await fetch(parsed.toString(), {
       method: 'GET',
@@ -1044,17 +1045,17 @@ proxyRouter.get('/sniff', async (req, res: Response) => {
       redirect: 'follow',
       dispatcher,
     } as any);
+    if (upstream.ok) {
+      html = await upstream.text();
+    } else {
+      console.error(`[sniff] 上游返回 ${upstream.status}`);
+    }
   } catch (err) {
+    // 抓取失败也继续走浏览器：有些站对 Node 的 TLS 指纹不友好，浏览器反而能过
     console.error('[sniff] 抓取失败:', (err as Error)?.message);
-    return res.status(502).json({ error: '无法获取目标页面' });
   }
 
-  if (!upstream.ok) {
-    return res.status(upstream.status || 502).json({ error: `上游返回 ${upstream.status}` });
-  }
-
-  const html = await upstream.text();
-  let urls = extractMediaUrls(html, parsed);
+  let urls = html ? extractMediaUrls(html, parsed) : [];
 
   let title = '';
   const titleMatch = /<title[^>]*>([^<]*)<\/title>/i.exec(html);
