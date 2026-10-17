@@ -902,8 +902,40 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
       console.error('[sniff] CDP 命令失败:', (e as Error)?.message);
     }
 
-    // 第一轮：等页面自己发起播放请求
-    await waitForFound(10_000);
+    /**
+     * 判断当前页面是不是「跳转/校验页」：标题空、正文几乎没有、也没有播放器元素。
+     * 这类页只需要带上刚拿到的 cookie 再打开一次就能拿到真页面，
+     * 不必干等满第一轮的时间。
+     */
+    const pageLooksLikeChallenge = async (): Promise<boolean> => {
+      try {
+        const r = await sendFn('Runtime.evaluate', {
+          expression: `(() => {
+            const t = (document.title || '').trim();
+            const txt = ((document.body && document.body.innerText) || '').trim();
+            const hasPlayer = !!document.querySelector('video, iframe, #player-start, [class*=player]');
+            return JSON.stringify({ t, len: txt.length, hasPlayer });
+          })()`,
+          returnByValue: true,
+        });
+        const v = r?.result?.result?.value;
+        if (typeof v !== 'string') return false;
+        const o = JSON.parse(v);
+        return !o.t && o.len < 120 && !o.hasPlayer;
+      } catch { return false; }
+    };
+
+    // 第一轮：先等 4 秒
+    await waitForFound(4_000);
+
+    // 空壳/校验页 → 立刻带 cookie 再打开一次（91zxdy 这类站第二次才给真页面）
+    if (foundUrls.size === 0) {
+      const challenge = await pageLooksLikeChallenge();
+      if (challenge) {
+        try { await sendFn('Page.navigate', { url: startUrl }); } catch { /* ignore */ }
+      }
+      await waitForFound(challenge ? 9_000 : 8_000);
+    }
 
     // 没抓到就模拟点击播放，再等一会儿
     if (foundUrls.size === 0) {
@@ -911,13 +943,13 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
       await waitForFound(5_000);
     }
 
-    // 还不行：有些站第一次访问只给跳转/校验页，带上持久 profile 的 cookie 再来一次
+    // 还不行：最后再带 cookie 重开一次 + 触发播放
     if (foundUrls.size === 0) {
       try { await sendFn('Page.navigate', { url: startUrl }); } catch { /* ignore */ }
-      await waitForFound(8_000);
+      await waitForFound(6_000);
       if (foundUrls.size === 0) {
         await triggerPlay();
-        await waitForFound(5_000);
+        await waitForFound(4_000);
       }
     }
 
