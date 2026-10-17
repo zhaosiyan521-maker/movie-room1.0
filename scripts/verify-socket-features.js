@@ -31,7 +31,7 @@ const { check, skipCheck, report } = checker;
 const WATCHED_EVENTS = [
   'user-joined', 'room-joined', 'chat-message', 'chat-limited', 'voice-state', 'user-speaking',
   'playback-start', 'playback-pause', 'playback-resume', 'playback-stop', 'user-left', 'kicked',
-  'host-disconnected', 'kick-result', 'error',
+  'host-disconnected', 'room-dissolved', 'kick-result', 'error',
 ];
 
 (async () => {
@@ -220,15 +220,25 @@ const WATCHED_EVENTS = [
       await waitFor(() => events.B2['room-joined'].length >= 1, 5000),
       `count=${events.B2['room-joined'].length}`);
 
-    // 房主断线（放映中）→ 观众收到通知。
-    // 服务端有 20 秒宽限期（HOST_GRACE_MS），因此必须等待超过该窗口。
+    // 房主断线（放映中）→ 20 秒宽限 → **整间删除**，观众收到 room-dissolved。
+    //
+    // 【需求变更】旧行为是「宽限后只把房间改回 WAITING 并广播 host-disconnected」，
+    // 房间记录会留下来变成「0/30、没人、也没人关」的僵尸房间 —— 本次已改为
+    // 宽限到期一律删除房间（不分等待中/放映中），因此断言随之更新。
     await prisma.room.update({ where: { id: room.id }, data: { status: 'PLAYING' } });
     sockA.disconnect();
-    const gotHostDisconnected = await waitFor(() => events.B2['host-disconnected'].length >= 1, 28000, 200);
-    check('房主断线后 B 收到 host-disconnected（等待宽限期结束）', gotHostDisconnected,
-      `count=${events.B2['host-disconnected'].length}`);
-    const statusAfter = await prisma.room.findUnique({ where: { id: room.id }, select: { status: true } });
-    check('房主断线后房间状态回到 WAITING', statusAfter?.status === 'WAITING', `status=${statusAfter?.status}`);
+
+    // 宽限未到期：房间必须仍在（这 20 秒就是刷新/短暂断网的重连窗口）
+    await sleep(10000);
+    const stillThere = await prisma.room.findUnique({ where: { id: room.id }, select: { id: true } });
+    check('房主断线 10 秒：房间仍存在（20 秒宽限未到期）', !!stillThere);
+
+    const gotDissolved = await waitFor(() => events.B2['room-dissolved'].length >= 1, 20000, 200);
+    check('房主断线 20 秒后观众收到 room-dissolved（房间已解散）', gotDissolved,
+      `count=${events.B2['room-dissolved'].length}`);
+
+    const roomAfter = await prisma.room.findUnique({ where: { id: room.id }, select: { id: true } });
+    check('房主断线 20 秒后房间记录已被彻底删除', roomAfter === null, `room=${roomAfter?.id ?? 'null'}`);
   } finally {
     try { sockA?.close(); } catch { /* ignore */ }
     try { sockB?.close(); } catch { /* ignore */ }

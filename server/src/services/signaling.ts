@@ -67,42 +67,40 @@ const HOST_GRACE_MS = 20_000;
 const pendingHostLeaves = new Map<string, NodeJS.Timeout>();
 
 /**
- * 安排一个延迟的房主离开处理（解散 WAITING 房间 / 放映中断处理）。
- * 到期时若房主已重新在线（重新 join-room），则跳过处理。
+ * 安排一个延迟的房主离开处理（20 秒宽限）。
+ * 到期时若房主已重新在线（重新 join-room），则取消处理。
  */
 function scheduleHostLeave(
   roomId: string,
   io: Server,
-  hostUserId: string,
-  action: 'dissolve' | 'abrupt'
+  hostUserId: string
 ): void {
-  if (pendingHostLeaves.has(`${roomId}:${action}`)) return; // 已有倒计时在跑
+  if (pendingHostLeaves.has(roomId)) return; // 已有倒计时在跑
   const t = setTimeout(async () => {
-    pendingHostLeaves.delete(`${roomId}:${action}`);
+    pendingHostLeaves.delete(roomId);
     try {
       const room = await prisma.room.findUnique({
         where: { id: roomId },
-        select: { id: true, hostId: true, status: true }
+        select: { id: true, hostId: true }
       });
       if (!room || room.hostId !== hostUserId) return;
 
-      // 房主已重新在线（新 socket 已 join-room），取消处理
+      // 房主已重新在线（新 socket 已 join-room），取消处理 —— 这就是刷新/短暂断网的宽限
       const hostOnline = Array.from(roomUsers.get(roomId) || []).some(sid => {
         const s = io.sockets.sockets.get(sid) as AuthenticatedSocket | undefined;
         return s?.userId === hostUserId;
       });
       if (hostOnline) return;
 
-      if (action === 'dissolve') {
-        await dissolveRoom(roomId, { io, reason: '房主已离开，房间自动解散' }).catch(() => {});
-      } else if (room.status === 'PLAYING') {
-        await handleHostAbruptLeave(io, roomId, hostUserId);
-      }
+      // 20 秒宽限已过：**不分房间状态**（等待中 / 放映中），一律立即解散并彻底清除。
+      // 旧实现里放映中只把房间改回等待、保留房间记录，结果留下「0/30、没人、也没人关」
+      // 的僵尸房间 —— 这次就是修这个。
+      await dissolveRoom(roomId, { io, reason: '房主已离开，房间自动解散' }).catch(() => {});
     } catch (error) {
       console.error('Scheduled host leave error:', error);
     }
   }, HOST_GRACE_MS);
-  pendingHostLeaves.set(`${roomId}:${action}`, t);
+  pendingHostLeaves.set(roomId, t);
 }
 
 // io 实例引用：供 admin 路由主动断开被封禁用户的连接（避免与 index.ts 形成循环依赖）
@@ -1267,57 +1265,40 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
   // 但被踢/断线路径不经过 leaveRoom 的统一出口时容易遗漏，故在此显式声明）
   voiceStates.delete(socket.id);
 
-  // 判断是否是房主在放映途中离开/断线
-  let hostAbrupt = false;
+  // 判断房主是否离开 / 断线
   try {
     const room = await prisma.room.findUnique({
       where: { id: roomId },
-      select: { id: true, hostId: true, status: true }
+      select: { id: true, hostId: true }
     });
 
-    // ===== 【公共房间需求】公共房间永不自动消失 =====
+    // ===== 两类房间，两套互不影响的离开规则 =====
     //
-    // 公共房间（管理员创建）必须一直存在，直到管理员在后台手动解散，房间内人数为 0 也不删。
-    // 因此这里**整块跳过**原有三套自动解散逻辑：
-    //   1) 放映中断线 → 宽限期后解散
-    //   2) 房主主动退出 → 立即解散
-    //   3) 房主断线（非放映中）→ 宽限期后解散
-    // 放映人掉线只走 markScreeningGrace（3 分钟宽限，超时由 reapScreeningHosts 释放权限），
-    // 房间本身与放映密码都不受影响。
+    // 公共房间（管理员创建）：**永不解散**，只有管理员能在后台删。
+    //   房内人走光也不删；放映人掉线只记 3 分钟宽限（超时由 reapScreeningHosts 释放放映位）。
+    //
+    // 普通房间（用户创建）：房主一走就解散，分两种时序：
+    //   1) 主动离开（点「解散房间/退出」，voluntary=true）→ **立即**解散并清除；
+    //   2) 被动断开（关标签页 / 断网 / 刷新）→ **20 秒宽限**，期间重连则取消；
+    //      20 秒一到**不看房间状态**，一律立即解散并清除。
+    //
+    // 注意 voluntary 与 isLastUserSocket 的配合：
+    //   - 主动解散必须无条件执行（否则房主另有一个连接在线时会被静默跳过）；
+    //   - 被动断开只在「该房主的最后一个连接断开」时开始计时（两个标签页关一个不算离开）。
     const isPublic = room ? await isPublicRoom(roomId) : false;
     if (room && isPublic) {
       // 放映人掉线只记宽限截止时间（3 分钟内连回来仍是放映人）；
       // 若掉线的不是放映人，markScreeningGrace 内部会自行忽略。
-      // 注意同样是「最后一个 socket」才记宽限：房主/放映人开着两个标签页时，
-      // 关掉其中一个不应让别人以为放映人掉线了。
       if (isLastUserSocket) {
         await markScreeningGrace(roomId, socket.userId!);
       }
-    } else if (room && room.status === 'PLAYING' && room.hostId === socket.userId) {
-      // 【关键】区分「主动解散」与「意外断线」，不能一律用 isLastUserSocket 拦。
-      //
-      // voluntary=true 表示用户**明确点了**「解散房间」（客户端 leave-room 或 HTTP /leave），
-      // 此时必须无条件解散 —— 否则只要房主还有第二个连接在线（例如切页留下的持久房主会话、
-      // 或另一个标签页），isLastUserSocket 就是 false，解散会被静默跳过，
-      // 表现就是「点击解散房间没反应、房间还在」。（这正是本回归的成因。）
-      //
-      // voluntary=false 才是「关掉网页/网络抖动」，这种必须有 isLastUserSocket 保护：
-      // 房主开着两个标签页时关掉一个，不应进入宽限期甚至误解散整场放映。
+    } else if (room && room.hostId === socket.userId) {
       if (voluntary) {
-        // 放映途中房主主动解散：直接解散
+        // 房主主动解散：立即删除房间与全部关联数据
         await dissolveRoom(roomId, { io }).catch(() => {});
       } else if (isLastUserSocket) {
-        // 强行关闭网页导致放映中断：进入宽限期，房主快速重连（如刷新页面）则取消
-        hostAbrupt = true;
-        scheduleHostLeave(roomId, io, socket.userId!, 'abrupt');
-      }
-    } else if (room && room.status !== 'PLAYING' && room.hostId === socket.userId) {
-      if (voluntary) {
-        // 房主主动退出（含放映已结束的房间）：彻底解散并清除房间，不留历史记录
-        await dissolveRoom(roomId, { io }).catch(() => {});
-      } else if (isLastUserSocket) {
-        // 断线（刷新页面/网络抖动）：宽限期内房主重连则取消解散
-        scheduleHostLeave(roomId, io, socket.userId!, 'dissolve');
+        // 断开（关标签页/断网/刷新）：20 秒宽限，到期一律解散（不分等待中/放映中）
+        scheduleHostLeave(roomId, io, socket.userId!);
       }
     }
   } catch (error) {
@@ -1353,8 +1334,7 @@ async function leaveRoom(socket: AuthenticatedSocket, roomId: string, io: Server
       userId: socket.userId,
       username: socket.username,
       nickname: socket.nickname,
-      socketId: socket.id,
-      hostAbrupt
+      socketId: socket.id
     });
   }
 
@@ -1381,41 +1361,15 @@ export function purgeRoomSignalingState(roomId: string): void {
   kickQuotaUsed.delete(roomId);
   roomPlaybackStates.delete(roomId);
   lastPositionPersistAt.delete(roomId);
-  for (const action of ['dissolve', 'abrupt'] as const) {
-    const key = `${roomId}:${action}`;
-    const t = pendingHostLeaves.get(key);
-    if (t) {
-      clearTimeout(t);
-      pendingHostLeaves.delete(key);
-    }
+  const pending = pendingHostLeaves.get(roomId);
+  if (pending) {
+    clearTimeout(pending);
+    pendingHostLeaves.delete(roomId);
   }
 }
 
-// 房主放映中断线：结束本场放映、房间回到等待状态，并通知房间内观众。
-// 需求变更：允许房主随意中断放映，不再累计中断次数、不再封禁账号或 IP。
-async function handleHostAbruptLeave(io: Server, roomId: string, hostUserId: string) {
-  try {
-    // 结束本场放映，房间回到等待状态。
-    // 【需求1】注意：这里**不清空数据库中的播放源**。房主只是断线（网络抖动、电脑休眠、
-    // 切后台超时），房间本身并未解散，直链应当保留下来，只是内存中的「正在放映」状态
-    // 被清掉（房主不在，放映确实已停止）。
-    await prisma.room.update({
-      where: { id: roomId },
-      data: { status: 'WAITING' }
-    }).catch(() => {});
-
-    roomPlaybackStates.delete(roomId); // 放映中断，清空内存播放状态（数据库中播放源保留）
-    lastPositionPersistAt.delete(roomId);
-
-    io.to(roomId).emit('host-disconnected', {
-      message: '房主连接中断，放映已结束'
-    });
-
-    dbg(`房主 ${hostUserId} 放映中断线，放映已结束`);
-  } catch (error) {
-    console.error('Handle host abrupt leave error:', error);
-  }
-}
+// 【已移除】旧的 handleHostAbruptLeave（放映中断线 → 只把房间改回等待、保留房间记录）随本次
+// 需求删除：普通房间房主 20 秒不回来就整间删除，不再存在「放映结束但房间还留着」的状态。
 
 function handleDisconnect(socket: AuthenticatedSocket, io: Server) {
   const roomId = userRooms.get(socket.id);

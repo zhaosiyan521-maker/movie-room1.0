@@ -48,6 +48,8 @@ const ROOM_PUBLIC_SELECT = {
   name: true,
   description: true,
   images: true,
+  // 房间类型：公共房间的展示与权限都按它判定（不再看创建者是不是管理员）
+  kind: true,
   status: true,
   maxViewers: true,
   currentMovie: true,
@@ -76,7 +78,8 @@ function publicRoom<T extends { password?: string | null; screeningPassword?: st
   room: T
 ): Omit<T, 'password' | 'screeningPassword'> & { hasPassword: boolean } {
   const { password, screeningPassword, host, ...rest } = room as any;
-  const isPublic = host?.isAdmin === true;
+  // 按**房间类型**判定，不再看创建者当前是不是管理员
+  const isPublic = rest.kind === 'PUBLIC';
   return {
     ...rest,
     hasPassword: Boolean(password),
@@ -154,8 +157,31 @@ function parseImages(images: string | null): string[] {
   }
 }
 
-// 创建房间（含图片上传，单独放开到 20mb）
-roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, res: Response) => {
+// ===== 创建房间：公共房间与普通房间是**两条独立路径** =====
+//
+// 两类房间的机制不同，因此创建入口分成两个函数，各自决定自己的规则：
+//   createNormalRoom —— 普通用户专用：受开房配额限制，房间名只与其它**普通**房间查重；
+//   createPublicRoom —— 管理员专用：不受开房配额限制，房间名只与其它**公共**房间查重。
+// 类型由**服务端**按登录账号决定（管理员 → PUBLIC，其它 → NORMAL），
+// 请求体里的任何字段都无法改变它。
+type RoomKind = 'NORMAL' | 'PUBLIC';
+
+/** 普通房间：普通用户创建。房主最后一个连接断开 20 秒后立即解散并彻底清除。 */
+async function createNormalRoom(req: AuthRequest, res: Response) {
+  return createRoomWithKind('NORMAL', req, res);
+}
+
+/** 公共房间：管理员创建。永不解散，只有管理员后台能删，额外带放映通道。 */
+async function createPublicRoom(req: AuthRequest, res: Response) {
+  return createRoomWithKind('PUBLIC', req, res);
+}
+
+/**
+ * 两条路径共用的落库流程（含图片上传，单独放开到 20mb）。
+ * 所有类型相关的差异都用 kind 显式分支，不靠「创建者是谁」隐式兜底。
+ */
+async function createRoomWithKind(kind: RoomKind, req: AuthRequest, res: Response) {
+  const isPublicKind = kind === 'PUBLIC';
   try {
     const { name, description, password, maxViewers = 30, images } = req.body;
 
@@ -189,33 +215,39 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
     // N 取自 User.maxRoomsPerIp（管理员在后台按用户配置，默认 1；0 = 禁止开房）。
     // 注意与「加入房间」无关 —— 配额为 0 只是不能自己开房，照样能进别人的房间。
     //
+    // 【本次分离】配额只约束**普通房间**：公共房间由管理员（可信账号）创建，
+    // 不应被面向普通用户的开房配额卡住，否则管理员想再开一个放映厅就会被拦。
+    //
     // IP 取法与登录/注册保持一致：trust proxy 已关闭，直接读 socket 远端地址，
     // 忽略 X-Forwarded-For（否则攻击者可伪造该头绕过配额）。
     const hostIp = String(req.socket?.remoteAddress || req.ip || '').replace(/^::ffff:/, '');
 
-    const hostUser = await prisma.user.findUnique({
-      where: { id: req.user!.id },
-      select: { maxRoomsPerIp: true }
-    });
-    const maxRoomsPerIp = hostUser?.maxRoomsPerIp ?? 1;
-    if (maxRoomsPerIp <= 0) {
-      return res.status(403).json({ error: '你当前没有开设房间的权限（配额为 0）' });
-    }
-
-    // 统计口径：只计入 hostIp 非空的在建房间。本字段上线前创建的历史房间 hostIp 为 null，
-    // 若一并计入会白白挤占配额，让老用户建不了新房。
-    // 事务外先粗筛一次 —— 正常路径在这里返回，避免图片已落盘后才被拒、产生孤儿文件。
-    const activeRoomCount = await prisma.room.count({
-      where: {
-        hostId: req.user!.id,
-        hostIp: { not: null },
-        status: { in: ['WAITING', 'PLAYING'] }
-      }
-    });
-    if (activeRoomCount >= maxRoomsPerIp) {
-      return res.status(400).json({
-        error: `当前 IP 下你最多同时开设 ${maxRoomsPerIp} 个房间，请先解散已有房间再创建`
+    let maxRoomsPerIp = 0;
+    if (!isPublicKind) {
+      const hostUser = await prisma.user.findUnique({
+        where: { id: req.user!.id },
+        select: { maxRoomsPerIp: true }
       });
+      maxRoomsPerIp = hostUser?.maxRoomsPerIp ?? 1;
+      if (maxRoomsPerIp <= 0) {
+        return res.status(403).json({ error: '你当前没有开设房间的权限（配额为 0）' });
+      }
+
+      // 统计口径：只计入 hostIp 非空的在建房间。本字段上线前创建的历史房间 hostIp 为 null，
+      // 若一并计入会白白挤占配额，让老用户建不了新房。
+      // 事务外先粗筛一次 —— 正常路径在这里返回，避免图片已落盘后才被拒、产生孤儿文件。
+      const activeRoomCount = await prisma.room.count({
+        where: {
+          hostId: req.user!.id,
+          hostIp: { not: null },
+          status: { in: ['WAITING', 'PLAYING'] }
+        }
+      });
+      if (activeRoomCount >= maxRoomsPerIp) {
+        return res.status(400).json({
+          error: `当前 IP 下你最多同时开设 ${maxRoomsPerIp} 个房间，请先解散已有房间再创建`
+        });
+      }
     }
 
     // 保存房间图片（最多 5 张）
@@ -230,22 +262,28 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
         // 【需求1】配额复核：上面的事务外检查与此处之间存在并发窗口，
         // 连点两次建房会同时读到旧房间数、双双通过校验，实际建出超过配额的房间。
         // 事务内的读写处于同一序列化边界，可关闭该窗口。
-        const quotaCount = await tx.room.count({
-          where: {
-            hostId: req.user!.id,
-            hostIp: { not: null },
-            status: { in: ['WAITING', 'PLAYING'] }
+        // 【本次分离】与事务外一致：公共房间不受普通房间的开房配额约束。
+        if (!isPublicKind) {
+          const quotaCount = await tx.room.count({
+            where: {
+              hostId: req.user!.id,
+              hostIp: { not: null },
+              status: { in: ['WAITING', 'PLAYING'] }
+            }
+          });
+          if (quotaCount >= maxRoomsPerIp) {
+            const quota: any = new Error('ROOM_QUOTA_EXCEEDED');
+            quota.appCode = 'ROOM_QUOTA_EXCEEDED';
+            throw quota;
           }
-        });
-        if (quotaCount >= maxRoomsPerIp) {
-          const quota: any = new Error('ROOM_QUOTA_EXCEEDED');
-          quota.appCode = 'ROOM_QUOTA_EXCEEDED';
-          throw quota;
         }
 
+        // 【本次分离】房间名查重只在**同类型**房间之间进行：
+        // 公共房间与普通房间是两套机制，名字互不占用。
         const duplicate = await tx.room.findFirst({
           where: {
             name: trimmedName,
+            kind,
             status: { in: ['WAITING', 'PLAYING'] }
           }
         });
@@ -255,7 +293,7 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
           throw dup;
         }
 
-        // 创建房间
+        // 创建房间（类型由服务端定型，写入 kind）
         const created = await tx.room.create({
           data: {
             name: trimmedName,
@@ -265,6 +303,7 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
             maxViewers: mv,
             hostId: req.user!.id,
             hostIp: hostIp || null,
+            kind,
             status: 'WAITING'
           },
           select: {
@@ -307,6 +346,12 @@ roomRouter.post('/', express.json({ limit: '20mb' }), async (req: AuthRequest, r
     console.error('Create room error:', error);
     res.status(500).json({ error: '创建房间失败' });
   }
+}
+
+// 创建入口：管理员 → 公共房间；普通用户 → 普通房间。
+// 类型完全由服务端按账号决定，请求体无法指定，前端也伪造不了。
+roomRouter.post('/', express.json({ limit: '20mb' }), (req: AuthRequest, res: Response) => {
+  return req.user!.isAdmin ? createPublicRoom(req, res) : createNormalRoom(req, res);
 });
 
 // 获取房间列表（支持搜索房间名称 / 房主用户名 / 房主昵称）
@@ -344,7 +389,7 @@ roomRouter.get('/', async (req: AuthRequest, res: Response) => {
     // 早前版本只把「命中本页切片」的公共房间放进结果，导致翻到第 2 页时公共房间整批消失，
     // 与「永远置顶」直接矛盾。这类房间数量极少（管理员手动创建），每页全量附带没有实际开销。
     const publicIdList = (await prisma.room.findMany({
-      where: { host: { isAdmin: true } },
+      where: { kind: 'PUBLIC' },
       select: { id: true },
     })).map(r => r.id);
     const publicIdSet = new Set(publicIdList);

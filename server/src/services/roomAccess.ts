@@ -32,26 +32,26 @@ export interface RoomForAccess {
 /**
  * 是否为「公共房间」。
  *
- * 判定依据是「创建者是否为管理员」，而不是房间上的某个标志位：
- * 这样与需求「管理员账户创建的房间」严格一致，也不会出现「标志位与实际创建者不符」的脏数据。
- * 注意必须查库拿 isAdmin —— 调用方传入的 room 对象通常不含该字段。
+ * 判定依据是房间上的**类型字段**（创建时定型），而不是「创建者现在是不是管理员」：
+ * 后者会让管理员身份的变化反过来改变已存在房间的机制 —— 例如把某人升为管理员，
+ * 他名下的普通房间会瞬间变成永不解散的公共房间，反之亦然。
  */
 export async function isPublicRoom(roomId: string): Promise<boolean> {
   const room = await prisma.room.findUnique({
     where: { id: roomId },
-    select: { host: { select: { isAdmin: true } } }
+    select: { kind: true }
   });
-  return room?.host?.isAdmin === true;
+  return room?.kind === 'PUBLIC';
 }
 
-/** 批量判定（房间列表用）：返回 hostId 为管理员的房间 id 集合 */
+/** 批量判定（房间列表用）：返回类型为 PUBLIC 的房间 id 集合 */
 export async function publicRoomIds(roomIds: string[]): Promise<Set<string>> {
   if (roomIds.length === 0) return new Set();
   const rooms = await prisma.room.findMany({
     where: { id: { in: roomIds } },
-    select: { id: true, host: { select: { isAdmin: true } } }
+    select: { id: true, kind: true }
   });
-  return new Set(rooms.filter(r => r.host?.isAdmin === true).map(r => r.id));
+  return new Set(rooms.filter(r => r.kind === 'PUBLIC').map(r => r.id));
 }
 
 /**
@@ -127,11 +127,12 @@ export async function claimScreening(
       id: true,
       password: true,
       screeningPassword: true,
-      host: { select: { isAdmin: true } }
+      kind: true
     }
   });
   if (!room) return { ok: false, reason: 'not-public' };
-  if (room.host?.isAdmin !== true) return { ok: false, reason: 'not-public' };
+  // 只有「公共房间」有放映通道；类型创建时定型，与创建者当前身份无关
+  if (room.kind !== 'PUBLIC') return { ok: false, reason: 'not-public' };
 
   // 管理员：免密直达，不消耗密码、不占放映位
   if (isAdmin) return { ok: true, asAdmin: true };

@@ -30,7 +30,8 @@
     "verify:multitab": "node scripts/verify-multitab.js",
     "verify:sniff": "node scripts/verify-sniff.js",
     "verify:dissolve": "node scripts/verify-dissolve.js",
-    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation && npm run verify:public-room && npm run verify:multitab && npm run verify:dissolve"
+    "verify:lifecycle": "node scripts/verify-room-lifecycle.js",
+    "verify": "npm run verify:security && npm run verify:e2e && npm run verify:socket && npm run verify:features && npm run verify:socket-features && npm run verify:voice-isolation && npm run verify:public-room && npm run verify:multitab && npm run verify:dissolve && npm run verify:lifecycle"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

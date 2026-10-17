@@ -183,7 +183,7 @@ adminRouter.post('/rooms/:id/dissolve', async (req: AuthRequest, res: Response) 
 adminRouter.get('/public-rooms', async (_req: AuthRequest, res: Response) => {
   try {
     const rooms = await prisma.room.findMany({
-      where: { host: { isAdmin: true } },
+      where: { kind: 'PUBLIC' },
       select: {
         id: true,
         name: true,
@@ -246,10 +246,10 @@ adminRouter.post('/public-rooms/:id/screening-password', async (req: AuthRequest
 
     const room = await prisma.room.findUnique({
       where: { id: req.params.id },
-      select: { id: true, name: true, host: { select: { isAdmin: true } } }
+      select: { id: true, name: true, kind: true }
     });
     if (!room) return res.status(404).json({ error: '房间不存在或已被解散' });
-    if (room.host?.isAdmin !== true) {
+    if (room.kind !== 'PUBLIC') {
       return res.status(400).json({ error: '该房间不是公共房间' });
     }
 
