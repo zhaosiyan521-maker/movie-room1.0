@@ -2,7 +2,7 @@ import express, { Router, Response } from 'express';
 import dns from 'dns';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import { Agent } from 'undici';
+import { Agent, WebSocket as UndiciWebSocket } from 'undici';
 
 export const proxyRouter = Router();
 
@@ -656,7 +656,10 @@ async function sniffWithBrowser(startUrl: string): Promise<BrowserSniffResult> {
     const target = (await targetsRes.json()) as { webSocketDebuggerUrl?: string };
     if (!target.webSocketDebuggerUrl) return { urls: [], title: '', usedBrowser: true };
 
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    // 注意：Node 20 没有全局 WebSocket（本地用 Node 24 开发没暴露这个问题，
+    // 部署到服务器的 Node 20 后 sniffWithBrowser 直接 ReferenceError）。
+    // 这里用 undici 的 WebSocket（项目已有该依赖），不额外引入 ws。
+    const ws = new UndiciWebSocket(target.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
 
     let id = 0;
