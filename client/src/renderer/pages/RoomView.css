@@ -937,6 +937,38 @@
   border-color: rgba(255, 255, 255, 0.5);
 }
 
+/* 【循环播放】管理员创建的房间：仅房间创建者可见的循环开关，
+   停在右上角全屏按钮左侧；开启时用绿色高亮表示生效。 */
+.loop-playback-btn {
+  position: absolute;
+  top: 8px;
+  right: 100px;
+  z-index: 20;
+  background-color: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background-color 0.2s, border-color 0.2s;
+}
+
+.loop-playback-btn:hover {
+  background-color: rgba(0, 0, 0, 0.8);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+.loop-playback-btn.active {
+  background-color: rgba(82, 196, 26, 0.85);
+  border-color: rgba(82, 196, 26, 0.95);
+}
+
+.loop-playback-btn.active:hover {
+  background-color: rgba(82, 196, 26, 1);
+}
+
 /* 进入全屏后，视频容器撑满整个屏幕，去掉圆角和比例限制 */
 .video-container:fullscreen {
   width: 100vw;

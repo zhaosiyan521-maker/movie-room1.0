@@ -69,6 +69,8 @@ interface Room {
   isPublicRoom?: boolean;
   /** 【新需求】我此刻是不是本厅放映人（是则不允许走「加入房间」进入） */
   isScreeningHost?: boolean;
+  /** 【循环播放】管理员创建的房间的循环开关（播完自动从头重播） */
+  loopPlayback?: boolean;
 }
 
 interface ChatMessage {
@@ -377,6 +379,13 @@ export default function RoomView() {
 
   // 电影播放完毕：房主弹窗「是否解散该房间」
   const [endedPrompt, setEndedPrompt] = useState(false);
+
+  // 【循环播放】仅管理员创建的房间：同一个视频播完后自动从头重播。
+  // 开关落库、房间解散前一直记住；只有房间创建者本人能看到并使用这个按钮。
+  const [loopPlayback, setLoopPlayback] = useState(false);
+  // 同步镜像：<video>.onended 绑在房主持久元素上，闭包可能是首渲染那一份，
+  // 直接读 state 会永远拿到 false，这里必须读 ref。
+  const loopPlaybackRef = useRef(false);
 
   // ===== 直链获取（服务端嗅探）=====
   const [showSniffInput, setShowSniffInput] = useState(false); // 输入弹窗
@@ -760,6 +769,9 @@ export default function RoomView() {
     setIsHost(false);
     isHostRef.current = false;
     setCanDissolve(false);
+    // 【循环播放】开关属于具体房间，离开时清掉，避免状态串到下一个房间
+    setLoopPlayback(false);
+    loopPlaybackRef.current = false;
     setRoom(null);
     setMembers([]);
     setScreeningStarted(false);
@@ -781,6 +793,9 @@ export default function RoomView() {
       const { data } = await api.get(`/rooms/${id}`);
       const r: Room = data.room;
       setRoom(r);
+      // 【循环播放】按库里的开关恢复按钮状态（普通房间该字段恒为 false）
+      loopPlaybackRef.current = r.loopPlayback === true;
+      setLoopPlayback(r.loopPlayback === true);
       setMembers(r.members.map(m => ({
         userId: m.user.id,
         nickname: m.user.nickname || m.user.username
@@ -2897,8 +2912,40 @@ export default function RoomView() {
     navigate('/');
   };
 
+  /**
+   * 【循环播放】切换开关（仅房间创建者可用）。
+   * 先请服务端落库、以服务端返回值为准，再改本地状态 ——
+   * 失败时按钮不会显示成已开启，避免「界面开着、服务端没记」的两端不一致。
+   */
+  const toggleLoopPlayback = async () => {
+    const next = !loopPlaybackRef.current;
+    try {
+      const { data } = await api.patch(`/rooms/${id}/loop`, { enabled: next });
+      const value = data?.loopPlayback === true;
+      loopPlaybackRef.current = value;
+      setLoopPlayback(value);
+    } catch (error: any) {
+      alert(error.response?.data?.error || '切换循环播放失败');
+    }
+  };
+
   // 电影播放完毕（仅房主触发）：暂停同步 + 房间回到等待状态 + 弹窗询问是否解散
   const handleHostMovieEnded = () => {
+    // 【循环播放】本房间开着循环时**不结束本场放映**：直接回到 0:00 重播，
+    // 并让观众一起从头开始（先 seek 到 0，再恢复播放）。
+    // 此处不能读 loopPlayback state：onended 绑在跨页存活的 <video> 上，
+    // 回调可能是首渲染那一份闭包，只能读 ref。
+    if (loopPlaybackRef.current) {
+      const el = hostSessionRef.current?.video || localVideoRef.current;
+      if (el) {
+        try { el.currentTime = 0; } catch { /* ignore */ }
+        el.play().catch(() => {});
+        const sock = getLiveSocket();
+        sock?.emit('host-seek', { roomId: id, currentTime: 0 });
+        sock?.emit('host-resume', { roomId: id });
+        return;
+      }
+    }
     setIsPlaying(false);
     isPlayingRef.current = false;
     // 【M1/M7-3】用 getLiveSocket()：该处理既可能由原生控制条 onended 触发，
@@ -3272,6 +3319,18 @@ export default function RoomView() {
                     {formatTime(progress.current)} / {formatTime(progress.duration)}
                   </span>
                 </div>
+              )}
+
+              {/* 【循环播放】只有「管理员创建的房间」+「房间创建者本人」才看得到这个按钮：
+                  放映人、普通观众（包括从放映通道进来的用户）一律不渲染。 */}
+              {isHost && room?.isPublicRoom && room.hostId === user?.id && (
+                <button
+                  className={`loop-playback-btn ${loopPlayback ? 'active' : ''}`}
+                  onClick={toggleLoopPlayback}
+                  title={loopPlayback ? '关闭循环播放' : '开启循环播放：播完自动从头重播'}
+                >
+                  🔁 循环播放{loopPlayback ? ' · 开' : ' · 关'}
+                </button>
               )}
 
               {/* 全屏切换按钮（观众 + 房主均可用） */}

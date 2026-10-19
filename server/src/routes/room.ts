@@ -485,6 +485,8 @@ roomRouter.get('/:id', async (req: AuthRequest, res: Response) => {
       select: {
         ...ROOM_PUBLIC_SELECT,
         hostId: true,   // 供前端判断自己是否房主
+        // 【循环播放】管理员创建的房间专用开关，房主端据此恢复按钮状态
+        loopPlayback: true,
         host: { select: ROOM_HOST_SELECT },
         members: {
           select: {
@@ -906,6 +908,53 @@ roomRouter.patch('/:id/status', express.json(), async (req: AuthRequest, res: Re
   } catch (error) {
     console.error('Update room status error:', error);
     res.status(500).json({ error: '更新房间状态失败' });
+  }
+});
+
+/**
+ * 【循环播放】管理员创建的房间：同一个视频播完后自动从头重播。
+ *
+ * 权限刻意收得比其他房间操作更窄：
+ *   - 只有**公共房间**（管理员创建）有这个能力，普通房间一律 403；
+ *   - 只有**房间创建者本人**能切换，不走 canScreen ——
+ *     放映人虽然能控制播放，但需求明确「用户进入管理员创建的房间看不到这个按钮」。
+ *
+ * 开关落库（rooms.loopPlayback），房间被解散前一直有效。
+ */
+roomRouter.patch('/:id/loop', express.json(), async (req: AuthRequest, res: Response) => {
+  try {
+    const roomId = req.params.id;
+    const { enabled } = req.body;
+
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: '参数无效' });
+    }
+
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: { id: true, hostId: true, kind: true }
+    });
+
+    if (!room) {
+      return res.status(404).json({ error: '房间不存在' });
+    }
+    if (room.kind !== 'PUBLIC') {
+      return res.status(403).json({ error: '普通房间不支持循环播放' });
+    }
+    if (room.hostId !== req.user!.id) {
+      return res.status(403).json({ error: '只有房间创建者可以设置循环播放' });
+    }
+
+    const updated = await prisma.room.update({
+      where: { id: roomId },
+      data: { loopPlayback: enabled },
+      select: { loopPlayback: true }
+    });
+
+    res.json({ ok: true, loopPlayback: updated.loopPlayback });
+  } catch (error) {
+    console.error('Update room loop error:', error);
+    res.status(500).json({ error: '更新循环播放失败' });
   }
 });
 

@@ -123,6 +123,11 @@ model Room {
   // 用于服务重启 / 内存丢失后，新观众仍能续播到接近的位置，而不是从 0 开始。
   lastPositionMs   Int             @default(0)
 
+  // ===== 【循环播放】仅管理员创建的房间（kind = PUBLIC）使用 =====
+  // 开启后，当前视频播完不结束本场放映，而是自动回到 0:00 重播，观众同步。
+  // 只有房间创建者本人能切换；开关落库，只要房间没被解散就一直记住。
+  loopPlayback     Boolean         @default(false)
+
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
